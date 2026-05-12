@@ -1,0 +1,9 @@
+[package]
+name = "stock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.44"
+serde = "1.0.228"
+uuid = "1.23.1"
