@@ -236,6 +236,97 @@ impl OrderBook {
 
         executions
     }
+    pub fn is_resting(&self, order_id: &str) -> bool {
+        self.order_map.contains_key(order_id)
+    }
+}
+
+#[derive(Debug)]
+pub struct MatchingEngine {
+    order_books: HashMap<String, OrderBook>, // symbol -> book
+    order_location: HashMap<String, String>, // order_id -> symbol
+    last_seq: u64,                           // last processed sequence number
+}
+
+impl MatchingEngine {
+    pub fn new() -> Self {
+        MatchingEngine {
+            order_books: HashMap::new(),
+            order_location: HashMap::new(),
+            last_seq: 0,
+        }
+    }
+    pub fn process_order(&mut self, order: Order) -> Result<Vec<Execution>, String> {
+        // 1. Validate sequence
+        if order.seq_num <= self.last_seq {
+            return Err(format!(
+                "Sequence violation: received seq {} but last was {}",
+                order.seq_num, self.last_seq
+            ));
+        }
+
+        let symbol = order.symbol.clone();
+        let order_id = order.order_id.clone();
+        let seq_num = order.seq_num; // save before moving order
+
+        // 2. Get or create the OrderBook for this symbol
+        let book = self
+            .order_books
+            .entry(symbol.clone())
+            .or_insert_with(|| OrderBook::new(symbol.clone()));
+
+        // 3. Place the order and get fills
+        let fills = book.place_order(order);
+
+        // 4. Update last sequence
+        self.last_seq = seq_num;
+        // 5. If the order is still resting, remember its symbol for fast cancellation
+        if book.is_resting(&order_id) {
+            self.order_location.insert(order_id, symbol);
+        }
+
+        Ok(fills)
+    }
+    pub fn best_bid_ask(&self, symbol: &str) -> Option<((f64, u32), (f64, u32))> {
+        let book = self.order_books.get(symbol)?;
+        let bid = book.best_bid()?;
+        let ask = book.best_ask()?;
+        Some((bid, ask))
+    }
+    pub fn cancel_order(
+        &mut self,
+        order_id: &str,
+        cancel_seq: u64,
+    ) -> Result<Option<Order>, String> {
+        // 1. Validate sequence
+        if cancel_seq <= self.last_seq {
+            return Err(format!(
+                "Sequence violation on cancel: received seq {} but last was {}",
+                cancel_seq, self.last_seq
+            ));
+        }
+
+        // 2. Find the symbol from order_location
+        let symbol = self
+            .order_location
+            .remove(order_id)
+            .ok_or_else(|| format!("Order {} not found for cancellation", order_id))?;
+
+        // 3. Get the OrderBook for that symbol
+        let book = self
+            .order_books
+            .get_mut(&symbol)
+            .ok_or_else(|| format!("Order book for symbol {} not found", symbol))?;
+
+        // 4. Cancel the order in the book
+        let removed = book.cancel_order(order_id);
+
+        // (last_seq update will go here in next chunk)
+        // 5. Update last sequence
+        self.last_seq = cancel_seq;
+
+        Ok(removed)
+    }
 }
 
 impl PartialOrd for Price {
@@ -427,50 +518,375 @@ pub struct Execution {
     pub quantity: u32,
     pub timestamp: f64,
 }
+use std::time::Instant;
+
 fn main() {
-    let mut ob = OrderBook::new("AAPL".to_string());
+    let mut engine = MatchingEngine::new();
+    let n_orders = 100_000;
+    let mut seq: u64 = 1;
 
-    // Place a sell order that rests
-    let sell_order = Order::new(
-        "sell1".into(),
-        "userA".into(),
-        "AAPL".into(),
-        "SELL",
-        150.0,
-        100,
-        None,
-        1.0,
-        1,
-    )
-    .unwrap();
-    let execs = ob.place_order(sell_order);
-    assert!(execs.is_empty());
-    assert_eq!(ob.best_ask(), Some((150.0, 100)));
-    assert_eq!(ob.best_bid(), None);
+    // Generate a realistic mix of buy/sell orders with slightly varying prices
+    let orders: Vec<Order> = (0..n_orders)
+        .map(|i| {
+            let side = if i % 2 == 0 { "BUY" } else { "SELL" };
+            let price = 100.0 + ((i as f64 * 0.01) % 1.0) - 0.5; // 99.5 .. 100.5
+            let qty = (i % 5 + 1) as u32;
+            let seq_num = seq;
+            seq += 1;
+            Order::new(
+                format!("order_{}", i),
+                format!("user_{}", i % 100), // 100 distinct users
+                "AAPL".into(),
+                side,
+                price,
+                qty,
+                None,
+                i as f64 * 0.001, // increasing timestamps
+                seq_num,
+            )
+            .expect("valid order")
+        })
+        .collect();
 
-    // Place a buy order that matches fully
-    let buy_order = Order::new(
-        "buy1".into(),
-        "userB".into(),
-        "AAPL".into(),
-        "BUY",
-        151.0,
-        50,
-        None,
-        2.0,
-        2,
-    )
-    .unwrap();
-    let execs = ob.place_order(buy_order);
-    assert_eq!(execs.len(), 2); // two executions (buy and sell sides)
-    // The sell order should now have 50 leaves_qty
-    // Best ask remains 150, qty=50
-    assert_eq!(ob.best_ask(), Some((150.0, 50)));
+    let start = Instant::now();
 
-    // Cancel the remaining sell order
-    let cancelled = ob.cancel_order("sell1");
-    assert!(cancelled.is_some());
-    assert!(ob.best_ask().is_none());
+    let mut total_executions = 0;
+    for order in orders {
+        match engine.process_order(order) {
+            Ok(execs) => total_executions += execs.len(),
+            Err(e) => {
+                eprintln!("Error processing order: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
-    println!("All OrderBook tests passed!");
+    let elapsed = start.elapsed();
+    let throughput = n_orders as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "Processed {} orders in {:.3} s",
+        n_orders,
+        elapsed.as_secs_f64()
+    );
+    println!("Throughput: {:.0} orders/sec", throughput);
+    println!("Total executions generated: {}", total_executions);
+
+    assert!(
+        throughput > 10_000.0,
+        "Throughput below target: {:.0}",
+        throughput
+    );
+    println!("\n✅ Benchmark passed – Phase 1 throughput target met!");
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Helpers ---
+    fn make_order(id: &str, side: &str, price: f64, qty: u32, seq: u64) -> Order {
+        Order::new(
+            id.to_string(),
+            "user".to_string(),
+            "AAPL".to_string(),
+            side,
+            price,
+            qty,
+            None,
+            seq as f64, // timestamp = seq_num for ordering
+            seq,
+        )
+        .unwrap()
+    }
+
+    fn make_engine() -> MatchingEngine {
+        MatchingEngine::new()
+    }
+
+    // --- 1. Sequence Validation ---
+    #[test]
+    fn test_sequence_accept_first() {
+        let mut engine = make_engine();
+        let order = make_order("o1", "BUY", 100.0, 10, 1);
+        assert!(engine.process_order(order).is_ok());
+        assert_eq!(engine.last_seq, 1);
+    }
+
+    #[test]
+    fn test_sequence_reject_duplicate() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("o1", "BUY", 100.0, 10, 1))
+            .unwrap();
+        let order2 = make_order("o2", "BUY", 100.0, 10, 1); // same seq
+        assert!(engine.process_order(order2).is_err());
+    }
+
+    #[test]
+    fn test_sequence_reject_lower() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("o1", "BUY", 100.0, 10, 5))
+            .unwrap();
+        let order2 = make_order("o2", "BUY", 100.0, 10, 3); // lower seq
+        assert!(engine.process_order(order2).is_err());
+    }
+
+    #[test]
+    fn test_sequence_last_seq_unchanged_on_error() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("o1", "BUY", 100.0, 10, 10))
+            .unwrap();
+        assert_eq!(engine.last_seq, 10);
+        let err = engine.process_order(make_order("o2", "BUY", 100.0, 10, 5));
+        assert!(err.is_err());
+        assert_eq!(engine.last_seq, 10); // unchanged
+    }
+
+    // --- 2. Place & No Match ---
+    #[test]
+    fn test_place_order_no_match() {
+        let mut engine = make_engine();
+        let fills = engine
+            .process_order(make_order("b1", "BUY", 100.0, 10, 1))
+            .unwrap();
+        assert!(fills.is_empty());
+        // Check that order is resting via cancel
+        let cancelled = engine.cancel_order("b1", 2).unwrap();
+        assert!(cancelled.is_some());
+    }
+
+    #[test]
+    fn test_best_bid_after_no_match() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("b1", "BUY", 100.0, 10, 1))
+            .unwrap();
+        let (bid_price, bid_qty) = engine.best_bid_ask("AAPL").unwrap().0;
+        assert_eq!(bid_price, 100.0);
+        assert_eq!(bid_qty, 10);
+    }
+
+    // --- 3. Cancel Order ---
+    #[test]
+    fn test_cancel_resting_order() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
+            .unwrap();
+        let removed = engine.cancel_order("s1", 2).unwrap().unwrap();
+        assert_eq!(removed.order_id, "s1");
+        // Cancel again fails
+        assert!(engine.cancel_order("s1", 3).is_err());
+    }
+
+    #[test]
+    fn test_cancel_updates_order_book() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
+            .unwrap();
+        engine.cancel_order("s1", 2).unwrap();
+        // Best ask should be empty
+        assert!(engine.best_bid_ask("AAPL").unwrap().1.1 == 0); // ask qty 0
+    }
+
+    // --- 4. Full Fill ---
+    #[test]
+    fn test_full_fill_basic() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
+            .unwrap();
+        let fills = engine
+            .process_order(make_order("b1", "BUY", 100.0, 10, 2))
+            .unwrap();
+        assert_eq!(fills.len(), 2); // two executions
+        assert!(engine.cancel_order("s1", 3).is_err()); // filled
+        assert!(engine.cancel_order("b1", 3).is_err()); // filled
+    }
+
+    #[test]
+    fn test_full_fill_execution_details() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
+            .unwrap();
+        let fills = engine
+            .process_order(make_order("b1", "BUY", 100.0, 10, 2))
+            .unwrap();
+        assert_eq!(fills[0].quantity, 10);
+        assert_eq!(fills[1].quantity, 10);
+        assert_eq!(fills[0].price, 100.0);
+    }
+
+    // --- 5. Partial Fill ---
+    #[test]
+    fn test_partial_fill_buy_less() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("s1", "SELL", 100.0, 20, 1))
+            .unwrap();
+        let fills = engine
+            .process_order(make_order("b1", "BUY", 100.0, 10, 2))
+            .unwrap();
+        assert_eq!(fills.len(), 2);
+        // Sell still resting with 10 leaves
+        let order = engine.cancel_order("s1", 3).unwrap().unwrap();
+        assert_eq!(order.leaves_qty, 10);
+    }
+
+    #[test]
+    fn test_partial_fill_buy_more() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
+            .unwrap();
+        let fills = engine
+            .process_order(make_order("b1", "BUY", 100.0, 30, 2))
+            .unwrap();
+        assert_eq!(fills.len(), 2);
+        // Sell is fully filled, buy resting with 20
+        assert!(engine.cancel_order("s1", 3).is_err());
+        let buy = engine.cancel_order("b1", 3).unwrap().unwrap();
+        assert_eq!(buy.leaves_qty, 20);
+    }
+
+    // --- 6. Multiple Partial Fills ---
+    #[test]
+    fn test_multiple_sells_partial_fill() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("s1", "SELL", 100.0, 5, 1))
+            .unwrap();
+        engine
+            .process_order(make_order("s2", "SELL", 100.0, 10, 2))
+            .unwrap();
+        let fills = engine
+            .process_order(make_order("b1", "BUY", 100.0, 12, 3))
+            .unwrap();
+        assert_eq!(fills.len(), 4); // 2 executions per match -> 4 total
+        // s1 fully filled, s2 partially filled (8 leaves)
+        assert!(engine.cancel_order("s1", 4).is_err());
+        let s2 = engine.cancel_order("s2", 4).unwrap().unwrap();
+        assert_eq!(s2.leaves_qty, 3); // 10 - 7? Wait: buy 12 matched s1(5) then s2(7), so s2 leaves 3
+        // Actually: buy 12, first match s1 (5) -> buy leaves 7, s1 leaves 0. second match s2 (7) -> buy leaves 0, s2 leaves 3.
+        assert_eq!(s2.leaves_qty, 3);
+    }
+
+    // --- 7. FIFO Price-Time Priority ---
+    #[test]
+    fn test_fifo_same_price() {
+        let mut engine = make_engine();
+        // Place two sells at same price, different timestamps (seq as timestamp)
+        engine
+            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
+            .unwrap(); // timestamp 1.0
+        engine
+            .process_order(make_order("s2", "SELL", 100.0, 10, 2))
+            .unwrap(); // timestamp 2.0
+        let fills = engine
+            .process_order(make_order("b1", "BUY", 100.0, 15, 3))
+            .unwrap();
+        // s1 should be fully filled, s2 partially
+        assert!(engine.cancel_order("s1", 4).is_err());
+        let s2 = engine.cancel_order("s2", 4).unwrap().unwrap();
+        assert_eq!(s2.leaves_qty, 5);
+    }
+
+    // --- 8. Best Bid/Ask Updates ---
+    #[test]
+    fn test_best_bid_multiple_levels() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("b1", "BUY", 100.0, 10, 1))
+            .unwrap();
+        engine
+            .process_order(make_order("b2", "BUY", 101.0, 20, 2))
+            .unwrap();
+        let (bid_price, bid_qty) = engine.best_bid_ask("AAPL").unwrap().0;
+        assert_eq!(bid_price, 101.0);
+        assert_eq!(bid_qty, 20);
+    }
+
+    #[test]
+    fn test_best_bid_after_removal() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("b1", "BUY", 101.0, 20, 1))
+            .unwrap();
+        engine
+            .process_order(make_order("b2", "BUY", 100.0, 10, 2))
+            .unwrap();
+        // Remove b1 (cancel)
+        engine.cancel_order("b1", 3).unwrap();
+        let (bid_price, bid_qty) = engine.best_bid_ask("AAPL").unwrap().0;
+        assert_eq!(bid_price, 100.0);
+        assert_eq!(bid_qty, 10);
+    }
+
+    #[test]
+    fn test_best_ask_updates() {
+        let mut engine = make_engine();
+        engine
+            .process_order(make_order("s1", "SELL", 105.0, 30, 1))
+            .unwrap();
+        engine
+            .process_order(make_order("s2", "SELL", 102.0, 10, 2))
+            .unwrap();
+        let (ask_price, ask_qty) = engine.best_bid_ask("AAPL").unwrap().1;
+        assert_eq!(ask_price, 102.0);
+        assert_eq!(ask_qty, 10);
+    }
+
+    // --- 9. Edge Cases ---
+    #[test]
+    fn test_best_bid_ask_empty() {
+        let engine = make_engine();
+        assert!(engine.best_bid_ask("AAPL").is_none());
+    }
+
+    #[test]
+    fn test_multi_symbol_isolation() {
+        let mut engine = make_engine();
+        engine
+            .process_order(
+                Order::new(
+                    "a1".into(),
+                    "u1".into(),
+                    "AAPL".into(),
+                    "BUY",
+                    100.0,
+                    10,
+                    None,
+                    1.0,
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        engine
+            .process_order(
+                Order::new(
+                    "t1".into(),
+                    "u1".into(),
+                    "TSLA".into(),
+                    "SELL",
+                    200.0,
+                    5,
+                    None,
+                    2.0,
+                    2,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let (aapl_bid, aapl_ask) = engine.best_bid_ask("AAPL").unwrap();
+        assert_eq!(aapl_bid.0, 100.0);
+        assert!(aapl_ask.1 == 0);
+        let (tsla_bid, tsla_ask) = engine.best_bid_ask("TSLA").unwrap();
+        assert!(tsla_bid.1 == 0);
+        assert_eq!(tsla_ask.0, 200.0);
+    }
 }
