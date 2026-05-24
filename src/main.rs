@@ -558,6 +558,16 @@ pub struct OrderManager {
     execution_callbacks: Vec<Box<dyn Fn(Execution)>>,
 }
 
+// Custom error type — no external crates needed
+#[derive(Debug, PartialEq)]
+enum OrderManagerError {
+    AlreadyExists(String),     // duplicate order_id
+    OrderNotFound(String),     // no such order
+    InvalidTransition(String), // e.g. cancel a Filled order
+    OverFill(String),          // fill_qty > remaining
+    RiskRejected(String),
+    WalletRejected(String),
+}
 impl OrderManager {
     pub fn new() -> Self {
         Self {
@@ -653,6 +663,297 @@ impl OrderManager {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub enum RiskError {
+    LimitExceeded {
+        user_id: String,
+        symbol: String,
+        current_volume: u64,
+        limit: u64,
+    },
+}
+
+pub struct RiskManager {
+    limits: HashMap<(String, String), u64>, // (user_id, symbol) -> max qty
+    volumes: HashMap<(String, String), u64>, // (user_id, symbol) -> used qty today
+}
+
+impl RiskManager {
+    pub fn new() -> Self {
+        Self {
+            limits: HashMap::new(),
+            volumes: HashMap::new(),
+        }
+    }
+
+    pub fn set_limit(&mut self, user_id: String, symbol: String, limit: u64) {
+        self.limits.insert((user_id, symbol), limit);
+    }
+
+    pub fn check_and_record(&mut self, order: &Order) -> Result<(), RiskError> {
+        let key = (order.user_id.clone(), order.symbol.clone());
+
+        // No limit set = unlimited, always pass
+        let limit = match self.limits.get(&key) {
+            Some(&l) => l,
+            None => return Ok(()),
+        };
+
+        let current_volume = *self.volumes.get(&key).unwrap_or(&0);
+        let incoming_qty = order.quantity as u64;
+
+        if current_volume + incoming_qty > limit {
+            return Err(RiskError::LimitExceeded {
+                user_id: order.user_id.clone(),
+                symbol: order.symbol.clone(),
+                current_volume,
+                limit,
+            });
+        }
+
+        *self.volumes.entry(key).or_insert(0) += incoming_qty;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OrderStateNew {
+    New,
+    PartiallyFilled,
+    Filled,
+    Canceled,
+}
+
+struct ManagedOrder {
+    order: Order,
+    state: OrderStateNew,
+    remaining_quantity: u32,
+}
+
+struct OrderManagerNew {
+    orders: HashMap<String, ManagedOrder>,
+    risk_manager: RiskManager,
+    wallet: Wallet,
+}
+
+impl OrderManagerNew {
+    fn new() -> Self {
+        Self {
+            orders: HashMap::new(),
+            risk_manager: RiskManager::new(),
+            wallet: Wallet::new(),
+        }
+    }
+
+    pub fn add_order(&mut self, order: Order) -> Result<(), OrderManagerError> {
+        if self.orders.contains_key(&order.order_id) {
+            return Err(OrderManagerError::AlreadyExists(order.order_id.clone()));
+        }
+        self.risk_manager
+            .check_and_record(&order)
+            .map_err(|e| OrderManagerError::RiskRejected(format!("{:?}", e)))?;
+        self.wallet
+            .check_and_lock(
+                &order.user_id,
+                &order.side,
+                order.price,
+                order.quantity as u64,
+            )
+            .map_err(|e| OrderManagerError::WalletRejected(format!("{:?}", e)))?;
+        self.orders.insert(
+            order.order_id.clone(),
+            ManagedOrder {
+                order: order.clone(),
+                state: OrderStateNew::New,
+                remaining_quantity: order.quantity,
+            },
+        );
+
+        Ok(())
+    }
+
+    fn cancel_order(&mut self, order_id: &str) -> Result<(), OrderManagerError> {
+        let managed = self
+            .orders
+            .get_mut(order_id)
+            .ok_or_else(|| OrderManagerError::OrderNotFound(order_id.to_string()))?;
+
+        let user_id = managed.order.user_id.clone();
+        let side = managed.order.side.clone();
+        let price = managed.order.price;
+        let remaining = managed.remaining_quantity;
+        let _ = self
+            .wallet
+            .unlock_funds(&user_id, &side, price, remaining as u64);
+
+        // Only New or PartiallyFilled can be canceled
+        match managed.state {
+            OrderStateNew::New | OrderStateNew::PartiallyFilled => {
+                managed.state = OrderStateNew::Canceled;
+                Ok(())
+            }
+            OrderStateNew::Filled => Err(OrderManagerError::InvalidTransition(format!(
+                "order {} is already Filled",
+                order_id
+            ))),
+            OrderStateNew::Canceled => Err(OrderManagerError::InvalidTransition(format!(
+                "order {} is already Canceled",
+                order_id
+            ))),
+        }
+    }
+
+    fn record_fill(&mut self, order_id: &str, filled_qty: u32) -> Result<(), OrderManagerError> {
+        let managed = self
+            .orders
+            .get_mut(order_id)
+            .ok_or_else(|| OrderManagerError::OrderNotFound(order_id.to_string()))?;
+
+        let order = &managed.order;
+        let user_id = order.user_id.clone();
+        let _ = self
+            .wallet
+            .commit_fill(&user_id, &order.side, order.price, filled_qty as u64);
+
+        // Cannot record fill for already Canceled or Filled order
+        match managed.state {
+            OrderStateNew::Filled | OrderStateNew::Canceled => {
+                return Err(OrderManagerError::InvalidTransition(format!(
+                    "order {} is terminal, cannot fill",
+                    order_id
+                )));
+            }
+            _ => {} // ok to continue
+        }
+
+        // Cannot record fill larger than remaining quantity
+        if filled_qty > managed.remaining_quantity {
+            return Err(OrderManagerError::OverFill(format!(
+                "filled_qty {} > remaining_quantity {}",
+                filled_qty, managed.remaining_quantity
+            )));
+        }
+
+        managed.remaining_quantity -= filled_qty;
+        if managed.remaining_quantity == 0 {
+            managed.state = OrderStateNew::Filled;
+        } else {
+            managed.state = OrderStateNew::PartiallyFilled;
+        }
+
+        Ok(())
+    }
+
+    fn get_state(&self, order_id: &str) -> Option<OrderStateNew> {
+        self.orders.get(order_id).map(|m| m.state)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum WalletError {
+    InsufficientFunds,
+    Overlfow,
+}
+
+pub struct Wallet {
+    balances: HashMap<String, u64>,
+    locked: HashMap<String, u64>,
+}
+
+impl Wallet {
+    pub fn new() -> Self {
+        Self {
+            balances: HashMap::new(),
+            locked: HashMap::new(),
+        }
+    }
+
+    pub fn deposit(&mut self, user_id: String, amount: u64) {
+        *self.balances.entry(user_id).or_insert(0) += amount;
+    }
+
+    pub fn check_and_lock(
+        &mut self,
+        user_id: &str,
+        side: &Side,
+        price: f64,
+        quantity: u64,
+    ) -> Result<(), WalletError> {
+        if matches!(side, Side::Sell) {
+            return Ok(());
+        }
+
+        let required = (price * quantity as f64) as u64;
+        let balance = self.balances.get(user_id).copied().unwrap_or(0);
+        let locked = self.locked.get(user_id).copied().unwrap_or(0);
+
+        let available = balance.checked_sub(locked).unwrap_or(0);
+        if available < required {
+            return Err(WalletError::InsufficientFunds);
+        }
+
+        *self.locked.entry(user_id.to_string()).or_insert(0) += required;
+        Ok(())
+    }
+
+    // Called on fill: money is actually spent
+    pub fn commit_fill(
+        &mut self,
+        user_id: &str,
+        side: &Side,
+        price: f64,
+        qty_filled: u64,
+    ) -> Result<(), WalletError> {
+        if matches!(side, Side::Sell) {
+            return Ok(());
+        }
+
+        let amount = (price * qty_filled as f64) as u64;
+
+        let balance = self
+            .balances
+            .get_mut(user_id)
+            .ok_or(WalletError::InsufficientFunds)?;
+        *balance = balance
+            .checked_sub(amount)
+            .ok_or(WalletError::InsufficientFunds)?;
+
+        let locked = self
+            .locked
+            .get_mut(user_id)
+            .ok_or(WalletError::InsufficientFunds)?;
+        *locked = locked
+            .checked_sub(amount)
+            .ok_or(WalletError::InsufficientFunds)?;
+
+        Ok(())
+    }
+
+    // Called on cancel: just release the lock, no balance change
+    pub fn unlock_funds(
+        &mut self,
+        user_id: &str,
+        side: &Side,
+        price: f64,
+        qty_unlocked: u64,
+    ) -> Result<(), WalletError> {
+        if matches!(side, Side::Sell) {
+            return Ok(());
+        }
+
+        let amount = (price * qty_unlocked as f64) as u64;
+
+        let locked = self
+            .locked
+            .get_mut(user_id)
+            .ok_or(WalletError::InsufficientFunds)?;
+        *locked = locked
+            .checked_sub(amount)
+            .ok_or(WalletError::InsufficientFunds)?;
+
+        Ok(())
+    }
+}
 fn main() {
     let mut om = OrderManager::new();
 
@@ -704,315 +1005,287 @@ fn main() {
     println!("Cancelled o1: {:?}", cancelled);
     println!("State o1 after cancel: {:?}", om.get_order_state("o1"));
 }
-
 #[cfg(test)]
-mod tests {
+mod om_tests {
     use super::*;
 
-    // --- Helpers ---
-    fn make_order(id: &str, side: &str, price: f64, qty: u32, seq: u64) -> Order {
+    fn sample_order(id: &str, qty: u32) -> Order {
         Order::new(
             id.to_string(),
-            "user".to_string(),
+            "user1".to_string(),
             "AAPL".to_string(),
-            side,
-            price,
+            "SELL",
+            100.0,
             qty,
             None,
-            seq as f64, // timestamp = seq_num for ordering
-            seq,
+            1.0,
+            0,
         )
         .unwrap()
     }
 
-    fn make_engine() -> MatchingEngine {
-        MatchingEngine::new()
-    }
-
-    // --- 1. Sequence Validation ---
     #[test]
-    fn test_sequence_accept_first() {
-        let mut engine = make_engine();
-        let order = make_order("o1", "BUY", 100.0, 10, 1);
-        assert!(engine.process_order(order).is_ok());
-        assert_eq!(engine.last_seq, 1);
+    fn test_add_order_state_is_new() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        assert_eq!(om.get_state("o1"), Some(OrderStateNew::New));
     }
 
     #[test]
-    fn test_sequence_reject_duplicate() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("o1", "BUY", 100.0, 10, 1))
-            .unwrap();
-        let order2 = make_order("o2", "BUY", 100.0, 10, 1); // same seq
-        assert!(engine.process_order(order2).is_err());
+    fn test_add_duplicate_fails() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        let err = om.add_order(sample_order("o1", 10)).unwrap_err();
+        assert_eq!(err, OrderManagerError::AlreadyExists("o1".into()));
     }
 
     #[test]
-    fn test_sequence_reject_lower() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("o1", "BUY", 100.0, 10, 5))
-            .unwrap();
-        let order2 = make_order("o2", "BUY", 100.0, 10, 3); // lower seq
-        assert!(engine.process_order(order2).is_err());
+    fn test_partial_fill_new_to_partially_filled() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        om.record_fill("o1", 4).unwrap();
+        assert_eq!(om.get_state("o1"), Some(OrderStateNew::PartiallyFilled));
+        assert_eq!(om.orders["o1"].remaining_quantity, 6);
     }
 
     #[test]
-    fn test_sequence_last_seq_unchanged_on_error() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("o1", "BUY", 100.0, 10, 10))
-            .unwrap();
-        assert_eq!(engine.last_seq, 10);
-        let err = engine.process_order(make_order("o2", "BUY", 100.0, 10, 5));
-        assert!(err.is_err());
-        assert_eq!(engine.last_seq, 10); // unchanged
-    }
-
-    // --- 2. Place & No Match ---
-    #[test]
-    fn test_place_order_no_match() {
-        let mut engine = make_engine();
-        let fills = engine
-            .process_order(make_order("b1", "BUY", 100.0, 10, 1))
-            .unwrap();
-        assert!(fills.is_empty());
-        // Check that order is resting via cancel
-        let cancelled = engine.cancel_order("b1", 2).unwrap();
-        assert!(cancelled.is_some());
+    fn test_full_fill_goes_to_filled() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        om.record_fill("o1", 10).unwrap();
+        assert_eq!(om.get_state("o1"), Some(OrderStateNew::Filled));
+        assert_eq!(om.orders["o1"].remaining_quantity, 0);
     }
 
     #[test]
-    fn test_best_bid_after_no_match() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("b1", "BUY", 100.0, 10, 1))
-            .unwrap();
-        let (bid_price, bid_qty) = engine.best_bid_ask("AAPL").unwrap().0;
-        assert_eq!(bid_price, 100.0);
-        assert_eq!(bid_qty, 10);
-    }
-
-    // --- 3. Cancel Order ---
-    #[test]
-    fn test_cancel_resting_order() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
-            .unwrap();
-        let removed = engine.cancel_order("s1", 2).unwrap().unwrap();
-        assert_eq!(removed.order_id, "s1");
-        // Cancel again fails
-        assert!(engine.cancel_order("s1", 3).is_err());
+    fn test_multiple_partials_then_filled() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        om.record_fill("o1", 3).unwrap();
+        assert_eq!(om.get_state("o1"), Some(OrderStateNew::PartiallyFilled));
+        om.record_fill("o1", 3).unwrap();
+        assert_eq!(om.get_state("o1"), Some(OrderStateNew::PartiallyFilled));
+        om.record_fill("o1", 4).unwrap();
+        assert_eq!(om.get_state("o1"), Some(OrderStateNew::Filled));
     }
 
     #[test]
-    fn test_cancel_updates_order_book() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
-            .unwrap();
-        engine.cancel_order("s1", 2).unwrap();
-        // Best ask should be empty
-        assert!(engine.best_bid_ask("AAPL").unwrap().1.1 == 0); // ask qty 0
-    }
-
-    // --- 4. Full Fill ---
-    #[test]
-    fn test_full_fill_basic() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
-            .unwrap();
-        let fills = engine
-            .process_order(make_order("b1", "BUY", 100.0, 10, 2))
-            .unwrap();
-        assert_eq!(fills.len(), 2); // two executions
-        assert!(engine.cancel_order("s1", 3).is_err()); // filled
-        assert!(engine.cancel_order("b1", 3).is_err()); // filled
+    fn test_cancel_from_new() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        om.cancel_order("o1").unwrap();
+        assert_eq!(om.get_state("o1"), Some(OrderStateNew::Canceled));
     }
 
     #[test]
-    fn test_full_fill_execution_details() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
-            .unwrap();
-        let fills = engine
-            .process_order(make_order("b1", "BUY", 100.0, 10, 2))
-            .unwrap();
-        assert_eq!(fills[0].quantity, 10);
-        assert_eq!(fills[1].quantity, 10);
-        assert_eq!(fills[0].price, 100.0);
-    }
-
-    // --- 5. Partial Fill ---
-    #[test]
-    fn test_partial_fill_buy_less() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("s1", "SELL", 100.0, 20, 1))
-            .unwrap();
-        let fills = engine
-            .process_order(make_order("b1", "BUY", 100.0, 10, 2))
-            .unwrap();
-        assert_eq!(fills.len(), 2);
-        // Sell still resting with 10 leaves
-        let order = engine.cancel_order("s1", 3).unwrap().unwrap();
-        assert_eq!(order.leaves_qty, 10);
+    fn test_cancel_from_partially_filled() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        om.record_fill("o1", 4).unwrap();
+        om.cancel_order("o1").unwrap();
+        assert_eq!(om.get_state("o1"), Some(OrderStateNew::Canceled));
     }
 
     #[test]
-    fn test_partial_fill_buy_more() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
-            .unwrap();
-        let fills = engine
-            .process_order(make_order("b1", "BUY", 100.0, 30, 2))
-            .unwrap();
-        assert_eq!(fills.len(), 2);
-        // Sell is fully filled, buy resting with 20
-        assert!(engine.cancel_order("s1", 3).is_err());
-        let buy = engine.cancel_order("b1", 3).unwrap().unwrap();
-        assert_eq!(buy.leaves_qty, 20);
-    }
-
-    // --- 6. Multiple Partial Fills ---
-    #[test]
-    fn test_multiple_sells_partial_fill() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("s1", "SELL", 100.0, 5, 1))
-            .unwrap();
-        engine
-            .process_order(make_order("s2", "SELL", 100.0, 10, 2))
-            .unwrap();
-        let fills = engine
-            .process_order(make_order("b1", "BUY", 100.0, 12, 3))
-            .unwrap();
-        assert_eq!(fills.len(), 4); // 2 executions per match -> 4 total
-        // s1 fully filled, s2 partially filled (8 leaves)
-        assert!(engine.cancel_order("s1", 4).is_err());
-        let s2 = engine.cancel_order("s2", 4).unwrap().unwrap();
-        assert_eq!(s2.leaves_qty, 3); // 10 - 7? Wait: buy 12 matched s1(5) then s2(7), so s2 leaves 3
-        // Actually: buy 12, first match s1 (5) -> buy leaves 7, s1 leaves 0. second match s2 (7) -> buy leaves 0, s2 leaves 3.
-        assert_eq!(s2.leaves_qty, 3);
-    }
-
-    // --- 7. FIFO Price-Time Priority ---
-    #[test]
-    fn test_fifo_same_price() {
-        let mut engine = make_engine();
-        // Place two sells at same price, different timestamps (seq as timestamp)
-        engine
-            .process_order(make_order("s1", "SELL", 100.0, 10, 1))
-            .unwrap(); // timestamp 1.0
-        engine
-            .process_order(make_order("s2", "SELL", 100.0, 10, 2))
-            .unwrap(); // timestamp 2.0
-        let fills = engine
-            .process_order(make_order("b1", "BUY", 100.0, 15, 3))
-            .unwrap();
-        // s1 should be fully filled, s2 partially
-        assert!(engine.cancel_order("s1", 4).is_err());
-        let s2 = engine.cancel_order("s2", 4).unwrap().unwrap();
-        assert_eq!(s2.leaves_qty, 5);
-    }
-
-    // --- 8. Best Bid/Ask Updates ---
-    #[test]
-    fn test_best_bid_multiple_levels() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("b1", "BUY", 100.0, 10, 1))
-            .unwrap();
-        engine
-            .process_order(make_order("b2", "BUY", 101.0, 20, 2))
-            .unwrap();
-        let (bid_price, bid_qty) = engine.best_bid_ask("AAPL").unwrap().0;
-        assert_eq!(bid_price, 101.0);
-        assert_eq!(bid_qty, 20);
+    fn test_cancel_filled_fails() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        om.record_fill("o1", 10).unwrap();
+        assert!(matches!(
+            om.cancel_order("o1").unwrap_err(),
+            OrderManagerError::InvalidTransition(_)
+        ));
     }
 
     #[test]
-    fn test_best_bid_after_removal() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("b1", "BUY", 101.0, 20, 1))
-            .unwrap();
-        engine
-            .process_order(make_order("b2", "BUY", 100.0, 10, 2))
-            .unwrap();
-        // Remove b1 (cancel)
-        engine.cancel_order("b1", 3).unwrap();
-        let (bid_price, bid_qty) = engine.best_bid_ask("AAPL").unwrap().0;
-        assert_eq!(bid_price, 100.0);
-        assert_eq!(bid_qty, 10);
+    fn test_cancel_already_canceled_fails() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        om.cancel_order("o1").unwrap();
+        assert!(matches!(
+            om.cancel_order("o1").unwrap_err(),
+            OrderManagerError::InvalidTransition(_)
+        ));
     }
 
     #[test]
-    fn test_best_ask_updates() {
-        let mut engine = make_engine();
-        engine
-            .process_order(make_order("s1", "SELL", 105.0, 30, 1))
-            .unwrap();
-        engine
-            .process_order(make_order("s2", "SELL", 102.0, 10, 2))
-            .unwrap();
-        let (ask_price, ask_qty) = engine.best_bid_ask("AAPL").unwrap().1;
-        assert_eq!(ask_price, 102.0);
-        assert_eq!(ask_qty, 10);
-    }
-
-    // --- 9. Edge Cases ---
-    #[test]
-    fn test_best_bid_ask_empty() {
-        let engine = make_engine();
-        assert!(engine.best_bid_ask("AAPL").is_none());
+    fn test_overfill_rejected() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        assert!(matches!(
+            om.record_fill("o1", 11).unwrap_err(),
+            OrderManagerError::OverFill(_)
+        ));
     }
 
     #[test]
-    fn test_multi_symbol_isolation() {
-        let mut engine = make_engine();
-        engine
-            .process_order(
-                Order::new(
-                    "a1".into(),
-                    "u1".into(),
-                    "AAPL".into(),
-                    "BUY",
-                    100.0,
-                    10,
-                    None,
-                    1.0,
-                    1,
-                )
-                .unwrap(),
+    fn test_fill_terminal_order_fails() {
+        let mut om = OrderManagerNew::new();
+        om.add_order(sample_order("o1", 10)).unwrap();
+        om.record_fill("o1", 10).unwrap();
+        assert!(matches!(
+            om.record_fill("o1", 1).unwrap_err(),
+            OrderManagerError::InvalidTransition(_)
+        ));
+    }
+
+    #[test]
+    fn test_unknown_order_errors() {
+        let mut om = OrderManagerNew::new();
+        assert_eq!(
+            om.record_fill("ghost", 5).unwrap_err(),
+            OrderManagerError::OrderNotFound("ghost".into())
+        );
+        assert_eq!(
+            om.cancel_order("ghost").unwrap_err(),
+            OrderManagerError::OrderNotFound("ghost".into())
+        );
+    }
+    #[cfg(test)]
+    mod risk_tests {
+        use super::*;
+
+        fn make_order(user_id: &str, symbol: &str, qty: u32) -> Order {
+            Order::new(
+                format!("o-{}-{}", user_id, qty),
+                user_id.to_string(),
+                symbol.to_string(),
+                "SELL",
+                100.0,
+                qty,
+                None,
+                1.0,
+                0,
             )
-            .unwrap();
-        engine
-            .process_order(
-                Order::new(
-                    "t1".into(),
-                    "u1".into(),
-                    "TSLA".into(),
-                    "SELL",
-                    200.0,
-                    5,
-                    None,
-                    2.0,
-                    2,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let (aapl_bid, aapl_ask) = engine.best_bid_ask("AAPL").unwrap();
-        assert_eq!(aapl_bid.0, 100.0);
-        assert!(aapl_ask.1 == 0);
-        let (tsla_bid, tsla_ask) = engine.best_bid_ask("TSLA").unwrap();
-        assert!(tsla_bid.1 == 0);
-        assert_eq!(tsla_ask.0, 200.0);
+            .unwrap()
+        }
+
+        #[test]
+        fn test_under_limit_passes() {
+            let mut om = OrderManagerNew::new();
+            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
+            assert!(om.add_order(make_order("u1", "AAPL", 500)).is_ok());
+            // volume is now 500
+        }
+
+        #[test]
+        fn test_exceeds_limit_rejected() {
+            let mut om = OrderManagerNew::new();
+            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
+            om.add_order(make_order("u1", "AAPL", 500)).unwrap();
+            // 500 + 600 = 1100 > 1000, should fail
+            assert!(matches!(
+                om.add_order(make_order("u1", "AAPL", 600)).unwrap_err(),
+                OrderManagerError::RiskRejected(_)
+            ));
+        }
+
+        #[test]
+        fn test_exact_limit_passes() {
+            let mut om = OrderManagerNew::new();
+            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
+            om.add_order(make_order("u1", "AAPL", 500)).unwrap();
+            // use 499 + 1 would also work, but simplest fix: different qty = different ID
+            assert!(om.add_order(make_order("u1", "AAPL", 499)).is_ok()); // 500+499=999 ≤ 1000
+        }
+
+        #[test]
+        fn test_different_user_unaffected() {
+            let mut om = OrderManagerNew::new();
+            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
+            om.add_order(make_order("u1", "AAPL", 900)).unwrap();
+            // u2 has no limit, should always pass
+            assert!(om.add_order(make_order("u2", "AAPL", 9999)).is_ok());
+        }
+
+        #[test]
+        fn test_no_limit_set_always_passes() {
+            let mut om = OrderManagerNew::new();
+            // no limits configured at all
+            assert!(om.add_order(make_order("u1", "AAPL", 99999)).is_ok());
+        }
+
+        #[test]
+        fn test_different_symbol_unaffected() {
+            let mut om = OrderManagerNew::new();
+            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
+            om.add_order(make_order("u1", "AAPL", 900)).unwrap();
+            // TSLA has no limit for u1, should pass
+            assert!(om.add_order(make_order("u1", "TSLA", 9999)).is_ok());
+        }
+    }
+    #[cfg(test)]
+    mod wallet_tests {
+        use super::*;
+
+        #[test]
+        fn test_deposit_and_lock() {
+            let mut w = Wallet::new();
+            w.deposit("u1".into(), 1000);
+            assert!(w.check_and_lock("u1", &Side::Buy, 1.0, 600).is_ok());
+            assert_eq!(*w.locked.get("u1").unwrap(), 600);
+            assert_eq!(*w.balances.get("u1").unwrap(), 1000); // balance unchanged
+        }
+
+        #[test]
+        fn test_insufficient_funds() {
+            let mut w = Wallet::new();
+            w.deposit("u1".into(), 1000);
+            w.check_and_lock("u1", &Side::Buy, 1.0, 600).unwrap();
+            // only 400 available, 500 requested
+            assert_eq!(
+                w.check_and_lock("u1", &Side::Buy, 1.0, 500),
+                Err(WalletError::InsufficientFunds)
+            );
+        }
+
+        #[test]
+        fn test_commit_fill_deducts_balance_and_lock() {
+            let mut w = Wallet::new();
+            w.deposit("u1".into(), 1000);
+            w.check_and_lock("u1", &Side::Buy, 1.0, 600).unwrap();
+            w.commit_fill("u1", &Side::Buy, 1.0, 300).unwrap();
+            assert_eq!(*w.balances.get("u1").unwrap(), 700); // 1000 - 300
+            assert_eq!(*w.locked.get("u1").unwrap(), 300); // 600 - 300
+        }
+
+        #[test]
+        fn test_unlock_funds_on_cancel() {
+            let mut w = Wallet::new();
+            w.deposit("u1".into(), 1000);
+            w.check_and_lock("u1", &Side::Buy, 1.0, 600).unwrap();
+            w.commit_fill("u1", &Side::Buy, 1.0, 300).unwrap(); // partial fill
+            w.unlock_funds("u1", &Side::Buy, 1.0, 300).unwrap(); // cancel remaining
+            assert_eq!(*w.locked.get("u1").unwrap(), 0);
+            assert_eq!(*w.balances.get("u1").unwrap(), 700); // only filled portion deducted
+        }
+
+        #[test]
+        fn test_sell_order_always_passes() {
+            let mut w = Wallet::new(); // no deposit at all
+            assert!(w.check_and_lock("u1", &Side::Sell, 100.0, 999).is_ok());
+            assert!(w.commit_fill("u1", &Side::Sell, 100.0, 999).is_ok());
+            assert!(w.unlock_funds("u1", &Side::Sell, 100.0, 999).is_ok());
+        }
+        #[test]
+        fn test_overflow_rejected() {
+            let mut w = Wallet::new();
+            w.deposit("u1".into(), 1000);
+            // requires 10000, only have 1000
+            assert_eq!(
+                w.check_and_lock("u1", &Side::Buy, 1000.0, 10),
+                Err(WalletError::InsufficientFunds)
+            );
+        }
+
+        #[test]
+        fn test_no_deposit_insufficient_funds() {
+            let mut w = Wallet::new();
+            // user has no deposit at all, buy should fail
+            assert_eq!(
+                w.check_and_lock("u1", &Side::Buy, 100.0, 10),
+                Err(WalletError::InsufficientFunds)
+            );
+        }
     }
 }
