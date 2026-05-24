@@ -2,6 +2,11 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, HashMap},
 };
+mod order;
+mod sequencer;
+use std::time::Instant;
+
+use crate::sequencer::Sequencer;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Price(f64);
@@ -327,6 +332,33 @@ impl MatchingEngine {
 
         Ok(removed)
     }
+    /// Returns true if the order is still resting in an order book.
+    pub fn is_resting(&self, order_id: &str) -> bool {
+        self.order_location.contains_key(order_id)
+    }
+
+    /// Returns the remaining `leaves_qty` of a resting order, if it exists.
+    pub fn get_order_leaves(&self, order_id: &str) -> Option<u32> {
+        let symbol = self.order_location.get(order_id)?;
+        let book = self.order_books.get(symbol)?;
+        // We need to dig into the book’s order_map → PriceLevel → node
+        let (price, side) = book.order_map.get(order_id)?;
+        let level = match side {
+            Side::Buy => book.buy_levels.get(&Reverse(*price)),
+            Side::Sell => book.sell_levels.get(price),
+        }?;
+        let idx = level.order_map.get(order_id)?;
+        let node = &level.nodes[*idx];
+        node.order.as_ref().map(|o| o.leaves_qty)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OrderState {
+    New,
+    PartialFill { leaves_qty: u32 },
+    Filled,
+    Canceled,
 }
 
 impl PartialOrd for Price {
@@ -518,67 +550,161 @@ pub struct Execution {
     pub quantity: u32,
     pub timestamp: f64,
 }
-use std::time::Instant;
 
-fn main() {
-    let mut engine = MatchingEngine::new();
-    let n_orders = 100_000;
-    let mut seq: u64 = 1;
+pub struct OrderManager {
+    engine: MatchingEngine,
+    sequencer: Sequencer,
+    order_states: HashMap<String, OrderState>,
+    execution_callbacks: Vec<Box<dyn Fn(Execution)>>,
+}
 
-    // Generate a realistic mix of buy/sell orders with slightly varying prices
-    let orders: Vec<Order> = (0..n_orders)
-        .map(|i| {
-            let side = if i % 2 == 0 { "BUY" } else { "SELL" };
-            let price = 100.0 + ((i as f64 * 0.01) % 1.0) - 0.5; // 99.5 .. 100.5
-            let qty = (i % 5 + 1) as u32;
-            let seq_num = seq;
-            seq += 1;
-            Order::new(
-                format!("order_{}", i),
-                format!("user_{}", i % 100), // 100 distinct users
-                "AAPL".into(),
-                side,
-                price,
-                qty,
-                None,
-                i as f64 * 0.001, // increasing timestamps
-                seq_num,
-            )
-            .expect("valid order")
-        })
-        .collect();
-
-    let start = Instant::now();
-
-    let mut total_executions = 0;
-    for order in orders {
-        match engine.process_order(order) {
-            Ok(execs) => total_executions += execs.len(),
-            Err(e) => {
-                eprintln!("Error processing order: {}", e);
-                std::process::exit(1);
-            }
+impl OrderManager {
+    pub fn new() -> Self {
+        Self {
+            engine: MatchingEngine::new(),
+            sequencer: Sequencer::new(1),
+            order_states: HashMap::new(),
+            execution_callbacks: Vec::new(),
         }
     }
+    pub fn place_order(&mut self, mut order: Order) -> Result<Vec<Execution>, String> {
+        order.seq_num = self.sequencer.next();
 
-    let elapsed = start.elapsed();
-    let throughput = n_orders as f64 / elapsed.as_secs_f64();
+        let order_id = order.order_id.clone();
+        let original_qty = order.quantity;
+        let fills = self.engine.process_order(order)?;
 
-    println!(
-        "Processed {} orders in {:.3} s",
-        n_orders,
-        elapsed.as_secs_f64()
-    );
-    println!("Throughput: {:.0} orders/sec", throughput);
-    println!("Total executions generated: {}", total_executions);
+        // After engine.process_order() returns fills:
 
-    assert!(
-        throughput > 10_000.0,
-        "Throughput below target: {:.0}",
-        throughput
-    );
-    println!("\n✅ Benchmark passed – Phase 1 throughput target met!");
+        // -- Update state for the incoming order itself
+        let incoming_id = order_id.clone();
+        if self.engine.is_resting(&incoming_id) {
+            let leaves = self
+                .engine
+                .get_order_leaves(&incoming_id)
+                .unwrap_or(original_qty);
+            self.order_states
+                .insert(incoming_id, OrderState::PartialFill { leaves_qty: leaves });
+        } else {
+            self.order_states.insert(incoming_id, OrderState::Filled);
+        }
+
+        // -- Update states for any resting orders that were involved in fills
+        for exec in &fills {
+            // Update the sell side
+            if !self.engine.is_resting(&exec.sell_order_id) {
+                self.order_states
+                    .insert(exec.sell_order_id.clone(), OrderState::Filled);
+            } else {
+                if let Some(leaves) = self.engine.get_order_leaves(&exec.sell_order_id) {
+                    self.order_states.insert(
+                        exec.sell_order_id.clone(),
+                        OrderState::PartialFill { leaves_qty: leaves },
+                    );
+                }
+            }
+            // Update the buy side (if it was a resting order, not the incoming one)
+            if exec.buy_order_id != order_id {
+                // avoid double‑updating the incoming order
+                if !self.engine.is_resting(&exec.buy_order_id) {
+                    self.order_states
+                        .insert(exec.buy_order_id.clone(), OrderState::Filled);
+                } else {
+                    if let Some(leaves) = self.engine.get_order_leaves(&exec.buy_order_id) {
+                        self.order_states.insert(
+                            exec.buy_order_id.clone(),
+                            OrderState::PartialFill { leaves_qty: leaves },
+                        );
+                    }
+                }
+            }
+        }
+        for exec in &fills {
+            for cb in &self.execution_callbacks {
+                cb(exec.clone());
+            }
+        }
+        Ok(fills)
+    }
+
+    pub fn cancel_order(&mut self, order_id: &str) -> Result<Option<Order>, String> {
+        let cancel_seq = self.sequencer.next();
+        let removed = self.engine.cancel_order(order_id, cancel_seq)?;
+
+        if removed.is_some() {
+            self.order_states
+                .insert(order_id.to_string(), OrderState::Canceled);
+        }
+
+        Ok(removed)
+    }
+
+    pub fn get_order_state(&self, order_id: &str) -> Option<OrderState> {
+        self.order_states.get(order_id).copied()
+    }
+
+    pub fn best_bid_ask(&self, symbol: &str) -> Option<((f64, u32), (f64, u32))> {
+        self.engine.best_bid_ask(symbol)
+    }
+
+    /// Registers a callback that will be invoked for every execution.
+    pub fn subscribe<F: Fn(Execution) + 'static>(&mut self, callback: F) {
+        self.execution_callbacks.push(Box::new(callback));
+    }
 }
+
+fn main() {
+    let mut om = OrderManager::new();
+
+    // Subscribe to all executions
+    om.subscribe(|exec| {
+        println!(
+            "EXECUTION: {} @ {} qty {}",
+            exec.symbol, exec.price, exec.quantity
+        );
+    });
+
+    // Place a few orders
+    let o1 = Order::new(
+        "o1".into(),
+        "u1".into(),
+        "AAPL".into(),
+        "SELL",
+        100.0,
+        10,
+        None,
+        1.0,
+        0,
+    )
+    .unwrap();
+    let o2 = Order::new(
+        "o2".into(),
+        "u2".into(),
+        "AAPL".into(),
+        "BUY",
+        100.0,
+        7,
+        None,
+        2.0,
+        0,
+    )
+    .unwrap();
+
+    let fills = om.place_order(o1).unwrap();
+    println!("After o1: {:?}", fills);
+    println!("State o1: {:?}", om.get_order_state("o1"));
+
+    let fills = om.place_order(o2).unwrap();
+    println!("After o2: {:?}", fills);
+    println!("State o1: {:?}", om.get_order_state("o1"));
+    println!("State o2: {:?}", om.get_order_state("o2"));
+
+    // Cancel remaining o1
+    let cancelled = om.cancel_order("o1").unwrap();
+    println!("Cancelled o1: {:?}", cancelled);
+    println!("State o1 after cancel: {:?}", om.get_order_state("o1"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
