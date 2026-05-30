@@ -559,7 +559,7 @@ pub struct OrderManager {
 
 // Custom error type — no external crates needed
 #[derive(Debug, PartialEq)]
-enum OrderManagerError {
+pub enum OrderManagerError {
     AlreadyExists(String),     // duplicate order_id
     OrderNotFound(String),     // no such order
     InvalidTransition(String), // e.g. cancel a Filled order
@@ -717,35 +717,41 @@ impl RiskManager {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum OrderStateNew {
+pub enum OrderStateNew {
     New,
     PartiallyFilled,
     Filled,
     Canceled,
 }
 
-struct ManagedOrder {
-    order: Order,
-    state: OrderStateNew,
-    remaining_quantity: u32,
+pub struct ManagedOrder {
+    pub order: Order,
+    pub state: OrderStateNew,
+    pub remaining_quantity: u32,
 }
 
-struct OrderManagerNew {
-    orders: HashMap<String, ManagedOrder>,
-    risk_manager: RiskManager,
-    wallet: Wallet,
+pub struct OrderManagerNew {
+    pub orders: HashMap<String, ManagedOrder>,
+    pub risk_manager: RiskManager,
+    pub wallet: Wallet,
+    pub engine: MatchingEngine,
+    pub sequencer: Sequencer,
+    execution_callbacks: Vec<Box<dyn Fn(Execution)>>,
 }
 
 impl OrderManagerNew {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             orders: HashMap::new(),
             risk_manager: RiskManager::new(),
             wallet: Wallet::new(),
+            engine: MatchingEngine::new(),
+            sequencer: Sequencer::new(1),
+            execution_callbacks: Vec::new(),
         }
     }
 
-    pub fn add_order(&mut self, order: Order) -> Result<(), OrderManagerError> {
+    pub fn add_order(&mut self, mut order: Order) -> Result<(), OrderManagerError> {
         if self.orders.contains_key(&order.order_id) {
             return Err(OrderManagerError::AlreadyExists(order.order_id.clone()));
         }
@@ -760,47 +766,105 @@ impl OrderManagerNew {
                 order.quantity as u64,
             )
             .map_err(|e| OrderManagerError::WalletRejected(format!("{:?}", e)))?;
+
+        let new_seq = self.sequencer.next();
+
+        order.seq_num = new_seq;
+
+        let order_id = order.order_id.clone();
+        let original_qty = order.quantity;
+        let og_order = order.clone();
+        let fills = self
+            .engine
+            .process_order(order)
+            .map_err(OrderManagerError::RiskRejected)?;
+
         self.orders.insert(
-            order.order_id.clone(),
+            order_id,
             ManagedOrder {
-                order: order.clone(),
+                order: og_order,
                 state: OrderStateNew::New,
-                remaining_quantity: order.quantity,
+                remaining_quantity: original_qty,
             },
         );
+        for fill in fills {
+            self.record_fill(&fill.buy_order_id, fill.quantity)?;
+            self.record_fill(&fill.sell_order_id, fill.quantity)?;
+
+            // Settle trade cash: transfer cash from the buyer to the seller!
+            let buyer_user_id = self
+                .orders
+                .get(&fill.buy_order_id)
+                .map(|o| o.order.user_id.clone());
+            let seller_user_id = self
+                .orders
+                .get(&fill.sell_order_id)
+                .map(|o| o.order.user_id.clone());
+
+            if let (Some(_buyer), Some(seller)) = (buyer_user_id, seller_user_id) {
+                let cash_amount = (fill.price * fill.quantity as f64) as u64;
+                self.wallet.deposit(seller, cash_amount);
+            }
+
+            // Trigger subscriber callbacks
+            for cb in &self.execution_callbacks {
+                cb(fill.clone());
+            }
+        }
 
         Ok(())
     }
 
-    fn cancel_order(&mut self, order_id: &str) -> Result<(), OrderManagerError> {
-        let managed = self
-            .orders
-            .get_mut(order_id)
-            .ok_or_else(|| OrderManagerError::OrderNotFound(order_id.to_string()))?;
+    pub fn cancel_order(&mut self, order_id: &str) -> Result<(), OrderManagerError> {
+        // 1. Fetch the order locally first to verify its current state and avoid borrow issues
+        let (state, user_id, side, price, remaining) = {
+            let managed = self
+                .orders
+                .get(order_id)
+                .ok_or_else(|| OrderManagerError::OrderNotFound(order_id.to_string()))?;
+            (
+                managed.state,
+                managed.order.user_id.clone(),
+                managed.order.side.clone(),
+                managed.order.price,
+                managed.remaining_quantity,
+            )
+        };
 
-        let user_id = managed.order.user_id.clone();
-        let side = managed.order.side.clone();
-        let price = managed.order.price;
-        let remaining = managed.remaining_quantity;
+        // 2. Reject if the order is already in a terminal state
+        match state {
+            OrderStateNew::Filled => {
+                return Err(OrderManagerError::InvalidTransition(format!(
+                    "order {} is already Filled",
+                    order_id
+                )));
+            }
+            OrderStateNew::Canceled => {
+                return Err(OrderManagerError::InvalidTransition(format!(
+                    "order {} is already Canceled",
+                    order_id
+                )));
+            }
+            _ => {}
+        }
+
+        // 3. Call the matching engine to cancel it there (if it's resting)
+        let cancel_seq = self.sequencer.next();
+        let _ = self
+            .engine
+            .cancel_order(order_id, cancel_seq)
+            .map_err(OrderManagerError::OrderNotFound)?;
+
+        // 4. If matching engine cancellation succeeds, unlock funds and transition state
         let _ = self
             .wallet
             .unlock_funds(&user_id, &side, price, remaining as u64);
 
-        // Only New or PartiallyFilled can be canceled
-        match managed.state {
-            OrderStateNew::New | OrderStateNew::PartiallyFilled => {
-                managed.state = OrderStateNew::Canceled;
-                Ok(())
-            }
-            OrderStateNew::Filled => Err(OrderManagerError::InvalidTransition(format!(
-                "order {} is already Filled",
-                order_id
-            ))),
-            OrderStateNew::Canceled => Err(OrderManagerError::InvalidTransition(format!(
-                "order {} is already Canceled",
-                order_id
-            ))),
+        if let Some(managed) = self.orders.get_mut(order_id) {
+            managed.state = OrderStateNew::Canceled;
         }
+
+        Ok(())
     }
 
     fn record_fill(&mut self, order_id: &str, filled_qty: u32) -> Result<(), OrderManagerError> {
@@ -844,8 +908,12 @@ impl OrderManagerNew {
         Ok(())
     }
 
-    fn get_state(&self, order_id: &str) -> Option<OrderStateNew> {
+    pub fn get_state(&self, order_id: &str) -> Option<OrderStateNew> {
         self.orders.get(order_id).map(|m| m.state)
+    }
+
+    pub fn subscribe<F: Fn(Execution) + 'static>(&mut self, callback: F) {
+        self.execution_callbacks.push(Box::new(callback));
     }
 }
 
@@ -1140,6 +1208,108 @@ mod om_tests {
             om.cancel_order("ghost").unwrap_err(),
             OrderManagerError::OrderNotFound("ghost".into())
         );
+    }
+
+    #[test]
+    fn test_connected_order_manager_matching_and_wallet_transfer() {
+        let mut om = OrderManagerNew::new();
+        
+        // 1. Setup wallets
+        om.wallet.deposit("u1".to_string(), 1000); // Buyer has 1000
+        
+        // 2. Setup subscription
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        let executions_count = Arc::new(AtomicU32::new(0));
+        let exec_count_clone = executions_count.clone();
+        om.subscribe(move |_exec| {
+            exec_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // 3. Place resting SELL order
+        let o_sell = Order::new(
+            "o_sell".to_string(),
+            "u2".to_string(),
+            "AAPL".to_string(),
+            "SELL",
+            100.0,
+            10,
+            None,
+            1.0,
+            0,
+        )
+        .unwrap();
+        om.add_order(o_sell).unwrap();
+
+        // 4. Place matching BUY order
+        let o_buy = Order::new(
+            "o_buy".to_string(),
+            "u1".to_string(),
+            "AAPL".to_string(),
+            "BUY",
+            100.0,
+            10,
+            None,
+            2.0,
+            0,
+        )
+        .unwrap();
+        om.add_order(o_buy).unwrap();
+
+        // 5. Verify states
+        assert_eq!(om.get_state("o_sell"), Some(OrderStateNew::Filled));
+        assert_eq!(om.get_state("o_buy"), Some(OrderStateNew::Filled));
+
+        // 6. Verify cash transfer
+        assert_eq!(om.wallet.balances.get("u1").copied().unwrap_or(0), 0);
+        assert_eq!(om.wallet.locked.get("u1").copied().unwrap_or(0), 0);
+        assert_eq!(om.wallet.balances.get("u2").copied().unwrap_or(0), 1000);
+
+        // 7. Verify subscription callbacks (2 executions: 1 buy fill, 1 sell fill)
+        assert_eq!(executions_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_connected_cancellation_in_engine() {
+        let mut om = OrderManagerNew::new();
+
+        // 1. Place resting SELL order
+        let o_sell = Order::new(
+            "o_sell".to_string(),
+            "u2".to_string(),
+            "AAPL".to_string(),
+            "SELL",
+            100.0,
+            10,
+            None,
+            1.0,
+            0,
+        )
+        .unwrap();
+        om.add_order(o_sell).unwrap();
+
+        // 2. Cancel the order
+        om.cancel_order("o_sell").unwrap();
+        assert_eq!(om.get_state("o_sell"), Some(OrderStateNew::Canceled));
+
+        // 3. Placing a matching BUY order should NOT trade since the SELL was canceled in the engine
+        om.wallet.deposit("u1".to_string(), 1000);
+        let o_buy = Order::new(
+            "o_buy".to_string(),
+            "u1".to_string(),
+            "AAPL".to_string(),
+            "BUY",
+            100.0,
+            10,
+            None,
+            2.0,
+            0,
+        )
+        .unwrap();
+        om.add_order(o_buy).unwrap();
+
+        // BUY order should just rest as New because SELL order is gone
+        assert_eq!(om.get_state("o_buy"), Some(OrderStateNew::New));
     }
     #[cfg(test)]
     mod risk_tests {
