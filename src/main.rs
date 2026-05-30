@@ -4,7 +4,6 @@ use std::{
 };
 mod order;
 mod sequencer;
-use std::time::Instant;
 
 use crate::sequencer::Sequencer;
 
@@ -568,6 +567,7 @@ enum OrderManagerError {
     RiskRejected(String),
     WalletRejected(String),
 }
+
 impl OrderManager {
     pub fn new() -> Self {
         Self {
