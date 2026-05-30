@@ -787,26 +787,25 @@ impl OrderManagerNew {
                 remaining_quantity: original_qty,
             },
         );
-        for fill in fills {
-            self.record_fill(&fill.buy_order_id, fill.quantity)?;
-            self.record_fill(&fill.sell_order_id, fill.quantity)?;
+        for chunk in fills.chunks(2) {
+            if chunk.len() == 2 {
+                let buy_exec = &chunk[0];
+                self.record_fill(&buy_exec.buy_order_id, buy_exec.quantity)?;
+                self.record_fill(&buy_exec.sell_order_id, buy_exec.quantity)?;
 
-            // Settle trade cash: transfer cash from the buyer to the seller!
-            let buyer_user_id = self
-                .orders
-                .get(&fill.buy_order_id)
-                .map(|o| o.order.user_id.clone());
-            let seller_user_id = self
-                .orders
-                .get(&fill.sell_order_id)
-                .map(|o| o.order.user_id.clone());
+                // Settle trade cash: transfer cash from the buyer to the seller!
+                let buyer_user_id = self.orders.get(&buy_exec.buy_order_id).map(|o| o.order.user_id.clone());
+                let seller_user_id = self.orders.get(&buy_exec.sell_order_id).map(|o| o.order.user_id.clone());
 
-            if let (Some(_buyer), Some(seller)) = (buyer_user_id, seller_user_id) {
-                let cash_amount = (fill.price * fill.quantity as f64) as u64;
-                self.wallet.deposit(seller, cash_amount);
+                if let (Some(_buyer), Some(seller)) = (buyer_user_id, seller_user_id) {
+                    let cash_amount = (buy_exec.price * buy_exec.quantity as f64) as u64;
+                    self.wallet.deposit(seller, cash_amount);
+                }
             }
+        }
 
-            // Trigger subscriber callbacks
+        // Trigger subscriber callbacks for both parties
+        for fill in &fills {
             for cb in &self.execution_callbacks {
                 cb(fill.clone());
             }
