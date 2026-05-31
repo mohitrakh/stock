@@ -1,12 +1,31 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, HashMap},
+    net::SocketAddr,
 };
 mod order;
 mod sequencer;
+use crate::{models::user::User, sequencer::Sequencer};
+mod error;
+use axum::{Router, routing::get};
+use dotenvy::dotenv;
+use tokio::net::TcpListener;
 
-use crate::sequencer::Sequencer;
+mod routes {
+    pub mod user_routes;
+}
 
+mod controllers {
+    pub mod user_controller;
+}
+
+mod models {
+    pub mod user;
+}
+mod db;
+mod state;
+
+use state::AppState;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Price(f64);
 
@@ -794,8 +813,14 @@ impl OrderManagerNew {
                 self.record_fill(&buy_exec.sell_order_id, buy_exec.quantity)?;
 
                 // Settle trade cash: transfer cash from the buyer to the seller!
-                let buyer_user_id = self.orders.get(&buy_exec.buy_order_id).map(|o| o.order.user_id.clone());
-                let seller_user_id = self.orders.get(&buy_exec.sell_order_id).map(|o| o.order.user_id.clone());
+                let buyer_user_id = self
+                    .orders
+                    .get(&buy_exec.buy_order_id)
+                    .map(|o| o.order.user_id.clone());
+                let seller_user_id = self
+                    .orders
+                    .get(&buy_exec.sell_order_id)
+                    .map(|o| o.order.user_id.clone());
 
                 if let (Some(_buyer), Some(seller)) = (buyer_user_id, seller_user_id) {
                     let cash_amount = (buy_exec.price * buy_exec.quantity as f64) as u64;
@@ -1021,440 +1046,21 @@ impl Wallet {
         Ok(())
     }
 }
-fn main() {
-    let mut om = OrderManager::new();
+#[tokio::main]
+async fn main() {
+    dotenv().ok();
+    let db = db::connect_db().await;
 
-    // Subscribe to all executions
-    om.subscribe(|exec| {
-        println!(
-            "EXECUTION: {} @ {} qty {}",
-            exec.symbol, exec.price, exec.quantity
-        );
-    });
+    let state = AppState { db };
 
-    // Place a few orders
-    let o1 = Order::new(
-        "o1".into(),
-        "u1".into(),
-        "AAPL".into(),
-        "SELL",
-        100.0,
-        10,
-        None,
-        1.0,
-        0,
-    )
-    .unwrap();
-    let o2 = Order::new(
-        "o2".into(),
-        "u2".into(),
-        "AAPL".into(),
-        "BUY",
-        100.0,
-        7,
-        None,
-        2.0,
-        0,
-    )
-    .unwrap();
+    let app = Router::new()
+        .route("/health", get(|| async { "OK" }))
+        .nest("/users", routes::user_routes::user_routes())
+        .with_state(state);
 
-    let fills = om.place_order(o1).unwrap();
-    println!("After o1: {:?}", fills);
-    println!("State o1: {:?}", om.get_order_state("o1"));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
 
-    let fills = om.place_order(o2).unwrap();
-    println!("After o2: {:?}", fills);
-    println!("State o1: {:?}", om.get_order_state("o1"));
-    println!("State o2: {:?}", om.get_order_state("o2"));
-
-    // Cancel remaining o1
-    let cancelled = om.cancel_order("o1").unwrap();
-    println!("Cancelled o1: {:?}", cancelled);
-    println!("State o1 after cancel: {:?}", om.get_order_state("o1"));
-}
-#[cfg(test)]
-mod om_tests {
-    use super::*;
-
-    fn sample_order(id: &str, qty: u32) -> Order {
-        Order::new(
-            id.to_string(),
-            "user1".to_string(),
-            "AAPL".to_string(),
-            "SELL",
-            100.0,
-            qty,
-            None,
-            1.0,
-            0,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn test_add_order_state_is_new() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        assert_eq!(om.get_state("o1"), Some(OrderStateNew::New));
-    }
-
-    #[test]
-    fn test_add_duplicate_fails() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        let err = om.add_order(sample_order("o1", 10)).unwrap_err();
-        assert_eq!(err, OrderManagerError::AlreadyExists("o1".into()));
-    }
-
-    #[test]
-    fn test_partial_fill_new_to_partially_filled() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        om.record_fill("o1", 4).unwrap();
-        assert_eq!(om.get_state("o1"), Some(OrderStateNew::PartiallyFilled));
-        assert_eq!(om.orders["o1"].remaining_quantity, 6);
-    }
-
-    #[test]
-    fn test_full_fill_goes_to_filled() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        om.record_fill("o1", 10).unwrap();
-        assert_eq!(om.get_state("o1"), Some(OrderStateNew::Filled));
-        assert_eq!(om.orders["o1"].remaining_quantity, 0);
-    }
-
-    #[test]
-    fn test_multiple_partials_then_filled() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        om.record_fill("o1", 3).unwrap();
-        assert_eq!(om.get_state("o1"), Some(OrderStateNew::PartiallyFilled));
-        om.record_fill("o1", 3).unwrap();
-        assert_eq!(om.get_state("o1"), Some(OrderStateNew::PartiallyFilled));
-        om.record_fill("o1", 4).unwrap();
-        assert_eq!(om.get_state("o1"), Some(OrderStateNew::Filled));
-    }
-
-    #[test]
-    fn test_cancel_from_new() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        om.cancel_order("o1").unwrap();
-        assert_eq!(om.get_state("o1"), Some(OrderStateNew::Canceled));
-    }
-
-    #[test]
-    fn test_cancel_from_partially_filled() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        om.record_fill("o1", 4).unwrap();
-        om.cancel_order("o1").unwrap();
-        assert_eq!(om.get_state("o1"), Some(OrderStateNew::Canceled));
-    }
-
-    #[test]
-    fn test_cancel_filled_fails() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        om.record_fill("o1", 10).unwrap();
-        assert!(matches!(
-            om.cancel_order("o1").unwrap_err(),
-            OrderManagerError::InvalidTransition(_)
-        ));
-    }
-
-    #[test]
-    fn test_cancel_already_canceled_fails() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        om.cancel_order("o1").unwrap();
-        assert!(matches!(
-            om.cancel_order("o1").unwrap_err(),
-            OrderManagerError::InvalidTransition(_)
-        ));
-    }
-
-    #[test]
-    fn test_overfill_rejected() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        assert!(matches!(
-            om.record_fill("o1", 11).unwrap_err(),
-            OrderManagerError::OverFill(_)
-        ));
-    }
-
-    #[test]
-    fn test_fill_terminal_order_fails() {
-        let mut om = OrderManagerNew::new();
-        om.add_order(sample_order("o1", 10)).unwrap();
-        om.record_fill("o1", 10).unwrap();
-        assert!(matches!(
-            om.record_fill("o1", 1).unwrap_err(),
-            OrderManagerError::InvalidTransition(_)
-        ));
-    }
-
-    #[test]
-    fn test_unknown_order_errors() {
-        let mut om = OrderManagerNew::new();
-        assert_eq!(
-            om.record_fill("ghost", 5).unwrap_err(),
-            OrderManagerError::OrderNotFound("ghost".into())
-        );
-        assert_eq!(
-            om.cancel_order("ghost").unwrap_err(),
-            OrderManagerError::OrderNotFound("ghost".into())
-        );
-    }
-
-    #[test]
-    fn test_connected_order_manager_matching_and_wallet_transfer() {
-        let mut om = OrderManagerNew::new();
-        
-        // 1. Setup wallets
-        om.wallet.deposit("u1".to_string(), 1000); // Buyer has 1000
-        
-        // 2. Setup subscription
-        use std::sync::atomic::{AtomicU32, Ordering};
-        use std::sync::Arc;
-        let executions_count = Arc::new(AtomicU32::new(0));
-        let exec_count_clone = executions_count.clone();
-        om.subscribe(move |_exec| {
-            exec_count_clone.fetch_add(1, Ordering::SeqCst);
-        });
-
-        // 3. Place resting SELL order
-        let o_sell = Order::new(
-            "o_sell".to_string(),
-            "u2".to_string(),
-            "AAPL".to_string(),
-            "SELL",
-            100.0,
-            10,
-            None,
-            1.0,
-            0,
-        )
-        .unwrap();
-        om.add_order(o_sell).unwrap();
-
-        // 4. Place matching BUY order
-        let o_buy = Order::new(
-            "o_buy".to_string(),
-            "u1".to_string(),
-            "AAPL".to_string(),
-            "BUY",
-            100.0,
-            10,
-            None,
-            2.0,
-            0,
-        )
-        .unwrap();
-        om.add_order(o_buy).unwrap();
-
-        // 5. Verify states
-        assert_eq!(om.get_state("o_sell"), Some(OrderStateNew::Filled));
-        assert_eq!(om.get_state("o_buy"), Some(OrderStateNew::Filled));
-
-        // 6. Verify cash transfer
-        assert_eq!(om.wallet.balances.get("u1").copied().unwrap_or(0), 0);
-        assert_eq!(om.wallet.locked.get("u1").copied().unwrap_or(0), 0);
-        assert_eq!(om.wallet.balances.get("u2").copied().unwrap_or(0), 1000);
-
-        // 7. Verify subscription callbacks (2 executions: 1 buy fill, 1 sell fill)
-        assert_eq!(executions_count.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn test_connected_cancellation_in_engine() {
-        let mut om = OrderManagerNew::new();
-
-        // 1. Place resting SELL order
-        let o_sell = Order::new(
-            "o_sell".to_string(),
-            "u2".to_string(),
-            "AAPL".to_string(),
-            "SELL",
-            100.0,
-            10,
-            None,
-            1.0,
-            0,
-        )
-        .unwrap();
-        om.add_order(o_sell).unwrap();
-
-        // 2. Cancel the order
-        om.cancel_order("o_sell").unwrap();
-        assert_eq!(om.get_state("o_sell"), Some(OrderStateNew::Canceled));
-
-        // 3. Placing a matching BUY order should NOT trade since the SELL was canceled in the engine
-        om.wallet.deposit("u1".to_string(), 1000);
-        let o_buy = Order::new(
-            "o_buy".to_string(),
-            "u1".to_string(),
-            "AAPL".to_string(),
-            "BUY",
-            100.0,
-            10,
-            None,
-            2.0,
-            0,
-        )
-        .unwrap();
-        om.add_order(o_buy).unwrap();
-
-        // BUY order should just rest as New because SELL order is gone
-        assert_eq!(om.get_state("o_buy"), Some(OrderStateNew::New));
-    }
-    #[cfg(test)]
-    mod risk_tests {
-        use super::*;
-
-        fn make_order(user_id: &str, symbol: &str, qty: u32) -> Order {
-            Order::new(
-                format!("o-{}-{}", user_id, qty),
-                user_id.to_string(),
-                symbol.to_string(),
-                "SELL",
-                100.0,
-                qty,
-                None,
-                1.0,
-                0,
-            )
-            .unwrap()
-        }
-
-        #[test]
-        fn test_under_limit_passes() {
-            let mut om = OrderManagerNew::new();
-            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
-            assert!(om.add_order(make_order("u1", "AAPL", 500)).is_ok());
-            // volume is now 500
-        }
-
-        #[test]
-        fn test_exceeds_limit_rejected() {
-            let mut om = OrderManagerNew::new();
-            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
-            om.add_order(make_order("u1", "AAPL", 500)).unwrap();
-            // 500 + 600 = 1100 > 1000, should fail
-            assert!(matches!(
-                om.add_order(make_order("u1", "AAPL", 600)).unwrap_err(),
-                OrderManagerError::RiskRejected(_)
-            ));
-        }
-
-        #[test]
-        fn test_exact_limit_passes() {
-            let mut om = OrderManagerNew::new();
-            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
-            om.add_order(make_order("u1", "AAPL", 500)).unwrap();
-            // use 499 + 1 would also work, but simplest fix: different qty = different ID
-            assert!(om.add_order(make_order("u1", "AAPL", 499)).is_ok()); // 500+499=999 ≤ 1000
-        }
-
-        #[test]
-        fn test_different_user_unaffected() {
-            let mut om = OrderManagerNew::new();
-            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
-            om.add_order(make_order("u1", "AAPL", 900)).unwrap();
-            // u2 has no limit, should always pass
-            assert!(om.add_order(make_order("u2", "AAPL", 9999)).is_ok());
-        }
-
-        #[test]
-        fn test_no_limit_set_always_passes() {
-            let mut om = OrderManagerNew::new();
-            // no limits configured at all
-            assert!(om.add_order(make_order("u1", "AAPL", 99999)).is_ok());
-        }
-
-        #[test]
-        fn test_different_symbol_unaffected() {
-            let mut om = OrderManagerNew::new();
-            om.risk_manager.set_limit("u1".into(), "AAPL".into(), 1000);
-            om.add_order(make_order("u1", "AAPL", 900)).unwrap();
-            // TSLA has no limit for u1, should pass
-            assert!(om.add_order(make_order("u1", "TSLA", 9999)).is_ok());
-        }
-    }
-    #[cfg(test)]
-    mod wallet_tests {
-        use super::*;
-
-        #[test]
-        fn test_deposit_and_lock() {
-            let mut w = Wallet::new();
-            w.deposit("u1".into(), 1000);
-            assert!(w.check_and_lock("u1", &Side::Buy, 1.0, 600).is_ok());
-            assert_eq!(*w.locked.get("u1").unwrap(), 600);
-            assert_eq!(*w.balances.get("u1").unwrap(), 1000); // balance unchanged
-        }
-
-        #[test]
-        fn test_insufficient_funds() {
-            let mut w = Wallet::new();
-            w.deposit("u1".into(), 1000);
-            w.check_and_lock("u1", &Side::Buy, 1.0, 600).unwrap();
-            // only 400 available, 500 requested
-            assert_eq!(
-                w.check_and_lock("u1", &Side::Buy, 1.0, 500),
-                Err(WalletError::InsufficientFunds)
-            );
-        }
-
-        #[test]
-        fn test_commit_fill_deducts_balance_and_lock() {
-            let mut w = Wallet::new();
-            w.deposit("u1".into(), 1000);
-            w.check_and_lock("u1", &Side::Buy, 1.0, 600).unwrap();
-            w.commit_fill("u1", &Side::Buy, 1.0, 300).unwrap();
-            assert_eq!(*w.balances.get("u1").unwrap(), 700); // 1000 - 300
-            assert_eq!(*w.locked.get("u1").unwrap(), 300); // 600 - 300
-        }
-
-        #[test]
-        fn test_unlock_funds_on_cancel() {
-            let mut w = Wallet::new();
-            w.deposit("u1".into(), 1000);
-            w.check_and_lock("u1", &Side::Buy, 1.0, 600).unwrap();
-            w.commit_fill("u1", &Side::Buy, 1.0, 300).unwrap(); // partial fill
-            w.unlock_funds("u1", &Side::Buy, 1.0, 300).unwrap(); // cancel remaining
-            assert_eq!(*w.locked.get("u1").unwrap(), 0);
-            assert_eq!(*w.balances.get("u1").unwrap(), 700); // only filled portion deducted
-        }
-
-        #[test]
-        fn test_sell_order_always_passes() {
-            let mut w = Wallet::new(); // no deposit at all
-            assert!(w.check_and_lock("u1", &Side::Sell, 100.0, 999).is_ok());
-            assert!(w.commit_fill("u1", &Side::Sell, 100.0, 999).is_ok());
-            assert!(w.unlock_funds("u1", &Side::Sell, 100.0, 999).is_ok());
-        }
-        #[test]
-        fn test_overflow_rejected() {
-            let mut w = Wallet::new();
-            w.deposit("u1".into(), 1000);
-            // requires 10000, only have 1000
-            assert_eq!(
-                w.check_and_lock("u1", &Side::Buy, 1000.0, 10),
-                Err(WalletError::InsufficientFunds)
-            );
-        }
-
-        #[test]
-        fn test_no_deposit_insufficient_funds() {
-            let mut w = Wallet::new();
-            // user has no deposit at all, buy should fail
-            assert_eq!(
-                w.check_and_lock("u1", &Side::Buy, 100.0, 10),
-                Err(WalletError::InsufficientFunds)
-            );
-        }
-    }
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    println!("Server is listening on port 4000");
+    axum::serve(listener, app).await.unwrap();
 }
