@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use crate::sequencer::Sequencer;
 use super::matching_engine::MatchingEngine;
 use super::risk_manager::RiskManager;
 use super::types::{Execution, Order};
 use super::wallet::Wallet;
+use crate::sequencer::Sequencer;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum OrderState {
@@ -36,7 +36,7 @@ pub struct OrderManager {
     pub wallet: Wallet,
     pub engine: MatchingEngine,
     pub sequencer: Sequencer,
-    execution_callbacks: Vec<Box<dyn Fn(Execution)>>,
+    execution_callbacks: Vec<Box<dyn Fn(Execution) + Send + Sync>>,
 }
 
 impl OrderManager {
@@ -217,7 +217,7 @@ impl OrderManager {
         self.orders.get(order_id).map(|m| m.state)
     }
 
-    pub fn subscribe<F: Fn(Execution) + 'static>(&mut self, callback: F) {
+    pub fn subscribe<F: Fn(Execution) + Send + Sync + 'static>(&mut self, callback: F) {
         self.execution_callbacks.push(Box::new(callback));
     }
 }
