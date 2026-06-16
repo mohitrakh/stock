@@ -1,11 +1,9 @@
-use std::sync::{Arc, Mutex};
-
 use sqlx::PgPool;
-
-use crate::types::order_manager::OrderManager;
+use crossbeam_channel::Sender;
+use crate::types::types::ExchangeCommand;
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: PgPool,
-    pub order_manager: Arc<Mutex<OrderManager>>,
+    pub tx: Sender<ExchangeCommand>,
 }

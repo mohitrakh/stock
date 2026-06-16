@@ -1,4 +1,3 @@
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Price(f64);
 
@@ -121,5 +120,13 @@ pub enum RiskError {
 #[derive(Debug, PartialEq)]
 pub enum WalletError {
     InsufficientFunds,
-    Overlfow,
+    Overflow,
 }
+
+#[derive(Debug, Clone)]
+pub enum ExchangeCommand {
+    PlaceOrder(Order),
+    CancelOrder { order_id: String, user_id: String },
+    Deposit { user_id: String, amount: u64 },
+}
+
