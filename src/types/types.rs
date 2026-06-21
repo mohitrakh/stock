@@ -1,3 +1,5 @@
+use tokio::sync::oneshot;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Price(f64);
 
@@ -123,10 +125,20 @@ pub enum WalletError {
     Overflow,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ExchangeCommand {
-    PlaceOrder(Order),
-    CancelOrder { order_id: String, user_id: String },
-    Deposit { user_id: String, amount: u64 },
+    PlaceOrder {
+        order: Order,
+        respond_to: oneshot::Sender<Result<String, String>>,
+    },
+    CancelOrder {
+        order_id: String,
+        user_id: String,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    Deposit {
+        user_id: String,
+        amount: u64,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
 }
-

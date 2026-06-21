@@ -1,7 +1,4 @@
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::{net::SocketAddr, thread};
 
 mod error;
 mod middleware;
@@ -28,17 +25,19 @@ mod db;
 mod state;
 use state::AppState;
 
-use crate::types::order_manager::OrderManager;
+use crate::types::{order_manager::OrderManager, types::ExchangeCommand};
+
+const EXCHANGE_COMMAND_QUEUE_SIZE: usize = 10_000;
 
 #[tokio::main]
 async fn main() {
     dotenv().ok();
     let db = db::connect_db().await;
-    let order_manager = Arc::new(Mutex::new(OrderManager::new()));
-    let state = AppState {
-        db,
-        order_manager: order_manager,
-    };
+    let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
+
+    thread::spawn(move || run_exchange_worker(rx));
+
+    let state = AppState { db, tx };
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
@@ -51,4 +50,45 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await.unwrap();
     println!("Server is listening on port 4000");
     axum::serve(listener, app).await.unwrap();
+}
+
+fn run_exchange_worker(mut rx: tokio::sync::mpsc::Receiver<ExchangeCommand>) {
+    let mut order_manager = OrderManager::new();
+
+    while let Some(command) = rx.blocking_recv() {
+        match command {
+            ExchangeCommand::Deposit {
+                user_id,
+                amount,
+                respond_to,
+            } => {
+                order_manager.wallet.deposit(user_id, amount);
+                let _ = respond_to.send(Ok(()));
+            }
+            ExchangeCommand::PlaceOrder { order, respond_to } => {
+                let order_id = order.order_id.clone();
+                let result = order_manager
+                    .add_order(order)
+                    .map(|_| order_id)
+                    .map_err(|err| format!("{:?}", err));
+
+                let _ = respond_to.send(result);
+            }
+            ExchangeCommand::CancelOrder {
+                order_id,
+                user_id,
+                respond_to,
+            } => {
+                let result = match order_manager.orders.get(&order_id) {
+                    Some(managed) if managed.order.user_id == user_id => order_manager
+                        .cancel_order(&order_id)
+                        .map_err(|err| format!("{:?}", err)),
+                    Some(_) => Err("Unauthorized to cancel this order".to_string()),
+                    None => Err("Order not found".to_string()),
+                };
+
+                let _ = respond_to.send(result);
+            }
+        }
+    }
 }

@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    error::app_error::AppError, middleware::auth_middleware::AuthUser, state::AppState,
-    types::types::Order,
+    error::app_error::AppError,
+    middleware::auth_middleware::AuthUser,
+    state::AppState,
+    types::types::{ExchangeCommand, Order},
 };
 
 #[derive(Deserialize)]
@@ -35,8 +37,23 @@ pub async fn deposit(
     auth: AuthUser,
     Json(payload): Json<DepositeRequest>,
 ) -> Result<StatusCode, AppError> {
-    let mut om = state.order_manager.lock().unwrap();
-    om.wallet.deposit(auth.user_id, payload.amount);
+    let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+
+    state
+        .tx
+        .send(ExchangeCommand::Deposit {
+            user_id: auth.user_id,
+            amount: payload.amount,
+            respond_to,
+        })
+        .await
+        .map_err(|_| AppError::Validation("exchange worker is unavailable".to_string()))?;
+
+    response_rx
+        .await
+        .map_err(|_| AppError::Validation("exchange worker dropped response".to_string()))?
+        .map_err(AppError::Validation)?;
+
     Ok(StatusCode::OK)
 }
 
@@ -61,10 +78,21 @@ pub async fn place_order(
         0, // seq_num is set dynamically inside add_order
     )
     .map_err(|err| AppError::Validation(err))?;
-    let mut om = state.order_manager.lock().unwrap();
-    om.add_order(order)
-        .map_err(|err| AppError::Validation(format!("{:?}", err)))?;
-    Ok((StatusCode::CREATED, order_id))
+
+    let (respond_to, response_rx) = tokio::sync::oneshot::channel();
+
+    state
+        .tx
+        .send(ExchangeCommand::PlaceOrder { order, respond_to })
+        .await
+        .map_err(|_| AppError::Validation("exchange worker is unavailable".to_string()))?;
+
+    let created_order_id = response_rx
+        .await
+        .map_err(|_| AppError::Validation("exchange worker dropped response".to_string()))?
+        .map_err(AppError::Validation)?;
+
+    Ok((StatusCode::CREATED, created_order_id))
 }
 
 pub async fn cancel_order(
@@ -72,19 +100,28 @@ pub async fn cancel_order(
     auth: AuthUser,
     Json(payload): Json<CancelRequest>,
 ) -> Result<StatusCode, AppError> {
-    let mut om = state.order_manager.lock().unwrap();
+    let (respond_to, response_rx) = tokio::sync::oneshot::channel();
 
-    // Check if the order exists and belongs to this user first
-    if let Some(managed) = om.orders.get(&payload.order_id) {
-        if managed.order.user_id != auth.user_id {
-            return Err(AppError::Validation(
-                "Unauthorized to cancel this order".to_string(),
-            ));
-        }
-    } else {
-        return Err(AppError::NotFound);
-    }
-    om.cancel_order(&payload.order_id)
-        .map_err(|err| AppError::Validation(format!("{:?}", err)))?;
+    state
+        .tx
+        .send(ExchangeCommand::CancelOrder {
+            order_id: payload.order_id,
+            user_id: auth.user_id,
+            respond_to,
+        })
+        .await
+        .map_err(|_| AppError::Validation("exchange worker is unavailable".to_string()))?;
+
+    response_rx
+        .await
+        .map_err(|_| AppError::Validation("exchange worker dropped response".to_string()))?
+        .map_err(|err| {
+            if err == "Order not found" {
+                AppError::NotFound
+            } else {
+                AppError::Validation(err)
+            }
+        })?;
+
     Ok(StatusCode::OK)
 }

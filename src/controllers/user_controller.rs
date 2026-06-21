@@ -8,7 +8,6 @@ use bcrypt::{DEFAULT_COST, hash, verify};
 use chrono::{Duration, Utc};
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde::Serialize;
-use sqlx::PgPool;
 #[derive(Serialize)]
 pub struct UserResponse {
     pub id: u32,
