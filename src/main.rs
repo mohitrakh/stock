@@ -79,13 +79,9 @@ fn run_exchange_worker(mut rx: tokio::sync::mpsc::Receiver<ExchangeCommand>) {
                 user_id,
                 respond_to,
             } => {
-                let result = match order_manager.orders.get(&order_id) {
-                    Some(managed) if managed.order.user_id == user_id => order_manager
-                        .cancel_order(&order_id)
-                        .map_err(|err| format!("{:?}", err)),
-                    Some(_) => Err("Unauthorized to cancel this order".to_string()),
-                    None => Err("Order not found".to_string()),
-                };
+                let result = order_manager
+                    .cancel_order_for_user(&order_id, &user_id)
+                    .map_err(|err| format!("{:?}", err));
 
                 let _ = respond_to.send(result);
             }

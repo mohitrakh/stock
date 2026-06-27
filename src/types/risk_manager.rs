@@ -19,7 +19,7 @@ impl RiskManager {
         self.limits.insert((user_id, symbol), limit);
     }
 
-    pub fn check_and_record(&mut self, order: &Order) -> Result<(), RiskError> {
+    pub fn check(&self, order: &Order) -> Result<(), RiskError> {
         let key = (order.user_id.clone(), order.symbol.clone());
 
         // No limit set = unlimited, always pass
@@ -40,7 +40,22 @@ impl RiskManager {
             });
         }
 
+        Ok(())
+    }
+
+    pub fn record(&mut self, order: &Order) {
+        let key = (order.user_id.clone(), order.symbol.clone());
+        if !self.limits.contains_key(&key) {
+            return;
+        }
+
+        let incoming_qty = order.quantity as u64;
         *self.volumes.entry(key).or_insert(0) += incoming_qty;
+    }
+
+    pub fn check_and_record(&mut self, order: &Order) -> Result<(), RiskError> {
+        self.check(order)?;
+        self.record(order);
         Ok(())
     }
 }

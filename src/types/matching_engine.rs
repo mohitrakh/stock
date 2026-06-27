@@ -33,18 +33,35 @@ impl MatchingEngine {
         let seq_num = order.seq_num; // save before moving order
 
         // 2. Get or create the OrderBook for this symbol
-        let book = self
-            .order_books
-            .entry(symbol.clone())
-            .or_insert_with(|| OrderBook::new(symbol.clone()));
+        let (fills, is_incoming_resting, no_longer_resting) = {
+            let book = self
+                .order_books
+                .entry(symbol.clone())
+                .or_insert_with(|| OrderBook::new(symbol.clone()));
 
-        // 3. Place the order and get fills
-        let fills = book.place_order(order);
+            // 3. Place the order and get fills
+            let fills = book.place_order(order);
+            let is_incoming_resting = book.is_resting(&order_id);
+            let mut no_longer_resting = Vec::new();
+
+            for fill in &fills {
+                for filled_order_id in [&fill.buy_order_id, &fill.sell_order_id] {
+                    if !book.is_resting(filled_order_id) {
+                        no_longer_resting.push(filled_order_id.clone());
+                    }
+                }
+            }
+
+            (fills, is_incoming_resting, no_longer_resting)
+        };
 
         // 4. Update last sequence
         self.last_seq = seq_num;
+        for filled_order_id in no_longer_resting {
+            self.order_location.remove(&filled_order_id);
+        }
         // 5. If the order is still resting, remember its symbol for fast cancellation
-        if book.is_resting(&order_id) {
+        if is_incoming_resting {
             self.order_location.insert(order_id, symbol);
         }
 
