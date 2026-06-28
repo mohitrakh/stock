@@ -31,6 +31,12 @@ pub struct ManagedOrder {
     pub remaining_quantity: u32,
 }
 
+pub struct AddOrderOutcome {
+    pub order_id: String,
+    pub seq_num: u64,
+    pub executions: Vec<Execution>,
+}
+
 pub struct OrderManager {
     pub orders: HashMap<String, ManagedOrder>,
     pub risk_manager: RiskManager,
@@ -52,7 +58,7 @@ impl OrderManager {
         }
     }
 
-    pub fn add_order(&mut self, mut order: Order) -> Result<(), OrderManagerError> {
+    pub fn add_order(&mut self, mut order: Order) -> Result<AddOrderOutcome, OrderManagerError> {
         if self.orders.contains_key(&order.order_id) {
             return Err(OrderManagerError::AlreadyExists(order.order_id.clone()));
         }
@@ -77,7 +83,7 @@ impl OrderManager {
         let original_qty = order.quantity;
         let og_order = order.clone();
         self.orders.insert(
-            order_id,
+            order_id.clone(),
             ManagedOrder {
                 order: og_order,
                 state: OrderState::New,
@@ -102,7 +108,11 @@ impl OrderManager {
             }
         }
 
-        Ok(())
+        Ok(AddOrderOutcome {
+            order_id,
+            seq_num: new_seq,
+            executions: fills,
+        })
     }
 
     fn apply_execution(&mut self, execution: &Execution) -> Result<(), OrderManagerError> {
@@ -143,7 +153,7 @@ impl OrderManager {
         &mut self,
         order_id: &str,
         user_id: &str,
-    ) -> Result<(), OrderManagerError> {
+    ) -> Result<u64, OrderManagerError> {
         let managed = self
             .orders
             .get(order_id)
@@ -159,7 +169,7 @@ impl OrderManager {
         self.cancel_order(order_id)
     }
 
-    pub fn cancel_order(&mut self, order_id: &str) -> Result<(), OrderManagerError> {
+    pub fn cancel_order(&mut self, order_id: &str) -> Result<u64, OrderManagerError> {
         // 1. Fetch the order locally first to verify its current state and avoid borrow issues
         let (state, user_id, side, price, remaining) = {
             let managed = self
@@ -211,7 +221,7 @@ impl OrderManager {
             managed.state = OrderState::Canceled;
         }
 
-        Ok(())
+        Ok(cancel_seq)
     }
 
     fn record_fill(&mut self, order_id: &str, filled_qty: u32) -> Result<(), OrderManagerError> {

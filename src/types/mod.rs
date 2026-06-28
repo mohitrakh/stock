@@ -1,3 +1,4 @@
+pub mod exchange_event;
 pub mod matching_engine;
 pub mod order_book;
 pub mod order_manager;

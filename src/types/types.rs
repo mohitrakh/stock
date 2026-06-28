@@ -97,7 +97,7 @@ impl Order {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Execution {
     pub execution_id: String,
     pub buy_order_id: String,
