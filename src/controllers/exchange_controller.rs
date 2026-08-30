@@ -23,7 +23,7 @@ pub struct BalancedResponse {
 pub struct OrderRequest {
     pub symbol: String,
     pub side: String,
-    pub price: f64,
+    pub price: u64,
     pub quantity: u32,
 }
 

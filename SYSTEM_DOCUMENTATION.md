@@ -1,31 +1,60 @@
-# Stock Trading System - Core Engine Documentation
+# Stock Trading System - Current Implementation Documentation
 
-This document provides a simple, structured explanation of the core types, components, fields, and methods that drive the stock trading system. It excludes user models and API controller/routing details to focus entirely on the core execution, risk, and matching logic.
+This document describes the code that exists now. `stock-exchange-system-design.md` describes the long-term target, while `PROJECT_DIRECTION.md` records completed milestones and the next task.
 
 ---
 
 ## 🏗️ System Architecture Overview
 
-The system is organized hierarchically, with the `OrderManager` acts as the central orchestrator that coordinates sequence generation, risk validation, capital/funds validation, and order matching:
+Axum acts as the gateway. It sends live `ExchangeCommand` values to one dedicated worker. `ExchangeRuntime` converts those commands into replayable events, records them in memory, invokes `ExchangeCore`, records output events, and returns live results through `oneshot` channels.
 
 ```mermaid
 graph TD
-    OM[OrderManager] --> SEQ[Sequencer]
+    HTTP[Axum HTTP handlers] --> CMD[ExchangeCommand queue]
+    CMD --> RT[ExchangeRuntime]
+    RT --> LOG[In-memory EventEnvelope log]
+    RT --> CORE[ExchangeCore]
+    CORE --> OM[OrderManager]
+    CORE --> SEQ[Sequencer]
+    CORE --> ME[MatchingEngine]
     OM --> RM[RiskManager]
     OM --> W[Wallet]
-    OM --> ME[MatchingEngine]
     ME --> OB[OrderBook (per Symbol)]
     OB --> PL[PriceLevel]
     PL --> N[Node (Doubly Linked List)]
     N --> O[Order]
 ```
 
-### Flow of an Order Placement
-1. **Sequence Generation**: `OrderManager` obtains a unique, monotonic sequence number from the `Sequencer` for serialization.
-2. **Risk Check**: `RiskManager` verifies if the user's cumulative quantity limit for that asset is exceeded.
-3. **Wallet Check**: `Wallet` ensures the buyer has enough available (unlocked) funds and locks the required escrow.
-4. **Matching**: `MatchingEngine` delegates the order to the correct `OrderBook` where it is matched against resting orders.
-5. **Settlement**: If fills occur, trade cash is moved in the `Wallet` from the buyer to the seller, and remaining quantities are updated.
+### Current Flow of an Order Placement
+
+1. The HTTP handler creates `ExchangeCommand::PlaceOrder` with a temporary reply channel.
+2. `ExchangeRuntime` appends `NewOrderRequested` to its in-memory event log.
+3. `ExchangeCore` asks `OrderManager` to check duplicates, risk, and wallet funds.
+4. `ExchangeCore` obtains the next matching sequence from `Sequencer`.
+5. `ExchangeCore` registers the sequenced order with `OrderManager` before calling `MatchingEngine`.
+6. `ExchangeCore` gives returned executions to `OrderManager` for lifecycle updates and wallet settlement.
+7. `ExchangeRuntime` appends `OrderAccepted` or `OrderRejected`, followed by any `ExecutionCreated` events.
+8. The runtime sends the live result back through the command's `oneshot` channel.
+
+All of these core calls run synchronously on the existing single exchange-worker thread. Logical component separation did not introduce internal channels or component threads.
+
+## Exchange Core (`src/exchange/core.rs`)
+
+`ExchangeCore` is the synchronous coordinator for the critical trading path. It owns `OrderManager`, `Sequencer`, and `MatchingEngine`.
+
+For a new order, it asks `OrderManager` to validate and reserve the order, assigns the matching sequence, registers the order, calls `MatchingEngine`, and gives the returned executions back to `OrderManager`.
+
+For a cancellation, it validates ownership and lifecycle state, assigns the matching sequence, removes the order from `MatchingEngine`, and then tells `OrderManager` to unlock funds and mark the order canceled.
+
+`AddOrderOutcome` belongs to this layer because it combines results from lifecycle management, sequencing, and matching.
+
+## Event Runtime (`src/exchange/runtime.rs`)
+
+`ExchangeRuntime` owns the command receiver, `ExchangeCore`, in-memory event log, and the next event-log sequence number.
+
+`ExchangeCommand` belongs to the live HTTP boundary because it contains `respond_to`; it is not replayable. `ExchangeEvent` contains business data only, and `EventEnvelope` adds a monotonic `seq_num`.
+
+The current event variants cover deposits, new orders, cancellations, accepted/rejected outcomes, successful deposits, cancellations, and created executions. The log is currently process memory only: it is neither durable nor exposed through HTTP.
 
 ---
 
@@ -34,14 +63,16 @@ graph TD
 This module defines the basic data structures, enums, and primitives used throughout the matching engine and risk/wallet sub-systems.
 
 ### `Price` (Struct)
-A safe wrapper around `f64` representing order prices, ensuring prices are valid and ordering is deterministic.
+A positive exact price represented as integer minor units. The prototype uses one shared unit for prices, deposits, balances, locks, and settlement. For example, `1025` represents `$10.25` when the configured minor unit is one cent.
 *   **Fields:**
-    *   `0` (`f64`): The raw price value.
+    *   `0` (`u64`): Exact minor-unit value.
 *   **Methods:**
-    *   `new(val: f64) -> Price`
-        *   Instantiates a new price and asserts that the price is not NaN.
-    *   `as_f64(self) -> f64`
-        *   Unwraps and returns the underlying `f64` value.
+    *   `new(minor_units: u64) -> Result<Price, String>`
+        *   Rejects zero and constructs a positive price.
+    *   `minor_units(self) -> u64`
+        *   Returns the exact integer value used by the gateway and wallet.
+    *   `checked_notional(self, quantity: u64) -> Option<u64>`
+        *   Computes price times quantity without overflow.
 
 ### `Side` (Enum)
 Represents the trade direction of an order.
@@ -66,14 +97,14 @@ Represents a trading order containing placement specs, volume requirements, and 
     *   `user_id` (`String`): Identifier of the user placing the order.
     *   `symbol` (`String`): Asset ticker symbol (e.g., AAPL).
     *   `side` (`Side`): The buy or sell trade direction.
-    *   `price` (`f64`): Limit price for the order.
+    *   `price` (`Price`): Exact limit price in minor units.
     *   `quantity` (`u32`): Initial requested order quantity.
     *   `leaves_qty` (`u32`): Remaining unfilled quantity.
     *   `timestamp` (`f64`): System epoch timestamp when the order was created.
     *   `seq_num` (`u64`): The unique sequence number assigned to this action.
 *   **Methods:**
     *   `new(...) -> Result<Order, String>`
-        *   Validates and constructs an order. Ensures price and quantity are positive and parses the side string.
+        *   Accepts an integer minor-unit price, validates positive price and quantity, and parses the side string.
 
 ### `Execution` (Struct)
 Represents a match event between a buyer and a seller.
@@ -82,7 +113,7 @@ Represents a match event between a buyer and a seller.
     *   `buy_order_id` (`String`): The matching buy order ID.
     *   `sell_order_id` (`String`): The matching sell order ID.
     *   `symbol` (`String`): The ticker symbol traded.
-    *   `price` (`f64`): The execution price.
+    *   `price` (`Price`): Exact execution price copied from the resting order.
     *   `quantity` (`u32`): The quantity filled.
     *   `timestamp` (`f64`): The time when matching occurred.
 
@@ -94,13 +125,13 @@ Stores and manages resting orders at a single price point. It uses a vector-back
 
 ### `PriceLevel` (Struct)
 *   **Fields:**
-    *   `price` (`f64`): The price value of this level.
+    *   `price` (`Price`): Exact price value of this level.
     *   `nodes` (`Vec<Node>`): The list containing the order nodes.
     *   `head_idx` (`Option<usize>`): Index pointing to the front of the queue (oldest order).
     *   `tail_idx` (`Option<usize>`): Index pointing to the back of the queue (newest order).
     *   `order_map` (`HashMap<String, usize>`): Maps an order ID to its index in `nodes` for $O(1)$ lookups.
 *   **Methods:**
-    *   `new(price: f64) -> PriceLevel`
+    *   `new(price: Price) -> PriceLevel`
         *   Creates an empty price level.
     *   `append(&mut self, order: Order)`
         *   Appends a new order to the tail of the queue ($O(1)$ time-priority tracking).
@@ -133,9 +164,9 @@ Maintains two separate sides (bid and ask) for a single symbol using self-balanc
 *   **Methods:**
     *   `new(symbol: String) -> OrderBook`
         *   Initializes a clean, empty order book.
-    *   `best_bid(&self) -> Option<(f64, u32)>`
+    *   `best_bid(&self) -> Option<(Price, u32)>`
         *   Returns the highest bid price and its total depth/quantity.
-    *   `best_ask(&self) -> Option<(f64, u32)>`
+    *   `best_ask(&self) -> Option<(Price, u32)>`
         *   Returns the lowest ask price and its total depth/quantity.
     *   `cancel_order(&mut self, order_id: &str) -> Option<Order>`
         *   Locates, removes, and returns the order. Removes the price level map entry if it becomes empty.
@@ -162,7 +193,7 @@ Routes incoming orders and cancellations to the appropriate `OrderBook` and enfo
         *   Creates a new matching engine instance.
     *   `process_order(&mut self, order: Order) -> Result<Vec<Execution>, String>`
         *   Validates the sequence number, obtains/creates the symbol's book, places/matches the order, updates `last_seq`, and tracks the location if it becomes a resting order.
-    *   `best_bid_ask(&self, symbol: &str) -> Option<((f64, u32), (f64, u32))>`
+    *   `best_bid_ask(&self, symbol: &str) -> Option<((Price, u32), (Price, u32))>`
         *   Retrieves the current best bid and ask (prices and quantities) for a given symbol.
     *   `cancel_order(&mut self, order_id: &str, cancel_seq: u64) -> Result<Option<Order>, String>`
         *   Enforces sequence order, routes the cancel request to the correct order book, updates tracking maps, and updates `last_seq`.
@@ -186,8 +217,12 @@ Validates if trading activity stays within allowed constraints to prevent over-e
         *   Creates a new risk manager.
     *   `set_limit(&mut self, user_id: String, symbol: String, limit: u64)`
         *   Configures or updates a volume limit constraint.
+    *   `check(&self, order: &Order) -> Result<(), RiskError>`
+        *   Validates the order without mutating recorded volume.
+    *   `record(&mut self, order: &Order)`
+        *   Records volume only after the wallet check succeeds.
     *   `check_and_record(&mut self, order: &Order) -> Result<(), RiskError>`
-        *   Validates if the new order quantity would exceed the user's limit. If valid, records the volume increment.
+        *   Older combined convenience method; the current order path deliberately calls `check` and `record` separately.
 
 ---
 
@@ -204,18 +239,18 @@ Tracks capital, manages buy-side order locks (collateral), and settles balances 
         *   Initializes an empty wallet.
     *   `deposit(&mut self, user_id: String, amount: u64)`
         *   Credits cash directly to a user's balance.
-    *   `check_and_lock(&mut self, user_id: &str, side: &Side, price: f64, quantity: u64) -> Result<(), WalletError>`
-        *   For buy orders, verifies if the user has enough unlocked funds and lock-reserves the maximum cost. Sell orders pass through without locking cash.
-    *   `commit_fill(&mut self, user_id: &str, side: &Side, price: f64, qty_filled: u64) -> Result<(), WalletError>`
-        *   Debits both the active total balance and the locked balance of a buyer when a fill is reported.
-    *   `unlock_funds(&mut self, user_id: &str, side: &Side, price: f64, qty_unlocked: u64) -> Result<(), WalletError>`
-        *   Releases locked cash back into the user's available balance (used during order cancellations).
+    *   `check_and_lock(&mut self, user_id: &str, side: &Side, price: Price, quantity: u64) -> Result<(), WalletError>`
+        *   For buy orders, computes the exact notional with checked multiplication and lock-reserves it. Sell orders pass through without locking cash.
+    *   `commit_buy_fill(&mut self, user_id: &str, limit_price: Price, execution_price: Price, qty_filled: u64) -> Result<(), WalletError>`
+        *   Atomically settles a buyer at the exact execution price and releases any excess lock caused by price improvement.
+    *   `unlock_funds(&mut self, user_id: &str, side: &Side, price: Price, qty_unlocked: u64) -> Result<(), WalletError>`
+        *   Releases the exact remaining lock during cancellation. Notional overflow is returned as `WalletError::Overflow`.
 
 ---
 
-## 🎛️ 7. Order Manager Orchestrator (`src/types/order_manager.rs`)
+## 🎛️ 7. Order Manager (`src/types/order_manager.rs`)
 
-Integrates risk, wallet ledger, sequencer, and the matching engine, tracking the lifecycle status of all orders.
+Owns order lifecycle state, risk checks, wallet reservation, cancellation completion, fill validation, and settlement. It does not own sequencing or order books.
 
 ### `OrderState` (Enum)
 *   **Variants:**
@@ -235,16 +270,20 @@ Integrates risk, wallet ledger, sequencer, and the matching engine, tracking the
     *   `orders` (`HashMap<String, ManagedOrder>`): Stores all historical and active orders.
     *   `risk_manager` (`RiskManager`): Manages risk checks.
     *   `wallet` (`Wallet`): Manages cash balances.
-    *   `engine` (`MatchingEngine`): Coordinates order matching.
-    *   `sequencer` (`Sequencer`): Monotonic sequence generator.
     *   `execution_callbacks` (`Vec<Box<dyn Fn(Execution)>>`): List of subscriber callbacks triggered upon trade match.
 *   **Methods:**
     *   `new() -> OrderManager`
-        *   Creates an initialized orchestrator with fresh components.
-    *   `add_order(&mut self, mut order: Order) -> Result<(), OrderManagerError>`
-        *   Orchestrates placement: checks risk, locks wallet funds, assigns sequence number, passes to matching engine, records fills, settles cash transfers to sellers, and triggers execution callbacks.
-    *   `cancel_order(&mut self, order_id: &str) -> Result<(), OrderManagerError>`
-        *   Orchestrates cancel: verifies state is active, requests engine cancellation, releases locked wallet funds, and updates order state.
+        *   Creates a fresh lifecycle manager, risk manager, and wallet.
+    *   `prepare_order(&mut self, order: Order) -> Result<Order, OrderManagerError>`
+        *   Rejects duplicates, runs risk checks, locks wallet funds, and records accepted risk volume before sequencing.
+    *   `register_order(&mut self, order: Order)`
+        *   Stores the sequenced order before matching so immediate executions can update both orders.
+    *   `apply_executions(&mut self, executions: &[Execution]) -> Result<(), OrderManagerError>`
+        *   Validates fills, settles wallets, updates order states, and triggers execution callbacks.
+    *   `validate_cancel_for_user(&self, order_id: &str, user_id: &str) -> Result<(), OrderManagerError>`
+        *   Validates order existence, ownership, and non-terminal state before cancellation sequencing.
+    *   `complete_cancel(&mut self, order_id: &str) -> Result<(), OrderManagerError>`
+        *   Unlocks remaining funds and records the canceled state after matching-engine removal succeeds.
     *   `record_fill(&mut self, order_id: &str, filled_qty: u32) -> Result<(), OrderManagerError>`
         *   Internal helper. Updates remaining quantity, transitions lifecycle states, and processes wallet adjustments.
     *   `get_state(&self, order_id: &str) -> Option<OrderState>`
@@ -280,3 +319,10 @@ Simple connection utilities for PostgreSQL backing.
 ### `AppState` (Struct in `src/state.rs`)
 *   **Fields:**
     *   `db` (`PgPool`): The shared SQLx connection pool shared across web routes.
+    *   `tx` (`Sender<ExchangeCommand>`): Bounded command-queue sender used by HTTP handlers to reach the single exchange worker.
+
+---
+
+## Current Verification
+
+As of 2026-08-30, `cargo test` passes 18 tests. These cover the exchange-core lifecycle, matching, wallet settlement, cancellation, rejected-operation sequence behavior, and sequential consumption of the runtime event log.

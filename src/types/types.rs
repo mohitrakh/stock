@@ -1,29 +1,23 @@
 use tokio::sync::oneshot;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Price(f64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Price(u64);
 
 impl Price {
-    pub fn new(val: f64) -> Self {
-        assert!(!val.is_nan(), "Price cannot be NaN");
-        Price(val)
+    pub fn new(minor_units: u64) -> Result<Self, String> {
+        if minor_units == 0 {
+            return Err("price must be positive".to_string());
+        }
+
+        Ok(Self(minor_units))
     }
-    pub fn as_f64(self) -> f64 {
+
+    pub const fn minor_units(self) -> u64 {
         self.0
     }
-}
 
-impl Eq for Price {}
-
-impl PartialOrd for Price {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.0.partial_cmp(&other.0)
-    }
-}
-
-impl Ord for Price {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
+    pub const fn checked_notional(self, quantity: u64) -> Option<u64> {
+        self.0.checked_mul(quantity)
     }
 }
 
@@ -56,7 +50,7 @@ pub struct Order {
     pub user_id: String,
     pub symbol: String,
     pub side: Side,
-    pub price: f64,
+    pub price: Price,
     pub quantity: u32,
     pub leaves_qty: u32,
     pub timestamp: f64,
@@ -69,7 +63,7 @@ impl Order {
         user_id: String,
         symbol: String,
         side: &str,
-        price: f64,
+        price: u64,
         quantity: u32,
         leaves_qty: Option<u32>,
         timestamp: f64,
@@ -77,10 +71,11 @@ impl Order {
     ) -> Result<Self, String> {
         let side = Side::from_str(side)?;
 
-        if price <= 0.0 || quantity == 0 {
-            return Err("price and quantity must be positive".to_string());
+        if quantity == 0 {
+            return Err("quantity must be positive".to_string());
         }
 
+        let price = Price::new(price)?;
         let leaves_qty = leaves_qty.unwrap_or(quantity);
 
         Ok(Order {
@@ -103,7 +98,7 @@ pub struct Execution {
     pub buy_order_id: String,
     pub sell_order_id: String,
     pub symbol: String,
-    pub price: f64,
+    pub price: Price,
     pub quantity: u32,
     pub timestamp: f64,
 }

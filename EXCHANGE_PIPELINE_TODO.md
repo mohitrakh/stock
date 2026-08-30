@@ -1,26 +1,65 @@
 # Exchange Pipeline TODO
 
-Current decision:
+This is the short-term migration checklist. `PROJECT_DIRECTION.md` records project history; `stock-exchange-system-design.md` remains the long-term target.
 
-- Use a bounded `tokio::sync::mpsc` command queue from the Axum HTTP layer into one exchange worker.
-- Use `tokio::sync::oneshot` response channels so HTTP handlers can wait for command results.
-- Let the exchange worker own `OrderManager`, `Wallet`, `RiskManager`, `Sequencer`, and `MatchingEngine`.
+## Completed Milestone - ExchangeCore Ownership Split
 
-Why this is acceptable now:
+`ExchangeCore` now owns and coordinates `OrderManager`, `Sequencer`, and `MatchingEngine` without adding component threads or changing the HTTP command/event boundary.
 
-- It removes direct `Mutex<OrderManager>` access from request handlers.
-- It gives the exchange core a single owner and deterministic command order.
-- It creates the right boundary: outside code sends commands; the exchange core mutates state.
+```text
+ExchangeRuntime
+  -> ExchangeCore
+       -> OrderManager
+       -> Sequencer
+       -> MatchingEngine
+```
 
-Temporary limitation:
+## Completed Implementation
 
-- Tokio `mpsc` is not the final queue for a serious low-latency exchange.
-- Later, replace this queue with a purpose-built event pipeline such as a fixed-size ring buffer, shared-memory log, or mmap-backed event store.
-- The architecture should keep the command/event boundary stable so the queue implementation can change without rewriting the engine.
+- [x] Add `src/exchange/core.rs` and export it from `src/exchange/mod.rs`.
+- [x] Add `ExchangeCore` with ownership of `OrderManager`, `Sequencer`, and `MatchingEngine`.
+- [x] Separate order validation/registration from sequencing and matching.
+- [x] Let `ExchangeCore` coordinate new-order processing and apply returned executions through `OrderManager`.
+- [x] Move cancellation sequencing and matching-engine cancellation coordination into `ExchangeCore`.
+- [x] Change `ExchangeRuntime` to call `ExchangeCore` instead of calling `OrderManager` directly.
+- [x] Move lifecycle tests to the `ExchangeCore` boundary.
+- [x] Add coverage proving rejected operations do not consume matching sequence numbers.
+- [x] Run formatting and the full test suite.
+- [x] Update `PROJECT_DIRECTION.md` and `SYSTEM_DOCUMENTATION.md`.
 
-Future direction:
+## Acceptance Criteria - Verified
 
-- Split inbound commands from outbound events.
-- Persist sequenced commands/events for replay.
-- Publish executions to market data and reporting consumers.
-- Consider per-symbol workers only after wallet, risk, sequencing, and replay semantics are clear.
+- `OrderManager` no longer owns a `Sequencer` or `MatchingEngine`.
+- `ExchangeCore` owns and coordinates the three logical trading components.
+- HTTP controllers and `ExchangeCommand` did not require architectural changes.
+- `ExchangeRuntime` still appends input and output events in sequence.
+- Lifecycle, matching, wallet, cancellation, sequence, and runtime behavior remain covered.
+- The core-ownership checkpoint passed 18 tests.
+
+## Completed Milestone - Exact Minor-Unit Prices
+
+The gateway and critical trading path now represent monetary prices as positive integer minor units. `Price(u64)` flows through orders, executions, order-book levels, matching quotes, wallet reservation, settlement, and cancellation.
+
+### Completed Implementation
+
+- [x] Change the HTTP order price from `f64` to integer minor units.
+- [x] Replace the floating price wrapper with ordered `Price(u64)`.
+- [x] Carry `Price` through orders, executions, price levels, order books, and matching quotes.
+- [x] Replace float-to-integer wallet casts with checked exact notional calculations.
+- [x] Reject notional overflow before locking funds or registering an order.
+- [x] Add coverage for exact partial-fill settlement, cancellation unlocks, overflow rejection, and adjacent price levels.
+- [x] Update the project journal and system documentation.
+
+### Acceptance Criteria - Verified
+
+- Monetary prices no longer use `f64`; only timestamps do.
+- JSON order prices are integers in the same minor unit used by deposits and balances.
+- Exact price comparisons determine price levels and crossing behavior.
+- Wallet reservation, fill settlement, and cancellation unlocks use checked multiplication.
+- `cargo test` passes 21 tests.
+
+## Next Milestone
+
+Not selected yet. Re-read the resulting code and discuss the next architectural goal before implementation.
+
+Do not automatically begin market data, replay, persistence, sell-side positions, mmap, ring buffers, UDP, CPU pinning, multiple component threads, or per-symbol partitioning.

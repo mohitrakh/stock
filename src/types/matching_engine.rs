@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::order_book::OrderBook;
-use super::types::{Execution, Order, Side};
+use super::types::{Execution, Order, Price, Side};
 
 #[derive(Debug)]
 pub struct MatchingEngine {
@@ -67,7 +67,7 @@ impl MatchingEngine {
 
         Ok(fills)
     }
-    pub fn best_bid_ask(&self, symbol: &str) -> Option<((f64, u32), (f64, u32))> {
+    pub fn best_bid_ask(&self, symbol: &str) -> Option<((Price, u32), (Price, u32))> {
         let book = self.order_books.get(symbol)?;
         let bid = book.best_bid()?;
         let ask = book.best_ask()?;

@@ -1,12 +1,14 @@
-use crate::types::{
-    exchange_event::{EventEnvelope, ExchangeEvent},
-    order_manager::OrderManager,
-    types::ExchangeCommand,
+use crate::{
+    exchange::core::ExchangeCore,
+    types::{
+        exchange_event::{EventEnvelope, ExchangeEvent},
+        types::ExchangeCommand,
+    },
 };
 
 pub struct ExchangeRuntime {
     rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
-    order_manager: OrderManager,
+    core: ExchangeCore,
     event_log: Vec<EventEnvelope>,
     next_event_seq: u64,
 }
@@ -44,7 +46,7 @@ impl ExchangeRuntime {
     pub fn new(rx: tokio::sync::mpsc::Receiver<ExchangeCommand>) -> Self {
         Self {
             rx,
-            order_manager: OrderManager::new(),
+            core: ExchangeCore::new(),
             event_log: Vec::new(),
             next_event_seq: 1,
         }
@@ -107,14 +109,14 @@ impl ExchangeRuntime {
     fn process_input_event(&mut self, event: ExchangeEvent) -> InputEventResult {
         match event {
             ExchangeEvent::FundsDepositRequested { user_id, amount } => {
-                self.order_manager.wallet.deposit(user_id.clone(), amount);
+                self.core.deposit(user_id.clone(), amount);
                 self.append_event(ExchangeEvent::FundsDeposited { user_id, amount });
                 InputEventResult::Deposit(Ok(()))
             }
             ExchangeEvent::NewOrderRequested { order } => {
                 let order_id = order.order_id.clone();
 
-                let result = match self.order_manager.add_order(order) {
+                let result = match self.core.add_order(order) {
                     Ok(outcome) => {
                         self.append_event(ExchangeEvent::OrderAccepted {
                             order_id: outcome.order_id.clone(),
@@ -141,7 +143,7 @@ impl ExchangeRuntime {
             }
             ExchangeEvent::CancelOrderRequested { order_id, user_id } => {
                 let result = self
-                    .order_manager
+                    .core
                     .cancel_order_for_user(&order_id, &user_id)
                     .map(|seq_num| {
                         self.append_event(ExchangeEvent::OrderCanceled { order_id, seq_num });
@@ -178,7 +180,7 @@ mod tests {
         ExchangeRuntime::new(rx)
     }
 
-    fn order(id: &str, user: &str, side: &str, price: f64, quantity: u32) -> Order {
+    fn order(id: &str, user: &str, side: &str, price: u64, quantity: u32) -> Order {
         Order::new(
             id.to_string(),
             user.to_string(),
@@ -228,14 +230,11 @@ mod tests {
     #[test]
     fn place_order_appends_accepted_after_successful_core_processing() {
         let mut runtime = runtime();
-        runtime
-            .order_manager
-            .wallet
-            .deposit("buyer".to_string(), 1_000);
+        runtime.core.deposit("buyer".to_string(), 1_000);
         let (respond_to, _response_rx) = oneshot::channel();
 
         runtime.handle_command(ExchangeCommand::PlaceOrder {
-            order: order("buy-1", "buyer", "BUY", 10.0, 10),
+            order: order("buy-1", "buyer", "BUY", 10, 10),
             respond_to,
         });
 
@@ -263,7 +262,7 @@ mod tests {
         let (respond_to, _response_rx) = oneshot::channel();
 
         runtime.handle_command(ExchangeCommand::PlaceOrder {
-            order: order("buy-1", "buyer", "BUY", 10.0, 10),
+            order: order("buy-1", "buyer", "BUY", 10, 10),
             respond_to,
         });
 
@@ -281,13 +280,10 @@ mod tests {
     #[test]
     fn cancel_order_appends_canceled_after_successful_core_processing() {
         let mut runtime = runtime();
+        runtime.core.deposit("buyer".to_string(), 1_000);
         runtime
-            .order_manager
-            .wallet
-            .deposit("buyer".to_string(), 1_000);
-        runtime
-            .order_manager
-            .add_order(order("buy-1", "buyer", "BUY", 10.0, 10))
+            .core
+            .add_order(order("buy-1", "buyer", "BUY", 10, 10))
             .unwrap();
         let (respond_to, _response_rx) = oneshot::channel();
 
@@ -319,18 +315,15 @@ mod tests {
     #[test]
     fn matching_order_appends_execution_created_events() {
         let mut runtime = runtime();
+        runtime.core.deposit("buyer".to_string(), 1_000);
         runtime
-            .order_manager
-            .wallet
-            .deposit("buyer".to_string(), 1_000);
-        runtime
-            .order_manager
-            .add_order(order("sell-1", "seller", "SELL", 10.0, 5))
+            .core
+            .add_order(order("sell-1", "seller", "SELL", 10, 5))
             .unwrap();
         let (respond_to, _response_rx) = oneshot::channel();
 
         runtime.handle_command(ExchangeCommand::PlaceOrder {
-            order: order("buy-1", "buyer", "BUY", 10.0, 5),
+            order: order("buy-1", "buyer", "BUY", 10, 5),
             respond_to,
         });
 
@@ -356,7 +349,7 @@ mod tests {
                 ExchangeEvent::ExecutionCreated { execution } => {
                     assert_eq!(execution.buy_order_id, "buy-1");
                     assert_eq!(execution.sell_order_id, "sell-1");
-                    assert_eq!(execution.price, 10.0);
+                    assert_eq!(execution.price.minor_units(), 10);
                     assert_eq!(execution.quantity, 5);
                 }
                 other => panic!("unexpected event: {:?}", other),
@@ -377,13 +370,13 @@ mod tests {
 
         let (respond_to, _response_rx) = oneshot::channel();
         runtime.handle_command(ExchangeCommand::PlaceOrder {
-            order: order("sell-1", "seller", "SELL", 10.0, 5),
+            order: order("sell-1", "seller", "SELL", 10, 5),
             respond_to,
         });
 
         let (respond_to, _response_rx) = oneshot::channel();
         runtime.handle_command(ExchangeCommand::PlaceOrder {
-            order: order("buy-1", "buyer", "BUY", 10.0, 5),
+            order: order("buy-1", "buyer", "BUY", 10, 5),
             respond_to,
         });
 

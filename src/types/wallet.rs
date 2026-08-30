@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::types::{Side, WalletError};
+use super::types::{Price, Side, WalletError};
 
 pub struct Wallet {
     balances: HashMap<String, u64>,
@@ -35,14 +35,16 @@ impl Wallet {
         &mut self,
         user_id: &str,
         side: &Side,
-        price: f64,
+        price: Price,
         quantity: u64,
     ) -> Result<(), WalletError> {
         if matches!(side, Side::Sell) {
             return Ok(());
         }
 
-        let required = (price * quantity as f64) as u64;
+        let required = price
+            .checked_notional(quantity)
+            .ok_or(WalletError::Overflow)?;
         let balance = self.balances.get(user_id).copied().unwrap_or(0);
         let locked = self.locked.get(user_id).copied().unwrap_or(0);
 
@@ -51,35 +53,45 @@ impl Wallet {
             return Err(WalletError::InsufficientFunds);
         }
 
-        *self.locked.entry(user_id.to_string()).or_insert(0) += required;
+        let new_locked = locked.checked_add(required).ok_or(WalletError::Overflow)?;
+        self.locked.insert(user_id.to_string(), new_locked);
         Ok(())
     }
 
     pub fn commit_buy_fill(
         &mut self,
         user_id: &str,
-        limit_price: f64,
-        execution_price: f64,
+        limit_price: Price,
+        execution_price: Price,
         qty_filled: u64,
     ) -> Result<(), WalletError> {
-        let amount_spent = (execution_price * qty_filled as f64) as u64;
-        let amount_reserved = (limit_price * qty_filled as f64) as u64;
+        let amount_spent = execution_price
+            .checked_notional(qty_filled)
+            .ok_or(WalletError::Overflow)?;
+        let amount_reserved = limit_price
+            .checked_notional(qty_filled)
+            .ok_or(WalletError::Overflow)?;
 
         let balance = self
             .balances
-            .get_mut(user_id)
+            .get(user_id)
+            .copied()
             .ok_or(WalletError::InsufficientFunds)?;
-        *balance = balance
-            .checked_sub(amount_spent)
-            .ok_or(WalletError::InsufficientFunds)?;
-
         let locked = self
             .locked
-            .get_mut(user_id)
+            .get(user_id)
+            .copied()
             .ok_or(WalletError::InsufficientFunds)?;
-        *locked = locked
+
+        let new_balance = balance
+            .checked_sub(amount_spent)
+            .ok_or(WalletError::InsufficientFunds)?;
+        let new_locked = locked
             .checked_sub(amount_reserved)
             .ok_or(WalletError::InsufficientFunds)?;
+
+        self.balances.insert(user_id.to_string(), new_balance);
+        self.locked.insert(user_id.to_string(), new_locked);
 
         Ok(())
     }
@@ -89,7 +101,7 @@ impl Wallet {
         &mut self,
         user_id: &str,
         side: &Side,
-        price: f64,
+        price: Price,
         qty_filled: u64,
     ) -> Result<(), WalletError> {
         if matches!(side, Side::Sell) {
@@ -104,22 +116,26 @@ impl Wallet {
         &mut self,
         user_id: &str,
         side: &Side,
-        price: f64,
+        price: Price,
         qty_unlocked: u64,
     ) -> Result<(), WalletError> {
         if matches!(side, Side::Sell) {
             return Ok(());
         }
 
-        let amount = (price * qty_unlocked as f64) as u64;
+        let amount = price
+            .checked_notional(qty_unlocked)
+            .ok_or(WalletError::Overflow)?;
 
         let locked = self
             .locked
-            .get_mut(user_id)
+            .get(user_id)
+            .copied()
             .ok_or(WalletError::InsufficientFunds)?;
-        *locked = locked
+        let new_locked = locked
             .checked_sub(amount)
             .ok_or(WalletError::InsufficientFunds)?;
+        self.locked.insert(user_id.to_string(), new_locked);
 
         Ok(())
     }

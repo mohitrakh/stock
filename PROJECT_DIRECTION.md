@@ -1,366 +1,128 @@
-# Project Direction - Event Store Runtime
+# Project Direction - Exchange Core and Exact Prices Complete
 
-This file exists so a new chat or future contributor can quickly recover the intended path for this project.
+This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
-Before suggesting architecture changes, read this file and then read:
+1. `stock-exchange-system-design.md` for the target architecture.
+2. `EXCHANGE_PIPELINE_TODO.md` for the current milestone state.
+3. `SYSTEM_DOCUMENTATION.md` for the code that exists now.
+4. The current Rust code before making architecture decisions.
 
-1. `stock-exchange-system-design.md`
-2. `SYSTEM_DOCUMENTATION.md`
-3. The current Rust code, especially:
-   - `src/main.rs`
-   - `src/state.rs`
-   - `src/controllers/exchange_controller.rs`
-   - `src/types/order_manager.rs`
-   - `src/types/matching_engine.rs`
-   - `src/types/order_book.rs`
-   - `src/types/wallet.rs`
-   - `src/types/risk_manager.rs`
-
-The design target comes from `stock-exchange-system-design.md`. The code is still a learning/prototype implementation, so prefer small correctness steps over large infrastructure rewrites.
+The repository is a learning stock exchange with an exchange-grade architecture target. Prefer small, tested changes that move toward deterministic, replayable, single-owner processing.
 
 ## Current Status
 
-The first lifecycle-correctness milestone is done. `OrderManager` now owns the core order lifecycle decisions for the current prototype: duplicate rejection, risk check before risk record, wallet lock before accepting buy orders, sequence assignment before matching, order registration before matching, fill validation before settlement mutation, execution-price settlement, cancel ownership validation, cancel unlock after matching-engine cancellation, and wallet error propagation.
-
-The current core tests cover resting orders, full and partial fills, cancel unlocks, wrong-user cancel rejection, insufficient funds, duplicate order IDs, execution-price settlement, and risk/wallet ordering.
-
-Latest verified status:
-
-```text
-cargo test
-11 passed
-```
-
-## Goal
-
-Build a learning stock exchange system that gradually moves toward an exchange-style architecture:
-
-```text
-gateway
-  -> order manager
-  -> sequencer
-  -> matching engine
-  -> outbound executions/events
-  -> market data/reporting/replay consumers
-```
-
-The immediate goal is not to build a production exchange. The immediate goal is to move from "HTTP calls a worker function" toward an event-store-shaped exchange runtime that can later support market data, reporting, replay, and a more serious queue/log implementation.
-
-## Current Architecture
-
-Axum is currently the HTTP gateway.
-
-Current command flow:
+The project has a working HTTP-to-exchange boundary, an in-memory event-store-shaped runtime, a separated exchange-core pipeline, and exact integer price handling.
 
 ```text
 Axum HTTP handler
-  -> bounded tokio::sync::mpsc command queue
+  -> bounded Tokio mpsc command queue
   -> dedicated exchange worker thread
-  -> OrderManager
-       -> RiskManager
-       -> Wallet
-       -> Sequencer
-       -> MatchingEngine
-            -> OrderBook
+  -> ExchangeRuntime
+       -> append sequenced input ExchangeEvent
+       -> ExchangeCore
+            -> OrderManager
+                 -> RiskManager
+                 -> Wallet
+            -> Sequencer
+            -> MatchingEngine
+                 -> OrderBook
+       -> append output ExchangeEvent
+       -> reply through temporary oneshot channel
 ```
 
-Important current decision:
+`ExchangeCommand` is live gateway plumbing and may contain `respond_to`. `ExchangeEvent` contains replayable business data and must remain free of HTTP response channels.
+
+`ExchangeRuntime` owns the command receiver and ordered in-memory `Vec<EventEnvelope>`. `ExchangeCore` owns the deterministic trading components and coordinates their calls. All core operations still run on the one existing exchange-worker thread.
+
+Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
+
+Latest verified status on 2026-08-30:
 
 ```text
-HTTP handlers should not directly mutate OrderManager.
-They should send commands to the exchange worker.
+cargo test
+21 passed; 0 failed
 ```
 
-The exchange worker owns the core state. This is the first step toward a deterministic application loop.
+The compiler reports existing dead-code warnings, but the test suite passes.
 
-Current implementation detail:
+## Completed Milestones
 
-- `AppState` carries a `Sender<ExchangeCommand>`.
-- `main.rs` creates a bounded Tokio `mpsc` queue.
-- `main.rs` spawns one dedicated `std::thread` exchange worker.
-- HTTP handlers attach a `oneshot` response channel to each command.
-- The worker processes commands one at a time and sends one response back.
+### 1. Core order lifecycle correctness
 
-## Why Tokio mpsc Is Used Right Now
+The prototype covers duplicate rejection, risk and wallet ordering, buy-side locking, resting and filled states, execution-price settlement, cancellation ownership, cancellation unlocks, and wallet error propagation.
 
-Tokio `mpsc` is a temporary bridge between:
+### 2. Single-owner exchange worker boundary
+
+HTTP handlers send `ExchangeCommand` values through bounded Tokio `mpsc` to one dedicated worker. A Tokio `oneshot` carries the temporary live HTTP result back. HTTP handlers do not mutate exchange state directly.
+
+### 3. In-memory event-store-shaped runtime
+
+`ExchangeRuntime` converts live commands into replayable input events, wraps all events in monotonic `EventEnvelope` sequence numbers, processes requests, appends output events, and exposes a read-only event-log view for tests and future consumers.
+
+The log is process memory only. It is not durable and is not visible through HTTP or terminal output by default.
+
+### 4. Exchange core responsibility split
+
+`ExchangeCore` now owns `OrderManager`, `Sequencer`, and `MatchingEngine`.
+
+For new orders it coordinates:
 
 ```text
-async Axum gateway
-  -> synchronous exchange worker thread
+OrderManager validation and reservation
+  -> Sequencer assignment
+  -> OrderManager registration
+  -> MatchingEngine processing
+  -> OrderManager execution application and settlement
 ```
 
-It is acceptable for the current prototype because:
-
-- Axum handlers are async.
-- `tx.send(command).await` integrates cleanly with async request handling.
-- The exchange core is still owned by one dedicated thread.
-- The architecture boundary is more important right now than the final queue implementation.
-
-This does not mean Tokio `mpsc` is the final low-latency exchange queue.
-
-Later, after correctness and event modeling are solid, the queue may be replaced with:
-
-- nonblocking Crossbeam usage
-- fixed-size ring buffer
-- mmap-backed event store
-- shared-memory event log
-
-Do not replace the queue yet unless there is a specific measured reason.
-
-## Core Architecture Principle
-
-Separate the system into two worlds:
+For cancellations it coordinates:
 
 ```text
-Gateway world:
-  async I/O, HTTP, auth, request parsing, validation
-
-Exchange core world:
-  synchronous, deterministic, single-owner state mutation
+OrderManager ownership/lifecycle validation
+  -> Sequencer assignment
+  -> MatchingEngine removal
+  -> OrderManager unlock and canceled-state transition
 ```
 
-The queue is the boundary between those worlds.
+`OrderManager` no longer owns the sequencer or matching engine. It owns order lifecycle state, risk, wallet operations, fill validation, and settlement.
 
-Inside Axum handlers:
+The lifecycle tests now exercise `ExchangeCore`, and an additional test proves that rejected orders and unauthorized cancellations do not consume matching sequence numbers.
 
-- Avoid blocking waits.
-- Avoid directly mutating exchange state.
-- Send commands and await responses.
+### 5. Exact minor-unit price representation
 
-Inside the exchange core:
+`Price` now wraps `u64` minor units and is used by orders, executions, price levels, order books, matching quotes, wallet reservation, settlement, and cancellation unlocks.
 
-- Async is not required.
-- Blocking loops are acceptable.
-- Later CPU pinning can target dedicated OS threads.
-- Only one owner should mutate order/risk/wallet/matching state.
+The gateway accepts integer JSON prices. No monetary value is converted through `f64`; timestamps remain `f64` because they are not money. Checked notional calculations reject overflow before wallet state changes.
 
-## What Not To Work On Yet
-
-Do not work on these yet:
-
-- Crossbeam migration
-- ring buffer implementation
-- mmap event store
-- CPU pinning
-- per-symbol workers
-- multiple binaries/projects
-- hot/warm replication
-- market data publisher
-- reporting service
-- FIX/SBE gateway
-
-Those are valid future topics, but adding them now would hide current domain bugs behind more infrastructure.
+Tests cover exact settlement through a partial fill and cancellation at `1025` minor units, rejection of an overflowing price-times-quantity calculation without mutation, and distinct adjacent book levels at `1025` and `1026`.
 
 ## Current Next Goal
 
-The next goal is:
+No new implementation goal has been selected yet.
 
-```text
-Build a tiny in-memory event-store-shaped exchange runtime.
-```
+The exact-price milestone is complete. Before choosing the next task, discuss whether the next correctness goal should be replay, sell-side positions, wallet credit overflow handling, or another documented limitation.
 
-This is not just "add an event enum". The goal is to start the actual pipeline shape from the system design:
+Do not begin the next implementation milestone without that discussion.
 
-```text
-API command
-  -> sequenced input event
-  -> exchange core processes event
-  -> output events are appended
-  -> later consumers read those events
-```
+## Known Prototype Limitations
 
-The key idea is to separate runtime/API plumbing from replayable trading-domain events.
+- sell-side inventory/positions are not modeled
+- one global minor-unit price scale is assumed; per-product currency and tick-size metadata are not modeled
+- wallet balance credits do not yet return overflow errors
+- the event log is in memory and disappears on restart
+- replay does not yet rebuild core state from a stored log
+- input and output variants share one `ExchangeEvent` enum
+- event-log sequencing and matching-input sequencing remain distinct concepts
+- live HTTP replies still use `oneshot`
+- there is no market-data or reporting consumer
+- internal matching failures after reservation do not yet have a rollback model
 
-`ExchangeCommand` is still useful at the HTTP boundary because it carries `respond_to` channels for live requests. But `ExchangeCommand` should not become the event-store message because `respond_to` cannot be persisted or replayed. The trading-domain event should contain only business data, wrapped with a sequence number.
+## What Not To Work On Yet
 
-The next implementation should introduce a small exchange runtime module that owns:
+Do not start Crossbeam, ring buffers, mmap, CPU pinning, component threads, per-symbol workers, market data, reporting, FIX/SBE, UDP, replication, or hot/warm engines without first selecting and documenting a new milestone.
 
-- the command receiver
-- the `OrderManager`
-- an in-memory event log
-- conversion from API commands into sequenced input events
-- processing of input events through the core
-- appending output events
-- temporary HTTP responses through `oneshot`
+## Rule For Future Sessions
 
-This gives us the beginning of the real pipeline without prematurely adding mmap, ring buffers, SBE, separate services, or extra component threads.
+Start by reading this file and `EXCHANGE_PIPELINE_TODO.md`. Verify the code and test result before trusting old milestone notes.
 
-## Completed Milestone: Lifecycle Correctness
-
-The previous goal was:
-
-```text
-Make OrderManager the source of truth for order lifecycle.
-```
-
-`OrderManager` needed to correctly handle:
-
-- order acceptance
-- order rejection
-- sequence assignment
-- resting orders
-- immediate fills
-- partial fills
-- full fills
-- cancels
-- wallet lock/unlock
-- wallet settlement
-- ownership checks
-
-This milestone is now considered complete for the current prototype. Future bugs may still appear, but the known lifecycle issues from this phase have been addressed and covered with focused tests.
-
-## Why The New Goal Is Next
-
-The design document emphasizes deterministic replay and event-sourced state transitions.
-
-Now that the core lifecycle is stable enough, the next blocker is architectural: the system still behaves mostly like a request/response worker, not an event-store-shaped exchange.
-
-Current code still has important architecture limitations:
-
-- sell-side inventory is not modeled.
-- prices use `f64`, which is not appropriate for real money/tick logic.
-- `ExchangeCommand` mixes API request plumbing with exchange input.
-- `respond_to` channels cannot be persisted or replayed.
-- executions are raw structs, not first-class output events.
-- there is no event log for market data, reporting, audit, or replay to consume.
-- the exchange worker loop still lives in `main.rs`.
-
-The next work should create the smallest useful version of the event pipeline before adding market data or reporting consumers.
-
-## Immediate Implementation Plan - Event Store Runtime
-
-Work in this order.
-
-### 1. Extract The Exchange Worker
-
-Move `run_exchange_worker` out of `main.rs` into a dedicated module, for example:
-
-```text
-src/exchange_worker.rs
-```
-
-`main.rs` should start the gateway and the exchange runtime. It should not become the owner of exchange pipeline logic.
-
-### 2. Define Replayable Exchange Events
-
-Add trading-domain events that contain business data only.
-
-Example shape:
-
-```rust
-pub enum ExchangeEvent {
-    NewOrderRequested { order: Order },
-    CancelOrderRequested { order_id: String, user_id: String },
-    FundsDepositRequested { user_id: String, amount: u64 },
-    FundsDeposited { user_id: String, amount: u64 },
-    OrderAccepted { order_id: String, seq_num: u64 },
-    OrderRejected { order_id: String, reason: String },
-    OrderCanceled { order_id: String, seq_num: u64 },
-    ExecutionCreated { execution: Execution },
-}
-```
-
-Input events and output events can be split into separate enums later if the combined enum gets unclear.
-
-### 3. Add An Event Envelope
-
-Wrap every event with sequencing metadata.
-
-```text
-EventEnvelope
-  -> seq_num
-  -> event
-```
-
-This is the small in-memory version of the event-store entry shown in the system design.
-
-### 4. Add An In-Memory Event Log
-
-Start with a simple `Vec<EventEnvelope>` owned by the exchange runtime.
-
-This is not the final low-latency design. It is a learning/prototype stand-in for the future mmap/ring-buffer/shared-memory event store.
-
-### 5. Convert Commands Into Input Events
-
-The HTTP layer can keep sending `ExchangeCommand` for now. Inside the exchange runtime:
-
-```text
-ExchangeCommand::PlaceOrder
-  -> sequenced ExchangeEvent::NewOrderRequested
-
-ExchangeCommand::CancelOrder
-  -> sequenced ExchangeEvent::CancelOrderRequested
-
-ExchangeCommand::Deposit
-  -> sequenced ExchangeEvent::FundsDepositRequested
-```
-
-The `respond_to` channel stays with the API command. It is used only to answer the live HTTP request and is not written into the event log.
-
-### 6. Process Events Through The Core
-
-The exchange runtime should process the input event by calling `OrderManager`, then append output events.
-
-Example:
-
-```text
-NewOrderRequested
-  -> OrderManager::add_order
-  -> OrderAccepted or OrderRejected
-  -> ExecutionCreated events if matched
-```
-
-### 7. Add The First Consumer After The Log Exists
-
-After events are being appended, add one simple consumer.
-
-Do not start with a full market data publisher. Start with the smallest useful consumer, such as an audit/debug consumer or test-only reader that proves events can be read in sequence.
-
-Market data and reporting should come after this because they need a clean event stream to consume.
-
-## Later Roadmap
-
-After the event-store-shaped runtime exists:
-
-```text
-1. Add a simple event consumer.
-2. Add a market data consumer that reads executions/events.
-3. Add a reporting/audit consumer.
-4. Add event persistence/replay.
-5. Replace f64 prices with integer tick/cents representation.
-6. Add sell-side inventory/position tracking.
-7. Revisit queue implementation.
-8. Consider Crossbeam/ring buffer/mmap.
-9. Consider CPU pinning.
-10. Consider per-symbol partitioning.
-```
-
-## Important Mental Model
-
-Do not think of the project as a normal CRUD backend.
-
-Think of it as:
-
-```text
-commands enter the exchange
-commands become sequenced input events
-the exchange core processes events deterministically
-the exchange appends output events
-other systems consume the event log
-```
-
-The current code should evolve toward that model gradually.
-
-## Instruction For Future Chats
-
-When starting a new chat, use this prompt:
-
-```text
-Please read PROJECT_DIRECTION.md, stock-exchange-system-design.md, and SYSTEM_DOCUMENTATION.md first.
-Then inspect the current Rust code before suggesting changes.
-Keep the project on the documented path.
-Do not jump to Crossbeam/ring buffer/mmap/CPU pinning until the in-memory event-store-shaped runtime exists.
-```
-
-If a future suggestion conflicts with this file, resolve the conflict deliberately instead of drifting.
+Discuss architecture before implementation. If a suggestion conflicts with the target design or changes the command/event boundary, stop and explain the tradeoff. Update this journal whenever a milestone is completed so the next session does not repeat old work.

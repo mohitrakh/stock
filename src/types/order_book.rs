@@ -25,16 +25,16 @@ impl OrderBook {
             exec_counter: 0,
         }
     }
-    pub fn best_bid(&self) -> Option<(f64, u32)> {
+    pub fn best_bid(&self) -> Option<(Price, u32)> {
         self.buy_levels
             .first_key_value()
-            .map(|(rev_price, level)| (rev_price.0.as_f64(), level.total_quantity()))
+            .map(|(rev_price, level)| (rev_price.0, level.total_quantity()))
     }
 
-    pub fn best_ask(&self) -> Option<(f64, u32)> {
+    pub fn best_ask(&self) -> Option<(Price, u32)> {
         self.sell_levels
             .first_key_value()
-            .map(|(price, level)| (price.as_f64(), level.total_quantity()))
+            .map(|(price, level)| (*price, level.total_quantity()))
     }
     pub fn cancel_order(&mut self, order_id: &str) -> Option<Order> {
         let (price, side) = self.order_map.remove(order_id)?;
@@ -67,7 +67,7 @@ impl OrderBook {
                         Some((&price, _)) => price,
                         None => break,
                     };
-                    if best_ask_price.as_f64() > order.price {
+                    if best_ask_price > order.price {
                         break;
                     }
 
@@ -135,7 +135,7 @@ impl OrderBook {
                         None => break,
                     };
                     let best_bid_price = best_bid_key.0; // unwrap Reverse
-                    if best_bid_price.as_f64() < order.price {
+                    if best_bid_price < order.price {
                         break;
                     }
 
@@ -200,7 +200,7 @@ impl OrderBook {
         let executions = self.match_order(&mut order);
 
         if order.leaves_qty > 0 {
-            let price = Price::new(order.price);
+            let price = order.price;
             let order_id = order.order_id.clone();
             match order.side {
                 Side::Buy => {

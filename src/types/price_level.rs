@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use super::types::{Node, Order};
+use super::types::{Node, Order, Price};
 
 #[derive(Debug)]
 pub struct PriceLevel {
-    pub price: f64,
+    pub price: Price,
     pub(crate) nodes: Vec<Node>,
     head_idx: Option<usize>,
     tail_idx: Option<usize>,
@@ -12,7 +12,7 @@ pub struct PriceLevel {
 }
 
 impl PriceLevel {
-    pub fn new(price: f64) -> Self {
+    pub fn new(price: Price) -> Self {
         PriceLevel {
             price,
             nodes: Vec::new(),
