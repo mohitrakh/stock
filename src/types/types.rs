@@ -21,7 +21,7 @@ impl Price {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Side {
     Buy,
     Sell,
@@ -44,7 +44,7 @@ pub struct Node {
     pub next_idx: Option<usize>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Order {
     pub order_id: String,
     pub user_id: String,
@@ -92,7 +92,7 @@ impl Order {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Execution {
     pub execution_id: String,
     pub buy_order_id: String,

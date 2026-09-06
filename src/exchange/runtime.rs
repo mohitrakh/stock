@@ -1,7 +1,7 @@
 use crate::{
     exchange::core::ExchangeCore,
     types::{
-        exchange_event::{EventEnvelope, ExchangeEvent},
+        exchange_event::{EventEnvelope, ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent},
         types::ExchangeCommand,
     },
 };
@@ -17,6 +17,31 @@ enum InputEventResult {
     Deposit(Result<(), String>),
     PlaceOrder(Result<String, String>),
     CancelOrder(Result<(), String>),
+}
+struct ProcessedInput {
+    result: InputEventResult,
+    output_events: Vec<ExchangeOutputEvent>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ReplayError {
+    EventSequenceMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    UnexpectedOutput {
+        seq_num: u64,
+        actual: ExchangeOutputEvent,
+    },
+    MissingOutput {
+        seq_num: u64,
+        expected: ExchangeOutputEvent,
+    },
+    OutputMismatch {
+        seq_num: u64,
+        expected: ExchangeOutputEvent,
+        actual: ExchangeOutputEvent,
+    },
 }
 
 impl InputEventResult {
@@ -40,6 +65,146 @@ impl InputEventResult {
             _ => unreachable!("expected cancel order result"),
         }
     }
+}
+
+fn process_input_event(core: &mut ExchangeCore, event: ExchangeInputEvent) -> ProcessedInput {
+    match event {
+        ExchangeInputEvent::FundsDepositRequested { user_id, amount } => {
+            core.deposit(user_id.clone(), amount);
+
+            ProcessedInput {
+                result: InputEventResult::Deposit(Ok(())),
+                output_events: vec![ExchangeOutputEvent::FundsDeposited { user_id, amount }],
+            }
+        }
+
+        ExchangeInputEvent::NewOrderRequested { order } => {
+            let order_id = order.order_id.clone();
+
+            match core.add_order(order) {
+                Ok(outcome) => {
+                    let response_order_id = outcome.order_id.clone();
+
+                    let mut output_events = vec![ExchangeOutputEvent::OrderAccepted {
+                        order_id: outcome.order_id,
+                        seq_num: outcome.seq_num,
+                    }];
+
+                    output_events.extend(
+                        outcome
+                            .executions
+                            .into_iter()
+                            .map(|execution| ExchangeOutputEvent::ExecutionCreated { execution }),
+                    );
+
+                    ProcessedInput {
+                        result: InputEventResult::PlaceOrder(Ok(response_order_id)),
+                        output_events,
+                    }
+                }
+
+                Err(err) => {
+                    let reason = format!("{:?}", err);
+
+                    ProcessedInput {
+                        result: InputEventResult::PlaceOrder(Err(reason.clone())),
+                        output_events: vec![ExchangeOutputEvent::OrderRejected {
+                            order_id,
+                            reason,
+                        }],
+                    }
+                }
+            }
+        }
+
+        ExchangeInputEvent::CancelOrderRequested { order_id, user_id } => {
+            match core.cancel_order_for_user(&order_id, &user_id) {
+                Ok(seq_num) => ProcessedInput {
+                    result: InputEventResult::CancelOrder(Ok(())),
+                    output_events: vec![ExchangeOutputEvent::OrderCanceled { order_id, seq_num }],
+                },
+
+                Err(err) => {
+                    let reason = format!("{:?}", err);
+
+                    ProcessedInput {
+                        result: InputEventResult::CancelOrder(Err(reason.clone())),
+                        output_events: vec![ExchangeOutputEvent::CancelRejected {
+                            order_id,
+                            reason,
+                        }],
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn replay_event_log(event_log: &[EventEnvelope]) -> Result<ExchangeCore, ReplayError> {
+    for (index, envelope) in event_log.iter().enumerate() {
+        let expected = index as u64 + 1;
+
+        if envelope.seq_num != expected {
+            return Err(ReplayError::EventSequenceMismatch {
+                expected,
+                actual: envelope.seq_num,
+            });
+        }
+    }
+
+    let mut core = ExchangeCore::new();
+    let mut index = 0;
+
+    while index < event_log.len() {
+        let input_envelope = &event_log[index];
+
+        let input = match &input_envelope.event {
+            ExchangeEvent::Input(input) => input.clone(),
+
+            ExchangeEvent::Output(actual) => {
+                return Err(ReplayError::UnexpectedOutput {
+                    seq_num: input_envelope.seq_num,
+                    actual: actual.clone(),
+                });
+            }
+        };
+
+        index += 1;
+
+        let processed = process_input_event(&mut core, input);
+
+        for expected_output in processed.output_events {
+            let Some(output_envelope) = event_log.get(index) else {
+                return Err(ReplayError::MissingOutput {
+                    seq_num: index as u64 + 1,
+                    expected: expected_output,
+                });
+            };
+
+            let actual_output = match &output_envelope.event {
+                ExchangeEvent::Output(actual) => actual,
+
+                ExchangeEvent::Input(_) => {
+                    return Err(ReplayError::MissingOutput {
+                        seq_num: output_envelope.seq_num,
+                        expected: expected_output,
+                    });
+                }
+            };
+
+            if actual_output != &expected_output {
+                return Err(ReplayError::OutputMismatch {
+                    seq_num: output_envelope.seq_num,
+                    expected: expected_output,
+                    actual: actual_output.clone(),
+                });
+            }
+
+            index += 1;
+        }
+    }
+
+    Ok(core)
 }
 
 impl ExchangeRuntime {
@@ -69,17 +234,18 @@ impl ExchangeRuntime {
                 amount,
                 respond_to,
             } => {
-                let result =
-                    self.record_and_process_input_event(ExchangeEvent::FundsDepositRequested {
+                let result = self.record_and_process_input_event(
+                    ExchangeInputEvent::FundsDepositRequested {
                         user_id: user_id.clone(),
                         amount,
-                    });
+                    },
+                );
 
                 let _ = respond_to.send(result.into_deposit_result());
             }
             ExchangeCommand::PlaceOrder { order, respond_to } => {
                 let result =
-                    self.record_and_process_input_event(ExchangeEvent::NewOrderRequested {
+                    self.record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
                         order: order.clone(),
                     });
 
@@ -91,7 +257,7 @@ impl ExchangeRuntime {
                 respond_to,
             } => {
                 let result =
-                    self.record_and_process_input_event(ExchangeEvent::CancelOrderRequested {
+                    self.record_and_process_input_event(ExchangeInputEvent::CancelOrderRequested {
                         order_id: order_id.clone(),
                         user_id: user_id.clone(),
                     });
@@ -101,59 +267,16 @@ impl ExchangeRuntime {
         }
     }
 
-    fn record_and_process_input_event(&mut self, event: ExchangeEvent) -> InputEventResult {
-        self.append_event(event.clone());
-        self.process_input_event(event)
-    }
-
-    fn process_input_event(&mut self, event: ExchangeEvent) -> InputEventResult {
-        match event {
-            ExchangeEvent::FundsDepositRequested { user_id, amount } => {
-                self.core.deposit(user_id.clone(), amount);
-                self.append_event(ExchangeEvent::FundsDeposited { user_id, amount });
-                InputEventResult::Deposit(Ok(()))
-            }
-            ExchangeEvent::NewOrderRequested { order } => {
-                let order_id = order.order_id.clone();
-
-                let result = match self.core.add_order(order) {
-                    Ok(outcome) => {
-                        self.append_event(ExchangeEvent::OrderAccepted {
-                            order_id: outcome.order_id.clone(),
-                            seq_num: outcome.seq_num,
-                        });
-
-                        for execution in outcome.executions {
-                            self.append_event(ExchangeEvent::ExecutionCreated { execution });
-                        }
-
-                        Ok(outcome.order_id)
-                    }
-                    Err(err) => {
-                        let reason = format!("{:?}", err);
-                        self.append_event(ExchangeEvent::OrderRejected {
-                            order_id,
-                            reason: reason.clone(),
-                        });
-                        Err(reason)
-                    }
-                };
-
-                InputEventResult::PlaceOrder(result)
-            }
-            ExchangeEvent::CancelOrderRequested { order_id, user_id } => {
-                let result = self
-                    .core
-                    .cancel_order_for_user(&order_id, &user_id)
-                    .map(|seq_num| {
-                        self.append_event(ExchangeEvent::OrderCanceled { order_id, seq_num });
-                    })
-                    .map_err(|err| format!("{:?}", err));
-
-                InputEventResult::CancelOrder(result)
-            }
-            event => unreachable!("cannot process output event as input: {:?}", event),
+    fn record_and_process_input_event(&mut self, event: ExchangeInputEvent) -> InputEventResult {
+        self.append_event(ExchangeEvent::Input(event.clone()));
+        let ProcessedInput {
+            result,
+            output_events,
+        } = process_input_event(&mut self.core, event);
+        for output_event in output_events {
+            self.append_event(ExchangeEvent::Output(output_event));
         }
+        result
     }
 
     fn append_event(&mut self, event: ExchangeEvent) -> u64 {
@@ -211,7 +334,7 @@ mod tests {
         assert_eq!(runtime.event_log[1].seq_num, 2);
 
         match &runtime.event_log[0].event {
-            ExchangeEvent::FundsDepositRequested { user_id, amount } => {
+            ExchangeEvent::Input(ExchangeInputEvent::FundsDepositRequested { user_id, amount }) => {
                 assert_eq!(user_id, "buyer");
                 assert_eq!(*amount, 1_000);
             }
@@ -219,7 +342,7 @@ mod tests {
         }
 
         match &runtime.event_log[1].event {
-            ExchangeEvent::FundsDeposited { user_id, amount } => {
+            ExchangeEvent::Output(ExchangeOutputEvent::FundsDeposited { user_id, amount }) => {
                 assert_eq!(user_id, "buyer");
                 assert_eq!(*amount, 1_000);
             }
@@ -241,14 +364,14 @@ mod tests {
         assert_eq!(runtime.event_log.len(), 2);
 
         match &runtime.event_log[0].event {
-            ExchangeEvent::NewOrderRequested { order } => {
+            ExchangeEvent::Input(ExchangeInputEvent::NewOrderRequested { order }) => {
                 assert_eq!(order.order_id, "buy-1");
             }
             other => panic!("unexpected event: {:?}", other),
         }
 
         match &runtime.event_log[1].event {
-            ExchangeEvent::OrderAccepted { order_id, seq_num } => {
+            ExchangeEvent::Output(ExchangeOutputEvent::OrderAccepted { order_id, seq_num }) => {
                 assert_eq!(order_id, "buy-1");
                 assert_eq!(*seq_num, 1);
             }
@@ -269,7 +392,7 @@ mod tests {
         assert_eq!(runtime.event_log.len(), 2);
 
         match &runtime.event_log[1].event {
-            ExchangeEvent::OrderRejected { order_id, reason } => {
+            ExchangeEvent::Output(ExchangeOutputEvent::OrderRejected { order_id, reason }) => {
                 assert_eq!(order_id, "buy-1");
                 assert!(reason.contains("WalletRejected"));
             }
@@ -296,7 +419,10 @@ mod tests {
         assert_eq!(runtime.event_log.len(), 2);
 
         match &runtime.event_log[0].event {
-            ExchangeEvent::CancelOrderRequested { order_id, user_id } => {
+            ExchangeEvent::Input(ExchangeInputEvent::CancelOrderRequested {
+                order_id,
+                user_id,
+            }) => {
                 assert_eq!(order_id, "buy-1");
                 assert_eq!(user_id, "buyer");
             }
@@ -304,7 +430,7 @@ mod tests {
         }
 
         match &runtime.event_log[1].event {
-            ExchangeEvent::OrderCanceled { order_id, seq_num } => {
+            ExchangeEvent::Output(ExchangeOutputEvent::OrderCanceled { order_id, seq_num }) => {
                 assert_eq!(order_id, "buy-1");
                 assert_eq!(*seq_num, 2);
             }
@@ -330,14 +456,14 @@ mod tests {
         assert_eq!(runtime.event_log.len(), 4);
 
         match &runtime.event_log[0].event {
-            ExchangeEvent::NewOrderRequested { order } => {
+            ExchangeEvent::Input(ExchangeInputEvent::NewOrderRequested { order }) => {
                 assert_eq!(order.order_id, "buy-1");
             }
             other => panic!("unexpected event: {:?}", other),
         }
 
         match &runtime.event_log[1].event {
-            ExchangeEvent::OrderAccepted { order_id, seq_num } => {
+            ExchangeEvent::Output(ExchangeOutputEvent::OrderAccepted { order_id, seq_num }) => {
                 assert_eq!(order_id, "buy-1");
                 assert_eq!(*seq_num, 2);
             }
@@ -346,7 +472,7 @@ mod tests {
 
         for event in &runtime.event_log[2..] {
             match &event.event {
-                ExchangeEvent::ExecutionCreated { execution } => {
+                ExchangeEvent::Output(ExchangeOutputEvent::ExecutionCreated { execution }) => {
                     assert_eq!(execution.buy_order_id, "buy-1");
                     assert_eq!(execution.sell_order_id, "sell-1");
                     assert_eq!(execution.price.minor_units(), 10);
@@ -388,7 +514,7 @@ mod tests {
         }
 
         match &consumed_events[0].event {
-            ExchangeEvent::FundsDepositRequested { user_id, amount } => {
+            ExchangeEvent::Input(ExchangeInputEvent::FundsDepositRequested { user_id, amount }) => {
                 assert_eq!(user_id, "buyer");
                 assert_eq!(*amount, 1_000);
             }
@@ -396,11 +522,205 @@ mod tests {
         }
 
         match &consumed_events[7].event {
-            ExchangeEvent::ExecutionCreated { execution } => {
+            ExchangeEvent::Output(ExchangeOutputEvent::ExecutionCreated { execution }) => {
                 assert_eq!(execution.buy_order_id, "buy-1");
                 assert_eq!(execution.sell_order_id, "sell-1");
             }
             other => panic!("unexpected event: {:?}", other),
         }
+    }
+    #[test]
+    fn rejected_cancellation_is_recorded_and_returned() {
+        let mut runtime = runtime();
+        runtime.core.deposit("buyer".to_string(), 1_000);
+        runtime
+            .core
+            .add_order(order("buy-1", "buyer", "BUY", 10, 10))
+            .unwrap();
+
+        let (respond_to, response_rx) = oneshot::channel();
+
+        runtime.handle_command(ExchangeCommand::CancelOrder {
+            order_id: "buy-1".to_string(),
+            user_id: "wrong-user".to_string(),
+            respond_to,
+        });
+
+        assert_eq!(runtime.event_log.len(), 2);
+        assert_eq!(runtime.event_log[0].seq_num, 1);
+        assert_eq!(runtime.event_log[1].seq_num, 2);
+
+        match &runtime.event_log[0].event {
+            ExchangeEvent::Input(ExchangeInputEvent::CancelOrderRequested {
+                order_id,
+                user_id,
+            }) => {
+                assert_eq!(order_id, "buy-1");
+                assert_eq!(user_id, "wrong-user");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match &runtime.event_log[1].event {
+            ExchangeEvent::Output(ExchangeOutputEvent::CancelRejected { order_id, reason }) => {
+                assert_eq!(order_id, "buy-1");
+                assert!(reason.contains("Unauthorized"));
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        let response = response_rx.blocking_recv().unwrap();
+        assert!(matches!(
+            response,
+            Err(reason) if reason.contains("Unauthorized")
+        ));
+    }
+    #[test]
+    fn same_input_sequence_produces_same_output_events() {
+        let inputs = vec![
+            ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".to_string(),
+                amount: 1_000,
+            },
+            ExchangeInputEvent::NewOrderRequested {
+                order: order("sell-1", "seller", "SELL", 10, 5),
+            },
+            ExchangeInputEvent::NewOrderRequested {
+                order: order("buy-1", "buyer", "BUY", 10, 5),
+            },
+        ];
+
+        let mut first_core = ExchangeCore::new();
+        let mut second_core = ExchangeCore::new();
+
+        let mut first_outputs = Vec::new();
+        let mut second_outputs = Vec::new();
+
+        for input in inputs {
+            let first_processed = process_input_event(&mut first_core, input.clone());
+            let second_processed = process_input_event(&mut second_core, input);
+
+            first_outputs.extend(first_processed.output_events);
+            second_outputs.extend(second_processed.output_events);
+        }
+
+        assert_eq!(first_outputs.len(), 5);
+        assert_eq!(first_outputs, second_outputs);
+    }
+    #[test]
+    fn replay_rebuilds_matching_state_and_sequence() {
+        let mut original = runtime();
+
+        let _ =
+            original.record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".to_string(),
+                amount: 1_000,
+            });
+
+        let _ = original.record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+            order: order("sell-1", "seller", "SELL", 10, 10),
+        });
+
+        let _ = original.record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+            order: order("buy-1", "buyer", "BUY", 10, 5),
+        });
+
+        assert_eq!(original.event_log().len(), 8);
+
+        let mut rebuilt_core = replay_event_log(original.event_log()).unwrap();
+
+        let continuation = process_input_event(
+            &mut rebuilt_core,
+            ExchangeInputEvent::CancelOrderRequested {
+                order_id: "sell-1".to_string(),
+                user_id: "seller".to_string(),
+            },
+        );
+
+        assert_eq!(
+            continuation.output_events,
+            vec![ExchangeOutputEvent::OrderCanceled {
+                order_id: "sell-1".to_string(),
+                seq_num: 3,
+            }]
+        );
+    }
+    #[test]
+    fn replay_rejects_event_sequence_gap() {
+        let event_log = vec![EventEnvelope {
+            seq_num: 2,
+            event: ExchangeEvent::Input(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".to_string(),
+                amount: 1_000,
+            }),
+        }];
+
+        assert!(matches!(
+            replay_event_log(&event_log),
+            Err(ReplayError::EventSequenceMismatch {
+                expected: 1,
+                actual: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn replay_rejects_missing_output() {
+        let event_log = vec![EventEnvelope {
+            seq_num: 1,
+            event: ExchangeEvent::Input(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".to_string(),
+                amount: 1_000,
+            }),
+        }];
+
+        assert!(matches!(
+            replay_event_log(&event_log),
+            Err(ReplayError::MissingOutput {
+                seq_num: 2,
+                expected: ExchangeOutputEvent::FundsDeposited { .. },
+            })
+        ));
+    }
+
+    #[test]
+    fn replay_rejects_unexpected_output() {
+        let event_log = vec![EventEnvelope {
+            seq_num: 1,
+            event: ExchangeEvent::Output(ExchangeOutputEvent::FundsDeposited {
+                user_id: "buyer".to_string(),
+                amount: 1_000,
+            }),
+        }];
+
+        assert!(matches!(
+            replay_event_log(&event_log),
+            Err(ReplayError::UnexpectedOutput { seq_num: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn replay_rejects_modified_output() {
+        let event_log = vec![
+            EventEnvelope {
+                seq_num: 1,
+                event: ExchangeEvent::Input(ExchangeInputEvent::FundsDepositRequested {
+                    user_id: "buyer".to_string(),
+                    amount: 1_000,
+                }),
+            },
+            EventEnvelope {
+                seq_num: 2,
+                event: ExchangeEvent::Output(ExchangeOutputEvent::FundsDeposited {
+                    user_id: "buyer".to_string(),
+                    amount: 999,
+                }),
+            },
+        ];
+
+        assert!(matches!(
+            replay_event_log(&event_log),
+            Err(ReplayError::OutputMismatch { seq_num: 2, .. })
+        ));
     }
 }
