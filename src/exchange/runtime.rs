@@ -217,6 +217,25 @@ impl ExchangeRuntime {
         }
     }
 
+    pub fn from_event_log(
+        rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
+        event_log: Vec<EventEnvelope>,
+    ) -> Result<Self, ReplayError> {
+        let core = replay_event_log(&event_log)?;
+
+        let next_event_seq = event_log
+            .last()
+            .map(|envelope| envelope.seq_num + 1)
+            .unwrap_or(1);
+
+        Ok(Self {
+            rx,
+            core,
+            event_log,
+            next_event_seq,
+        })
+    }
+
     pub fn run(mut self) {
         while let Some(command) = self.rx.blocking_recv() {
             self.handle_command(command);
@@ -722,5 +741,64 @@ mod tests {
             replay_event_log(&event_log),
             Err(ReplayError::OutputMismatch { seq_num: 2, .. })
         ));
+    }
+
+    #[test]
+    fn recovered_runtime_continues_event_and_matching_sequences() {
+        let mut original = runtime();
+
+        let _ =
+            original.record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".to_string(),
+                amount: 1_000,
+            });
+
+        let _ = original.record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+            order: order("sell-1", "seller", "SELL", 10, 10),
+        });
+
+        let _ = original.record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+            order: order("buy-1", "buyer", "BUY", 10, 5),
+        });
+
+        let recorded_log = original.event_log().to_vec();
+        assert_eq!(recorded_log.len(), 8);
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+
+        let mut recovered = ExchangeRuntime::from_event_log(rx, recorded_log).unwrap();
+
+        let (respond_to, response_rx) = oneshot::channel();
+
+        recovered.handle_command(ExchangeCommand::CancelOrder {
+            order_id: "sell-1".to_string(),
+            user_id: "seller".to_string(),
+            respond_to,
+        });
+
+        assert_eq!(response_rx.blocking_recv().unwrap(), Ok(()));
+        assert_eq!(recovered.event_log().len(), 10);
+
+        assert_eq!(recovered.event_log()[8].seq_num, 9);
+        assert_eq!(recovered.event_log()[9].seq_num, 10);
+
+        match &recovered.event_log()[8].event {
+            ExchangeEvent::Input(ExchangeInputEvent::CancelOrderRequested {
+                order_id,
+                user_id,
+            }) => {
+                assert_eq!(order_id, "sell-1");
+                assert_eq!(user_id, "seller");
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
+
+        match &recovered.event_log()[9].event {
+            ExchangeEvent::Output(ExchangeOutputEvent::OrderCanceled { order_id, seq_num }) => {
+                assert_eq!(order_id, "sell-1");
+                assert_eq!(*seq_num, 3);
+            }
+            other => panic!("unexpected event: {:?}", other),
+        }
     }
 }

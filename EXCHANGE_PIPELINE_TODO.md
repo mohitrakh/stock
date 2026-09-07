@@ -58,8 +58,35 @@ The gateway and critical trading path now represent monetary prices as positive 
 - Wallet reservation, fill settlement, and cancellation unlocks use checked multiplication.
 - `cargo test` passes 21 tests.
 
+## Completed Milestone - Deterministic In-Memory Replay
+
+Inputs and outputs share an ordered in-memory log but have separate event types. Live processing and replay use the same input-processing function, and a validated log can rebuild a runtime that continues processing live commands.
+
+### Completed Implementation
+
+- [x] Separate `ExchangeInputEvent` and `ExchangeOutputEvent` inside `ExchangeEvent`.
+- [x] Record cancellation rejection outcomes.
+- [x] Separate core input processing from runtime event-log mutation.
+- [x] Add equality comparisons and verify deterministic output generation.
+- [x] Add `replay_event_log` to validate sequences and compare regenerated outputs.
+- [x] Reject sequence mismatches, missing outputs, unexpected outputs, and output mismatches.
+- [x] Add `ExchangeRuntime::from_event_log` to resume live processing after replay.
+- [x] Test replayed matching state and continuation of both sequence counters.
+- [x] Update the project journal and current implementation documentation.
+
+### Acceptance Criteria - Verified
+
+- Replay applies only inputs to a fresh core and checks recorded outputs without applying them again.
+- Event-log sequence numbers must be contiguous and start at 1.
+- The rebuilt core is returned only after the complete supplied log passes validation.
+- A recovered runtime retains its history and can process a new live cancellation.
+- The recovery test continues an eight-event history at event sequences 9 and 10 with matching sequence 3.
+- On 2026-09-06, `cargo fmt -- --check` passes and `cargo test` passes 29 tests.
+
+This milestone uses an in-memory `Vec<EventEnvelope>`. Serialization, durable storage, snapshots, and loading history during application startup remain unimplemented.
+
 ## Next Milestone
 
 Not selected yet. Re-read the resulting code and discuss the next architectural goal before implementation.
 
-Do not automatically begin market data, replay, persistence, sell-side positions, mmap, ring buffers, UDP, CPU pinning, multiple component threads, or per-symbol partitioning.
+Do not automatically begin market data, persistence, sell-side positions, mmap, ring buffers, UDP, CPU pinning, multiple component threads, or per-symbol partitioning.

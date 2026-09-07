@@ -8,6 +8,8 @@ This document describes the code that exists now. `stock-exchange-system-design.
 
 Axum acts as the gateway. It sends live `ExchangeCommand` values to one dedicated worker. `ExchangeRuntime` converts those commands into replayable events, records them in memory, invokes `ExchangeCore`, records output events, and returns live results through `oneshot` channels.
 
+A supplied in-memory event log can also rebuild a fresh core through deterministic replay. `ExchangeRuntime::from_event_log` resumes live processing from that validated state; normal application startup still creates an empty runtime.
+
 ```mermaid
 graph TD
     HTTP[Axum HTTP handlers] --> CMD[ExchangeCommand queue]
@@ -54,7 +56,21 @@ For a cancellation, it validates ownership and lifecycle state, assigns the matc
 
 `ExchangeCommand` belongs to the live HTTP boundary because it contains `respond_to`; it is not replayable. `ExchangeEvent` contains business data only, and `EventEnvelope` adds a monotonic `seq_num`.
 
-The current event variants cover deposits, new orders, cancellations, accepted/rejected outcomes, successful deposits, cancellations, and created executions. The log is currently process memory only: it is neither durable nor exposed through HTTP.
+### Input and Output Events
+
+`ExchangeInputEvent` represents deposit, new-order, and cancellation requests. `ExchangeOutputEvent` represents successful deposits, order acceptance or rejection, successful or rejected cancellations, and created executions. `ExchangeEvent::Input` and `ExchangeEvent::Output` wrap these types in one ordered log. Events, envelopes, and replay-relevant order/execution values support `PartialEq` for comparison.
+
+`process_input_event` takes a mutable core and one input event. It returns `ProcessedInput`, containing the live result and generated output events, without writing the runtime log. Live processing appends the input, calls this shared processor, appends its outputs, and sends the result through the response channel.
+
+### Replay and Recovery
+
+`replay_event_log(&[EventEnvelope])` first checks that envelope sequences are contiguous starting at 1. It then creates a fresh `ExchangeCore` and processes each recorded input through `process_input_event`. Generated outputs must exactly match the following recorded outputs in both value and order. Recorded outputs are checked, not applied to the core a second time.
+
+`ReplayError` distinguishes `EventSequenceMismatch`, `MissingOutput`, `UnexpectedOutput`, and `OutputMismatch`. The rebuilt core is returned only after the entire supplied log passes validation; a failed replay does not return its partially rebuilt core.
+
+`ExchangeRuntime::from_event_log(rx, event_log)` uses that core, retains the supplied log, and sets the next event-log sequence to the last envelope's sequence plus one. An empty log produces a fresh core with next event sequence 1. Matching-input sequencing is reconstructed by replaying core operations and remains distinct from event-log sequencing.
+
+Recovery requires the full history from an empty core, including deposits and orders that affect later inputs. The current log exists only in process memory; it is not durable or exposed through HTTP or terminal output by default. Event serialization, snapshots, and loading history at startup are not implemented. `run_exchange_worker` still starts with `ExchangeRuntime::new`.
 
 ---
 
@@ -325,4 +341,6 @@ Simple connection utilities for PostgreSQL backing.
 
 ## Current Verification
 
-As of 2026-08-30, `cargo test` passes 18 tests. These cover the exchange-core lifecycle, matching, wallet settlement, cancellation, rejected-operation sequence behavior, and sequential consumption of the runtime event log.
+As of 2026-09-06, `cargo fmt -- --check` passes and `cargo test` passes 29 tests with no failures. These cover the exchange-core lifecycle, matching, exact minor-unit prices, wallet settlement, cancellation, rejected-operation sequence behavior, and sequential consumption of the runtime event log.
+
+Replay coverage includes deterministic output generation, all four replay error categories, reconstruction of matching state with sequence continuation, and live processing after runtime recovery. The recovery test rebuilds an eight-event deposit/partial-fill history and verifies a live cancellation at event sequences 9 and 10 with matching sequence 3.

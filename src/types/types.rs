@@ -1,6 +1,7 @@
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Price(u64);
 
 impl Price {
@@ -21,7 +22,8 @@ impl Price {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Side {
     Buy,
     Sell,
@@ -44,7 +46,7 @@ pub struct Node {
     pub next_idx: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Order {
     pub order_id: String,
     pub user_id: String,
@@ -92,7 +94,7 @@ impl Order {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Execution {
     pub execution_id: String,
     pub buy_order_id: String,
