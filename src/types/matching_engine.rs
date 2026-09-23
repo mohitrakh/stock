@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::order_book::OrderBook;
-use super::types::{Execution, Order, Price, Side};
+use super::types::{Execution, L2Level, Order, OrderBookView, Price, Side};
 
 #[derive(Debug)]
 pub struct MatchingEngine {
@@ -72,6 +72,28 @@ impl MatchingEngine {
         let bid = book.best_bid()?;
         let ask = book.best_ask()?;
         Some((bid, ask))
+    }
+
+    /// L2 depth for one symbol, or `None` if no order book has been opened for it yet.
+    pub fn l2_snapshot(&self, symbol: &str, depth: usize) -> Option<OrderBookView> {
+        let book = self.order_books.get(symbol)?;
+        let (bids, asks) = book.l2_snapshot(depth);
+
+        let to_levels = |levels: Vec<(Price, u32)>| {
+            levels
+                .into_iter()
+                .map(|(price, quantity)| L2Level {
+                    price: price.minor_units(),
+                    quantity,
+                })
+                .collect()
+        };
+
+        Some(OrderBookView {
+            symbol: symbol.to_string(),
+            bids: to_levels(bids),
+            asks: to_levels(asks),
+        })
     }
     pub fn cancel_order(
         &mut self,

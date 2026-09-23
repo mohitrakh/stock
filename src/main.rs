@@ -25,9 +25,10 @@ mod db;
 mod state;
 use state::AppState;
 
-use crate::exchange::runtime::run_exchange_worker;
+use crate::exchange::runtime::recover_runtime;
 
 const EXCHANGE_COMMAND_QUEUE_SIZE: usize = 10_000;
+const DEFAULT_EVENT_LOG_PATH: &str = "exchange-events.log";
 
 #[tokio::main]
 async fn main() {
@@ -35,7 +36,29 @@ async fn main() {
     let db = db::connect_db().await;
     let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
 
-    thread::spawn(move || run_exchange_worker(rx));
+    let event_log_path =
+        std::env::var("EVENT_LOG_PATH").unwrap_or_else(|_| DEFAULT_EVENT_LOG_PATH.to_string());
+
+    // Recovery happens before the listener binds, and on the main thread. History that cannot be
+    // trusted must stop the process, not kill a worker thread and leave a server answering
+    // requests it can never fulfil.
+    let runtime = recover_runtime(rx, &event_log_path).unwrap_or_else(|err| {
+        eprintln!("refusing to start: {}", err);
+        eprintln!("event log: {}", event_log_path);
+        eprintln!(
+            "The exchange will not start on history it cannot replay. Move the file aside to \
+             start a new exchange, understanding that its history is then abandoned."
+        );
+        std::process::exit(1);
+    });
+
+    println!(
+        "Event log {} recovered with {} events",
+        event_log_path,
+        runtime.event_log().len()
+    );
+
+    thread::spawn(move || runtime.run());
 
     let state = AppState { db, tx };
 

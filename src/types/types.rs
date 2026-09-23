@@ -122,11 +122,83 @@ pub enum WalletError {
     Overflow,
 }
 
+/// A user's cash position. `available` is what a new buy order can still reserve.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BalanceView {
+    pub user_id: String,
+    pub balance: u64,
+    pub locked: u64,
+    pub available: u64,
+}
+
+/// The lifecycle state of one order, as a client sees it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OrderView {
+    pub order_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub price: u64,
+    pub quantity: u32,
+    pub filled_quantity: u32,
+    pub remaining_quantity: u32,
+    pub status: String,
+    pub creation_time: f64,
+}
+
+/// A user's holding in one symbol. `locked` is reserved behind resting sell orders; `available` is
+/// what a new sell order can still reserve.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PositionView {
+    pub symbol: String,
+    pub quantity: u64,
+    pub locked: u64,
+    pub available: u64,
+}
+
+/// One fill, from the perspective of one party to it. `side` and `order_id` are that party's, so
+/// the two records a single match produces differ between buyer and seller.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExecutionView {
+    pub execution_id: String,
+    pub order_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub price: u64,
+    pub quantity: u32,
+    pub timestamp: f64,
+}
+
+/// A user's daily trading cap in one symbol, and how much of it today's orders have used.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RiskLimitView {
+    pub symbol: String,
+    pub max_daily_quantity: u64,
+    pub used_today: u64,
+}
+
+/// One aggregated price point of an L2 book: a price and the total size resting on it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct L2Level {
+    pub price: u64,
+    pub quantity: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OrderBookView {
+    pub symbol: String,
+    pub bids: Vec<L2Level>,
+    pub asks: Vec<L2Level>,
+}
+
+/// Live gateway plumbing, not replayable business data — every variant carries a response
+/// channel. The read variants are deliberately *not* mirrored by an `ExchangeInputEvent`: they
+/// change no state, so recording them would pad the event log and slow every future replay
+/// without changing a single outcome.
 #[derive(Debug)]
 pub enum ExchangeCommand {
     PlaceOrder {
         order: Order,
-        respond_to: oneshot::Sender<Result<String, String>>,
+        respond_to: oneshot::Sender<Result<OrderView, String>>,
     },
     CancelOrder {
         order_id: String,
@@ -137,5 +209,48 @@ pub enum ExchangeCommand {
         user_id: String,
         amount: u64,
         respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    DepositShares {
+        user_id: String,
+        symbol: String,
+        quantity: u64,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    SetRiskLimit {
+        user_id: String,
+        symbol: String,
+        max_daily_quantity: u64,
+        respond_to: oneshot::Sender<Result<(), String>>,
+    },
+    GetExecutions {
+        user_id: String,
+        symbol: Option<String>,
+        order_id: Option<String>,
+        start_time: Option<f64>,
+        end_time: Option<f64>,
+        respond_to: oneshot::Sender<Vec<ExecutionView>>,
+    },
+    GetRiskLimit {
+        user_id: String,
+        symbol: String,
+        respond_to: oneshot::Sender<RiskLimitView>,
+    },
+    GetBalance {
+        user_id: String,
+        respond_to: oneshot::Sender<BalanceView>,
+    },
+    GetPositions {
+        user_id: String,
+        respond_to: oneshot::Sender<Vec<PositionView>>,
+    },
+    GetOrder {
+        order_id: String,
+        user_id: String,
+        respond_to: oneshot::Sender<Option<OrderView>>,
+    },
+    GetOrderBook {
+        symbol: String,
+        depth: usize,
+        respond_to: oneshot::Sender<Option<OrderBookView>>,
     },
 }

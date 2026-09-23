@@ -1,3 +1,5 @@
 /target
 AGENTS.md
 *.md
+exchange-events.log
+*.log

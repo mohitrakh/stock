@@ -85,8 +85,123 @@ Inputs and outputs share an ordered in-memory log but have separate event types.
 
 This milestone uses an in-memory `Vec<EventEnvelope>`. Serialization, durable storage, snapshots, and loading history during application startup remain unimplemented.
 
+## Completed Milestone - Observable Exchange
+
+Full write-up: `docs/tasks/01-observable-exchange.md`.
+
+Inserted ahead of durable storage after an audit found every component built since the runtime milestone was unreachable from the running binary, and that a client could place an order and never learn whether it filled. A crossed-book bug in self-trade prevention was found and fixed in the same pass.
+
+### Completed Implementation
+
+- [x] Add `GetBalance`, `GetOrder`, and `GetOrderBook` variants to `ExchangeCommand`.
+- [x] Answer them directly from `ExchangeCore`, with no `ExchangeInputEvent` and no event-log write.
+- [x] Add `order_view` / `balance_view` to `OrderManager` and `l2_snapshot` to `OrderBook` and `MatchingEngine`.
+- [x] Return a JSON `OrderView` from `POST /exchange/orders` instead of a bare uuid string.
+- [x] Add `GET /exchange/balance`, `GET /exchange/orders/{order_id}`, `GET /exchange/orderbook/{symbol}`.
+- [x] Replace the self-trade `break` with a skip, via `PriceLevel::first_matchable_mut`.
+- [x] Snapshot crossing price levels in `match_order` so a skipped level cannot spin the loop.
+- [x] Map a cancel of an unknown order to 404 instead of 400.
+- [x] Run formatting, the full test suite, and a live HTTP session against a running server.
+- [x] Update `PROJECT_DIRECTION.md` and `SYSTEM_DOCUMENTATION.md`.
+
+### Acceptance Criteria - Verified
+
+- A client can read its balance, its own order state, and L2 market depth over HTTP.
+- Queries never append to the event log; a test asserts the log length across all three.
+- A non-owner reading another user's order id receives 404, not 403.
+- A self-order at the head of a price level no longer hides a valid counterparty behind it.
+- The aggressor never rests into a book crossed against a matchable counterparty.
+- `cargo fmt -- --check` passes and `cargo test` passes 38 tests.
+
+## Completed Milestone - Durable Event Log and Startup Recovery
+
+Full write-up: `docs/tasks/02-durable-event-log.md`.
+
+Exchange history now survives a process restart. Each processed command is written to an append-only file as one framed record (length, CRC-32, JSON payload) holding the input and every output it produced, synchronized to disk before the client is answered. Startup replays the file through the existing deterministic replay and refuses to start on anything it cannot trust.
+
+### Completed Implementation
+
+- [x] Add `src/exchange/event_store.rs`: magic header, length + CRC-32 framing, `open` with torn-tail truncation, `append` with `sync_all`.
+- [x] Write the input and its outputs as one record so a crash can never leave an input without its outputs.
+- [x] Make `ExchangeRuntime` write the record before advancing its in-memory log or replying.
+- [x] Fail closed: a store error answers the waiting client with a halt message and stops the worker.
+- [x] Add `recover_runtime` and call it from `main` before the listener binds; exit 1 on any untrusted history.
+- [x] Accept an optional `client_order_id` and return 409 on a duplicate, so a retried request cannot open a second order.
+- [x] Read `EVENT_LOG_PATH` from the environment; ignore the log file in git.
+- [x] Run formatting, the full test suite, and a live session covering two hard kills, a torn log, and a corrupted log.
+- [x] Update `PROJECT_DIRECTION.md` and `SYSTEM_DOCUMENTATION.md`.
+
+### Acceptance Criteria - Verified
+
+- Deposit, partial fill, hard kill, restart: balances, locks, order state, order-book state, and both sequence counters continue exactly (event sequences 9 and 10, matching sequence 3).
+- A record torn by a crash is discarded whole and the exchange starts on the history before it.
+- A checksum mismatch or a record that fails deterministic replay refuses startup with a clear message; the exchange never silently starts empty.
+- A write failure halts the worker rather than acknowledging a command that is not durable.
+- The same `client_order_id` submitted twice produces exactly one order.
+- `cargo fmt -- --check` passes and `cargo test` passes 46 tests.
+
+## Completed Milestone - Sell-Side Positions
+
+Full write-up: `docs/tasks/03-sell-side-positions.md`.
+
+The exchange no longer creates money out of nothing. A sell must be backed by shares the seller holds, reserved at placement the same way a buy reserves cash, and a fill transfers both cash and shares so neither total changes.
+
+### Completed Implementation
+
+- [x] Add `src/types/positions.rs`: holdings and reservations per `(user_id, symbol)`, mirroring the wallet's shape.
+- [x] Branch collateral in `prepare_order` — cash for a buy, shares for a sell — and add `OrderManagerError::PositionRejected`.
+- [x] Make `apply_execution` a four-legged settlement so cash and shares are both conserved.
+- [x] Release share reservations in `complete_cancel` for the unfilled remainder.
+- [x] Add `SharesDepositRequested` / `SharesDeposited` / `SharesDepositRejected` events and `POST /exchange/shares/deposit`.
+- [x] Add `GET /exchange/positions` so the fix is observable from outside the process.
+- [x] Drop the now-dead `Side` parameter from `Wallet::check_and_lock` and `unlock_funds`; delete the unreachable `commit_fill`.
+- [x] Update the twenty existing tests that had been selling shares nobody owned.
+- [x] Run formatting, the full test suite, and a live session including a restart and a legacy log.
+- [x] Update `PROJECT_DIRECTION.md` and `SYSTEM_DOCUMENTATION.md`.
+
+### Acceptance Criteria - Verified
+
+- A sell with no shares, or more shares than held, is rejected and credits nobody.
+- Reserved shares cannot be sold twice; cancelling returns them to available.
+- Cash and shares are both conserved across a partial fill — the invariant that would have caught this bug originally.
+- Shares received in a fill can then be sold.
+- Positions and their reservations survive a hard kill and restart.
+- A pre-position-ledger log containing an accepted unbacked sell refuses to start with an `OutputMismatch`, despite valid framing and checksums.
+- `cargo fmt -- --check` passes and `cargo test` passes 57 tests.
+
+## Completed Milestone - Risk Limits, Executions, and Ledger Cleanup
+
+Full write-up: `docs/tasks/04-risk-limits-and-executions.md`.
+
+Closes the last unmet functional requirements in the target design, plus the deferred correctness gaps.
+
+### Completed Implementation
+
+- [x] Derive the trading day from `Order.timestamp` rather than the system clock, so daily counters replay deterministically; roll forward only.
+- [x] Make limits events (`RiskLimitSetRequested` / `RiskLimitSet`) rather than configuration, with `POST /exchange/risk/limits`.
+- [x] Apply a compiled-in `DEFAULT_MAX_DAILY_QUANTITY` of 1,000,000 when no limit is set.
+- [x] Release the unfilled allowance in `complete_cancel`, alongside cash and shares.
+- [x] Replace unchecked volume arithmetic with `checked_add`; delete the unused `check_and_record`.
+- [x] Add `GET /exchange/risk/limits` and `GET /exchange/executions` with optional symbol, order, and time filters.
+- [x] Index executions per party during settlement, so both sides see their own side and order id.
+- [x] Make `Wallet::deposit` overflow-checked and fallible; add `FundsDepositRejected`.
+- [x] Turn `apply_executions`' silently-dropped odd execution into an error.
+- [x] Resolve the 42 `unused_must_use` warnings the new fallible signatures introduced.
+- [x] Run formatting, the full test suite, and a live session including a restart.
+- [x] Update `PROJECT_DIRECTION.md` and `SYSTEM_DOCUMENTATION.md`.
+
+### Acceptance Criteria - Verified
+
+- The documented 1,000,000 cap applies without anyone configuring it.
+- A cap of 10 admits 6, refuses 5, then admits 4 exactly; rejection is pre-trade, with no reservation taken and no sequence number consumed.
+- Cancelling returns the unfilled allowance; other symbols and other users are unaffected.
+- The day rolls from the order's own timestamp, and a backwards timestamp does not reset it again.
+- One match yields two execution rows, each carrying its own party's side and order id; every filter narrows correctly; nobody sees another user's fills.
+- After a hard kill, the event-set limit and both parties' fills are rebuilt by replay.
+- `cargo fmt -- --check` passes and `cargo test` passes 70 tests.
+
 ## Next Milestone
 
-Not selected yet. Re-read the resulting code and discuss the next architectural goal before implementation.
+Not selected yet. Every functional requirement in the target design's API section is now implemented; what remains is the architecture beyond the critical path. All three candidates — market data publisher, reporter, hot-warm engine — are the same move: a component that subscribes to the event store and keeps its own state. See `docs/tasks/04-risk-limits-and-executions.md`, section 7.
 
-Do not automatically begin market data, persistence, sell-side positions, mmap, ring buffers, UDP, CPU pinning, multiple component threads, or per-symbol partitioning.
+Do not automatically begin snapshots, group commit, mmap, ring buffers, UDP, CPU pinning, multiple component threads, or per-symbol partitioning.

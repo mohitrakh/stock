@@ -93,8 +93,20 @@ impl PriceLevel {
         }
         total
     }
-    pub fn peek_front_mut(&mut self) -> Option<&mut Order> {
-        let head_idx = self.head_idx?;
-        self.nodes[head_idx].order.as_mut()
+    /// The oldest resting order at this level not owned by `exclude_user`.
+    ///
+    /// Self-trade prevention walks past the aggressor's own orders instead of stopping at them,
+    /// so a resting self-order can never hide a valid counterparty queued behind it.
+    pub fn first_matchable_mut(&mut self, exclude_user: &str) -> Option<&mut Order> {
+        let mut current = self.head_idx;
+
+        while let Some(idx) = current {
+            match &self.nodes[idx].order {
+                Some(order) if order.user_id != exclude_user => break,
+                _ => current = self.nodes[idx].next_idx,
+            }
+        }
+
+        self.nodes[current?].order.as_mut()
     }
 }

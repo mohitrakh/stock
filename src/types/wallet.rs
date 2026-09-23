@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::types::{Price, Side, WalletError};
+use super::types::{Price, WalletError};
 
 pub struct Wallet {
     balances: HashMap<String, u64>,
@@ -15,8 +15,15 @@ impl Wallet {
         }
     }
 
-    pub fn deposit(&mut self, user_id: String, amount: u64) {
-        *self.balances.entry(user_id).or_insert(0) += amount;
+    /// Credits cash. Reports overflow rather than wrapping — previously this was a bare `+=`, which
+    /// would have panicked in debug and silently wrapped a balance to near zero in release.
+    pub fn deposit(&mut self, user_id: String, amount: u64) -> Result<(), WalletError> {
+        let current = self.balances.get(&user_id).copied().unwrap_or(0);
+        let updated = current.checked_add(amount).ok_or(WalletError::Overflow)?;
+
+        self.balances.insert(user_id, updated);
+
+        Ok(())
     }
 
     pub fn balance(&self, user_id: &str) -> u64 {
@@ -31,17 +38,15 @@ impl Wallet {
         self.balance(user_id).saturating_sub(self.locked(user_id))
     }
 
+    /// Reserves the cash a buy order would cost. Sell-side collateral is shares, not cash, and is
+    /// handled by `Positions` — this used to take a `Side` and silently do nothing for a sell,
+    /// which is precisely how unbacked sells got through.
     pub fn check_and_lock(
         &mut self,
         user_id: &str,
-        side: &Side,
         price: Price,
         quantity: u64,
     ) -> Result<(), WalletError> {
-        if matches!(side, Side::Sell) {
-            return Ok(());
-        }
-
         let required = price
             .checked_notional(quantity)
             .ok_or(WalletError::Overflow)?;
@@ -96,33 +101,13 @@ impl Wallet {
         Ok(())
     }
 
-    // Called on fill: money is actually spent
-    pub fn commit_fill(
-        &mut self,
-        user_id: &str,
-        side: &Side,
-        price: Price,
-        qty_filled: u64,
-    ) -> Result<(), WalletError> {
-        if matches!(side, Side::Sell) {
-            return Ok(());
-        }
-
-        self.commit_buy_fill(user_id, price, price, qty_filled)
-    }
-
-    // Called on cancel: just release the lock, no balance change
+    /// Called on cancel: releases a buy order's remaining reservation, no balance change.
     pub fn unlock_funds(
         &mut self,
         user_id: &str,
-        side: &Side,
         price: Price,
         qty_unlocked: u64,
     ) -> Result<(), WalletError> {
-        if matches!(side, Side::Sell) {
-            return Ok(());
-        }
-
         let amount = price
             .checked_notional(qty_unlocked)
             .ok_or(WalletError::Overflow)?;
