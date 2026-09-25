@@ -1,11 +1,18 @@
-use std::{net::SocketAddr, thread};
+use std::{
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
 
 mod error;
 mod exchange;
 mod middleware;
 mod sequencer;
 mod types;
-use axum::{Router, routing::get};
+use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use dotenvy::dotenv;
 use tokio::net::TcpListener;
 mod routes {
@@ -58,12 +65,21 @@ async fn main() {
         runtime.event_log().len()
     );
 
-    thread::spawn(move || runtime.run());
+    let exchange_available = Arc::new(AtomicBool::new(true));
+    let worker_availability = Arc::clone(&exchange_available);
+    thread::spawn(move || {
+        runtime.run();
+        worker_availability.store(false, Ordering::Release);
+    });
 
-    let state = AppState { db, tx };
+    let state = AppState {
+        db,
+        tx,
+        exchange_available,
+    };
 
     let app = Router::new()
-        .route("/health", get(|| async { "OK" }))
+        .route("/health", get(health))
         .nest("/users", routes::user_routes::user_routes())
         .nest("/exchange", routes::exchange_routes::exchange_routes()) // New routes
         .with_state(state);
@@ -73,4 +89,12 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await.unwrap();
     println!("Server is listening on port 4000");
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    if state.exchange_available.load(Ordering::Acquire) {
+        (StatusCode::OK, "OK")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "exchange unavailable")
+    }
 }

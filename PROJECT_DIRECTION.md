@@ -199,17 +199,49 @@ Two ambiguities in the source were resolved and recorded: the cap counts **share
 
 Verified with 70 passing tests and a live session: the default cap applies unconfigured, a custom cap of 10 admits 6 then 4 and refuses 5 in between, cancelling hands the allowance back, other symbols are untouched, both parties see their own side of a fill, every filter narrows correctly, and after a hard kill the event-set limit (10, 6 used) and both parties' fills all came back.
 
-## Next Milestone
+## 11. Failure-Safe Atomic Exchange Commands
 
-Not selected. Discuss before implementation, per the rule below.
+Full write-up: `docs/tasks/05-failure-safe-atomic-commands.md`.
 
-Every functional requirement in the target design's API section is now implemented. What remains is the architecture beyond the critical path, and all of it is downstream of the event store:
+This milestone fixes the command boundary that previously allowed a late settlement or cancellation failure to leave partially changed authoritative state. New commands now use a prepare/commit protocol: the complete transition is calculated against cloned affected books and read-only ledger validation, all business rules are checked, the input and output batch is appended and synchronized, and only then is the prepared plan committed. The commit phase is infallible for a plan that passed preparation.
 
-1. **Market data publisher** — candlestick charts and L2 publishing, as a subscriber to the event store. The design's version uses ring buffers and multicast, both on the do-not-start list, so the first step is the subscriber boundary itself rather than the optimisations.
-2. **Reporter** — trading history and compliance records written to PostgreSQL off the critical path. The database connection already exists and is used only for authentication.
-3. **Hot-warm matching engine** — the design's high-availability answer: a warm instance consuming the same events and taking over on failure.
+Order, cancellation, settlement, wallet, positions, risk usage, execution indexes, order-book state, and both sequence domains are covered by the same transition. A failed append leaves the live core, event log, callbacks, and sequence counters unchanged. Execution callbacks are published only after the durable commit. Internal faults are separated from ordinary client rejections; they halt the worker and are surfaced as unavailable responses. The HTTP health endpoint also returns 503 once the worker has stopped.
 
-All three are the same architectural move — a component that subscribes to the event store and keeps its own state — which is why the execution index in milestone 10 was deliberately not built that way. Doing it once, properly, as its own milestone is worth more than three ad-hoc versions.
+The regression suite now covers seller-credit overflow, buyer-position overflow, a later-fill failure, cancellation failure, append failure, callback ordering, and deterministic replay. `cargo fmt -- --check` and `cargo test` pass 76 tests. Full clippy remains a repository-wide cleanup task because it reports older public compatibility APIs and existing style lints in addition to the new code.
+
+This milestone deliberately does not start market data, reporting, hot-warm replication, mmap, ring buffers, snapshots, or performance work. Those components must consume committed events after this boundary rather than observe tentative state.
+
+The prior implementation description below is retained as historical context; the prepare/commit path is now the live path.
+
+The current order and cancellation paths are not atomic. A command can change some authoritative state and then fail during a later operation. For a new order, the current path can reserve collateral and risk, consume a matching sequence, register the order, mutate the book, and then settle executions. Settlement changes the seller's shares, buyer's shares, buyer's cash, seller's cash, execution indexes, and order states one operation at a time. If a later balance, position, or invariant check fails, the earlier changes remain.
+
+This is a real correctness failure, not only a theoretical edge case. For example, a seller whose cash balance is already at the maximum can sell successfully through the first settlement legs, then fail when the exchange credits the seller. The order is reported as rejected even though shares, cash, order state, book state, reservations, and sequencing may already have changed. A multi-fill order can apply earlier fills before a later fill fails. Cancellation has the same shape because the order is removed from the matching engine before collateral release and lifecycle completion finish.
+
+The runtime currently converts every core error into an ordinary `OrderRejected` or `CancelRejected` output. That incorrectly treats internal arithmetic or invariant failures as client mistakes. It also means replay can reproduce the same partial mutation and the same rejection. Deterministic replay proves that the same result is repeated; it does not prove that the result is correct.
+
+The milestone must establish this command boundary:
+
+```text
+prepare the complete command without mutating authoritative state
+    -> calculate every fill and cumulative ledger/risk/order/book change
+    -> validate the complete transition
+    -> durably append the input and output event batch
+    -> apply the prepared transition through an infallible commit
+    -> publish committed events and reply to the client
+```
+
+Preparation must cover the entire command, including all fills, cash, shares, risk usage, collateral, order lifecycle, matching-book changes, execution records, and both journal and matching sequence effects. The implementation should use an explicit prepared plan or state delta. Cloning the entire exchange for every command is not the target design because it would scale with all state and would undermine the critical path.
+
+The error boundary is part of the milestone:
+
+- An expected business rejection leaves all trading state and the matching sequence unchanged. Its input and rejection result may be persisted.
+- An internal arithmetic, settlement, matching, or invariant fault is never persisted as an ordinary rejection. It stops further command processing, publishes nothing, and exposes the exchange as unavailable.
+- An event-store append or synchronization failure does not acknowledge a commit. The worker stops, and a restart recovers from the last durable history.
+- Notifications and future subscribers run only after the durable commit boundary, never during tentative settlement.
+
+The first implementation checkpoint is a regression test that forces a late settlement failure and proves that balances, positions, orders, reservations, the book, and the matching sequence remain unchanged. The milestone is complete only when tests also cover buyer-position overflow, a failure in a later fill, cancellation failure after book removal, storage failure before commit, no notification before durability, typed internal-fault handling, and unavailable/503 behavior after worker failure. `cargo fmt -- --check` and `cargo test` must pass before this journal is marked complete.
+
+Market data remains part of the long-term system-design target, but it is removed from the current milestone. A market-data publisher needs a trustworthy committed event stream before it can safely build live L2 data and candlesticks. Reporting needs the same committed truth for compliance records. Hot-warm needs the same deterministic, failure-safe state transitions before a second engine can safely replay them. These are later consumers of committed events, not substitutes for fixing the command boundary first.
 
 ## Known Prototype Limitations
 
@@ -224,16 +256,16 @@ All three are the same architectural move — a component that subscribes to the
 - self-trade prevention skips the aggressor's own orders but cannot stop a user crossing against themselves; that needs engine-generated cancellations
 - `Order.leaves_qty` and `ManagedOrder.remaining_quantity` are separate sources of truth for the same number
 - one global minor-unit price scale is assumed; per-product currency and tick-size metadata are not modeled
-- wallet balance credits do not yet return overflow errors
+- wallet balance credits are checked for overflow before commit
 - the event log is one file that grows without bound; there are no snapshots, so replay is always from the beginning and startup reads the whole file into memory
 - one `fsync` per command; group commit is the marked upgrade path
-- a store write failure halts the worker; the in-memory change it could not persist is not rolled back
+- a store write failure halts the worker before the prepared change is committed
 - a `client_order_id` is unique forever, never reusable after its order is terminal as FIX permits
 - replay requires the full history from an empty core; snapshots and replay from a partial history are not supported
 - event-log sequencing and matching-input sequencing remain distinct concepts
 - live HTTP replies still use `oneshot`
 - there is no market-data or reporting consumer
-- internal matching failures after reservation do not yet have a rollback model
+- internal matching and settlement failures are rejected before commit and halt the worker if they cannot be represented as a business rejection
 
 ## What Not To Work On Yet
 

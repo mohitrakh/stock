@@ -39,7 +39,7 @@ impl Side {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Node {
     pub order: Option<Order>,
     pub prev_idx: Option<usize>,

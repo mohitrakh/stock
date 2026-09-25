@@ -2,7 +2,7 @@ use crate::{
     sequencer::Sequencer,
     types::{
         matching_engine::MatchingEngine,
-        order_manager::{OrderManager, OrderManagerError},
+        order_manager::{OrderManager, OrderManagerError, PreparedCancel, PreparedNewOrder},
         types::{
             BalanceView, Execution, ExecutionView, Order, OrderBookView, OrderView, PositionView,
             RiskLimitView,
@@ -17,6 +17,28 @@ pub struct AddOrderOutcome {
     /// The order's post-match state, read back from `OrderManager` rather than summed from
     /// `executions` — the manager is the one authority on fill quantity and lifecycle state.
     pub view: OrderView,
+}
+
+#[derive(Debug)]
+pub enum CoreError {
+    Business(OrderManagerError),
+    Internal(String),
+}
+
+pub(crate) struct PreparedAddOrder {
+    pub(crate) order: Order,
+    pub(crate) seq_num: u64,
+    pub(crate) executions: Vec<Execution>,
+    pub(crate) view: OrderView,
+    pub(crate) matching: crate::types::matching_engine::PreparedOrder,
+    pub(crate) manager: PreparedNewOrder,
+}
+
+pub(crate) struct PreparedCancelOrder {
+    pub(crate) order_id: String,
+    pub(crate) seq_num: u64,
+    pub(crate) matching: crate::types::matching_engine::PreparedCancel,
+    pub(crate) manager: PreparedCancel,
 }
 
 pub struct ExchangeCore {
@@ -36,6 +58,21 @@ impl ExchangeCore {
 
     pub fn deposit(&mut self, user_id: String, amount: u64) -> Result<(), OrderManagerError> {
         self.order_manager.deposit_funds(user_id, amount)
+    }
+
+    pub(crate) fn validate_deposit(
+        &self,
+        user_id: &str,
+        amount: u64,
+    ) -> Result<(), OrderManagerError> {
+        self.order_manager
+            .wallet
+            .validate_deposit(user_id, amount)
+            .map_err(|err| OrderManagerError::WalletRejected(format!("{:?}", err)))
+    }
+
+    pub(crate) fn commit_deposit(&mut self, user_id: String, amount: u64) {
+        self.order_manager.wallet.commit_deposit(user_id, amount);
     }
 
     pub fn set_risk_limit(&mut self, user_id: String, symbol: String, limit: u64) {
@@ -58,6 +95,15 @@ impl ExchangeCore {
             .execution_views(user_id, symbol, order_id, start_time, end_time)
     }
 
+    pub(crate) fn notify_executions(&self, executions: &[Execution]) {
+        self.order_manager.notify_executions(executions);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribe<F: Fn(Execution) + Send + Sync + 'static>(&mut self, callback: F) {
+        self.order_manager.subscribe(callback);
+    }
+
     pub fn deposit_shares(
         &mut self,
         user_id: &str,
@@ -67,34 +113,118 @@ impl ExchangeCore {
         self.order_manager.deposit_shares(user_id, symbol, quantity)
     }
 
-    pub fn add_order(&mut self, order: Order) -> Result<AddOrderOutcome, OrderManagerError> {
-        let mut order = self.order_manager.prepare_order(order)?;
+    pub(crate) fn validate_share_deposit(
+        &self,
+        user_id: &str,
+        symbol: &str,
+        quantity: u64,
+    ) -> Result<(), OrderManagerError> {
+        self.order_manager
+            .positions
+            .validate_credit(user_id, symbol, quantity)
+            .map_err(|err| OrderManagerError::PositionRejected(format!("{:?}", err)))
+    }
 
-        let seq_num = self.sequencer.next();
+    pub(crate) fn commit_share_deposit(&mut self, user_id: &str, symbol: &str, quantity: u64) {
+        self.order_manager
+            .positions
+            .commit_credit(user_id, symbol, quantity);
+    }
+
+    pub(crate) fn commit_risk_limit(&mut self, user_id: String, symbol: String, limit: u64) {
+        self.set_risk_limit(user_id, symbol, limit);
+    }
+
+    pub(crate) fn prepare_add_order(
+        &self,
+        mut order: Order,
+    ) -> Result<PreparedAddOrder, CoreError> {
+        let seq_num = self.sequencer.peek();
         order.seq_num = seq_num;
+        self.order_manager
+            .validate_new_order(&order)
+            .map_err(CoreError::Business)?;
 
-        let order_id = order.order_id.clone();
-        let user_id = order.user_id.clone();
-        self.order_manager.register_order(order.clone());
-
-        let executions = self
+        let matching = self
             .matching_engine
-            .process_order(order)
-            .map_err(OrderManagerError::MatchingRejected)?;
-
-        self.order_manager.apply_executions(&executions)?;
-
+            .prepare_order(order.clone())
+            .map_err(CoreError::Internal)?;
+        let executions = matching.executions.clone();
+        let manager = self
+            .order_manager
+            .prepare_new_order(order.clone(), &executions)
+            .map_err(|error| match error {
+                OrderManagerError::Internal(reason)
+                | OrderManagerError::MatchingRejected(reason) => CoreError::Internal(reason),
+                other => CoreError::Business(other),
+            })?;
         let view = self
             .order_manager
-            .order_view(&order_id, &user_id)
-            .expect("order was registered above, so its view must exist");
+            .planned_order_view(&order, &manager.settlement);
 
-        Ok(AddOrderOutcome {
-            order_id,
+        Ok(PreparedAddOrder {
+            order,
             seq_num,
             executions,
             view,
+            matching,
+            manager,
         })
+    }
+
+    pub(crate) fn commit_add_order(&mut self, prepared: PreparedAddOrder) {
+        self.order_manager.commit_new_order(prepared.manager);
+        self.matching_engine.commit_order(prepared.matching);
+        self.sequencer.commit(prepared.seq_num);
+    }
+
+    pub(crate) fn prepare_cancel_order(
+        &self,
+        order_id: &str,
+        user_id: &str,
+    ) -> Result<PreparedCancelOrder, CoreError> {
+        let seq_num = self.sequencer.peek();
+        let manager = self
+            .order_manager
+            .prepare_cancel_plan(order_id, user_id)
+            .map_err(|error| match error {
+                OrderManagerError::Internal(reason)
+                | OrderManagerError::MatchingRejected(reason) => CoreError::Internal(reason),
+                other => CoreError::Business(other),
+            })?;
+        let matching = self
+            .matching_engine
+            .prepare_cancel(order_id, seq_num)
+            .map_err(CoreError::Internal)?;
+
+        Ok(PreparedCancelOrder {
+            order_id: order_id.to_string(),
+            seq_num,
+            matching,
+            manager,
+        })
+    }
+
+    pub(crate) fn commit_cancel_order(&mut self, prepared: PreparedCancelOrder) {
+        self.order_manager.commit_cancel_plan(prepared.manager);
+        self.matching_engine.commit_cancel(prepared.matching);
+        self.sequencer.commit(prepared.seq_num);
+    }
+
+    pub fn add_order(&mut self, order: Order) -> Result<AddOrderOutcome, OrderManagerError> {
+        let prepared = self.prepare_add_order(order).map_err(|error| match error {
+            CoreError::Business(error) => error,
+            CoreError::Internal(reason) => OrderManagerError::Internal(reason),
+        })?;
+        let outcome = AddOrderOutcome {
+            order_id: prepared.order.order_id.clone(),
+            seq_num: prepared.seq_num,
+            executions: prepared.executions.clone(),
+            view: prepared.view.clone(),
+        };
+        self.commit_add_order(prepared);
+
+        Ok(outcome)
     }
 
     pub fn balance_view(&self, user_id: &str) -> BalanceView {
@@ -118,21 +248,14 @@ impl ExchangeCore {
         order_id: &str,
         user_id: &str,
     ) -> Result<u64, OrderManagerError> {
-        self.order_manager
-            .validate_cancel_for_user(order_id, user_id)?;
-
-        let cancel_seq = self.sequencer.next();
-        let removed = self
-            .matching_engine
-            .cancel_order(order_id, cancel_seq)
-            .map_err(OrderManagerError::OrderNotFound)?;
-
-        if removed.is_none() {
-            return Err(OrderManagerError::OrderNotFound(order_id.to_string()));
-        }
-
-        self.order_manager.complete_cancel(order_id)?;
-
+        let prepared =
+            self.prepare_cancel_order(order_id, user_id)
+                .map_err(|error| match error {
+                    CoreError::Business(error) => error,
+                    CoreError::Internal(reason) => OrderManagerError::Internal(reason),
+                })?;
+        let cancel_seq = prepared.seq_num;
+        self.commit_cancel_order(prepared);
         Ok(cancel_seq)
     }
 }
@@ -866,5 +989,96 @@ mod tests {
         assert_eq!(outcome.executions.len(), 2);
         assert_eq!(outcome.executions[0].sell_order_id, "sell-bob");
         assert_eq!(outcome.executions[0].price.minor_units(), 101);
+    }
+
+    #[test]
+    fn late_seller_credit_overflow_leaves_the_command_uncommitted() {
+        let mut core = funded_core();
+        core.deposit("seller".to_string(), u64::MAX).unwrap();
+        core.deposit("buyer".to_string(), 10).unwrap();
+        core.add_order(order("sell-1", "seller", "SELL", 10, 1))
+            .unwrap();
+
+        let result = core.add_order(order("buy-1", "buyer", "BUY", 10, 1));
+
+        assert!(matches!(result, Err(OrderManagerError::Internal(_))));
+        assert_eq!(core.sequencer.peek(), 2);
+        assert!(!core.order_manager.orders.contains_key("buy-1"));
+        assert_eq!(core.order_manager.wallet.balance("seller"), u64::MAX);
+        assert_eq!(core.order_manager.wallet.balance("buyer"), 10);
+        assert_eq!(
+            core.order_manager.positions.holding("seller", "AAPL"),
+            1_000
+        );
+        assert_eq!(core.order_manager.positions.locked("seller", "AAPL"), 1);
+        assert!(core.matching_engine.is_resting("sell-1"));
+    }
+
+    #[test]
+    fn buyer_position_overflow_leaves_the_command_uncommitted() {
+        let mut core = ExchangeCore::new();
+        core.deposit("buyer".to_string(), 10).unwrap();
+        core.deposit_shares("buyer", "AAPL", u64::MAX).unwrap();
+        core.deposit_shares("seller", "AAPL", 1).unwrap();
+        core.add_order(order("sell-1", "seller", "SELL", 10, 1))
+            .unwrap();
+
+        let result = core.add_order(order("buy-1", "buyer", "BUY", 10, 1));
+
+        assert!(matches!(result, Err(OrderManagerError::Internal(_))));
+        assert_eq!(core.sequencer.peek(), 2);
+        assert_eq!(
+            core.order_manager.positions.holding("buyer", "AAPL"),
+            u64::MAX
+        );
+        assert_eq!(core.order_manager.positions.locked("seller", "AAPL"), 1);
+        assert!(core.matching_engine.is_resting("sell-1"));
+    }
+
+    #[test]
+    fn later_fill_failure_does_not_commit_earlier_fills() {
+        let mut core = ExchangeCore::new();
+        core.deposit("buyer".to_string(), 20).unwrap();
+        core.deposit_shares("buyer", "AAPL", u64::MAX - 1).unwrap();
+        core.deposit_shares("seller-a", "AAPL", 1).unwrap();
+        core.deposit_shares("seller-b", "AAPL", 1).unwrap();
+        core.add_order(order("sell-a", "seller-a", "SELL", 10, 1))
+            .unwrap();
+        core.add_order(order("sell-b", "seller-b", "SELL", 10, 1))
+            .unwrap();
+
+        let result = core.add_order(order("buy-1", "buyer", "BUY", 10, 2));
+
+        assert!(matches!(result, Err(OrderManagerError::Internal(_))));
+        assert_eq!(core.sequencer.peek(), 3);
+        assert_eq!(
+            core.order_manager.positions.holding("buyer", "AAPL"),
+            u64::MAX - 1
+        );
+        assert!(core.matching_engine.is_resting("sell-a"));
+        assert!(core.matching_engine.is_resting("sell-b"));
+        assert!(!core.order_manager.orders.contains_key("buy-1"));
+    }
+
+    #[test]
+    fn cancellation_failure_does_not_remove_the_book_order() {
+        let mut core = funded_core();
+        core.deposit("buyer".to_string(), 100).unwrap();
+        core.add_order(order("buy-1", "buyer", "BUY", 10, 5))
+            .unwrap();
+
+        // Simulate an internal ledger inconsistency after placement. Preparation must detect it
+        // before the matching-engine removal is committed.
+        core.order_manager
+            .wallet
+            .unlock_funds("buyer", crate::types::types::Price::new(10).unwrap(), 5)
+            .unwrap();
+
+        let result = core.cancel_order_for_user("buy-1", "buyer");
+
+        assert!(matches!(result, Err(OrderManagerError::Internal(_))));
+        assert_eq!(core.sequencer.peek(), 2);
+        assert_eq!(core.order_manager.get_state("buy-1"), Some(OrderState::New));
+        assert!(core.matching_engine.is_resting("buy-1"));
     }
 }

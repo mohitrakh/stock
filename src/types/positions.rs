@@ -52,6 +52,27 @@ impl Positions {
         Ok(())
     }
 
+    pub fn validate_credit(
+        &self,
+        user_id: &str,
+        symbol: &str,
+        quantity: u64,
+    ) -> Result<(), PositionError> {
+        self.holding(user_id, symbol)
+            .checked_add(quantity)
+            .ok_or(PositionError::Overflow)
+            .map(|_| ())
+    }
+
+    pub(crate) fn commit_credit(&mut self, user_id: &str, symbol: &str, quantity: u64) {
+        let key = Self::key(user_id, symbol);
+        let updated = self
+            .holding(user_id, symbol)
+            .checked_add(quantity)
+            .expect("prepared position credit must remain valid");
+        self.holdings.insert(key, updated);
+    }
+
     pub fn holding(&self, user_id: &str, symbol: &str) -> u64 {
         self.holdings
             .get(&Self::key(user_id, symbol))
@@ -91,6 +112,30 @@ impl Positions {
         self.locked.insert(key, updated);
 
         Ok(())
+    }
+
+    pub fn validate_lock(
+        &self,
+        user_id: &str,
+        symbol: &str,
+        quantity: u64,
+    ) -> Result<(), PositionError> {
+        if self.available(user_id, symbol) < quantity {
+            return Err(PositionError::InsufficientShares);
+        }
+        self.locked(user_id, symbol)
+            .checked_add(quantity)
+            .ok_or(PositionError::Overflow)
+            .map(|_| ())
+    }
+
+    pub(crate) fn commit_lock(&mut self, user_id: &str, symbol: &str, quantity: u64) {
+        let key = Self::key(user_id, symbol);
+        let updated = self
+            .locked(user_id, symbol)
+            .checked_add(quantity)
+            .expect("prepared position lock must remain valid");
+        self.locked.insert(key, updated);
     }
 
     /// Delivers shares on a fill: they leave the holding and their reservation is released
@@ -136,6 +181,39 @@ impl Positions {
         self.locked.insert(key, updated);
 
         Ok(())
+    }
+
+    pub fn validate_unlock(
+        &self,
+        user_id: &str,
+        symbol: &str,
+        quantity: u64,
+    ) -> Result<(), PositionError> {
+        self.locked(user_id, symbol)
+            .checked_sub(quantity)
+            .ok_or(PositionError::InsufficientShares)
+            .map(|_| ())
+    }
+
+    pub(crate) fn commit_unlock(&mut self, user_id: &str, symbol: &str, quantity: u64) {
+        let key = Self::key(user_id, symbol);
+        let updated = self
+            .locked(user_id, symbol)
+            .checked_sub(quantity)
+            .expect("prepared position unlock must remain valid");
+        self.locked.insert(key, updated);
+    }
+
+    pub(crate) fn commit_settlement(
+        &mut self,
+        user_id: String,
+        symbol: String,
+        holding: u64,
+        locked: u64,
+    ) {
+        self.holdings
+            .insert((user_id.clone(), symbol.clone()), holding);
+        self.locked.insert((user_id, symbol), locked);
     }
 
     /// Every `(symbol, holding, locked)` the user has a record for, sorted by symbol so the

@@ -6,7 +6,7 @@ use std::{
 use super::price_level::PriceLevel;
 use super::types::{Execution, Order, Price, Side};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OrderBook {
     pub symbol: String,
     pub(crate) buy_levels: BTreeMap<Reverse<Price>, PriceLevel>,

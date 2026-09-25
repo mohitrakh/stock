@@ -77,6 +77,12 @@ pub struct EventStore {
 }
 
 impl EventStore {
+    #[cfg(test)]
+    pub(crate) fn open_read_only_for_test(path: impl AsRef<Path>) -> Result<Self, EventStoreError> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        Ok(Self { file })
+    }
+
     /// Opens (or creates) the log at `path`, recovers the events already in it, and truncates any
     /// torn record left by a crash so the next append starts from clean history.
     ///

@@ -15,4 +15,13 @@ impl Sequencer {
         self.next_seq += 1;
         seq
     }
+
+    pub fn peek(&self) -> u64 {
+        self.next_seq
+    }
+
+    pub fn commit(&mut self, seq: u64) {
+        assert_eq!(seq, self.next_seq, "prepared sequence must commit in order");
+        self.next_seq += 1;
+    }
 }

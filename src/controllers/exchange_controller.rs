@@ -94,11 +94,19 @@ async fn ask<T>(
         .tx
         .send(make_command(respond_to))
         .await
-        .map_err(|_| AppError::Validation("exchange worker is unavailable".to_string()))?;
+        .map_err(|_| AppError::Unavailable("exchange worker is unavailable".to_string()))?;
 
     response_rx
         .await
-        .map_err(|_| AppError::Validation("exchange worker dropped response".to_string()))
+        .map_err(|_| AppError::Unavailable("exchange worker dropped response".to_string()))
+}
+
+fn map_exchange_error(error: String) -> AppError {
+    if error.starts_with("exchange unavailable:") {
+        AppError::Unavailable(error)
+    } else {
+        AppError::Validation(error)
+    }
 }
 
 pub async fn deposit(
@@ -112,7 +120,7 @@ pub async fn deposit(
         respond_to,
     })
     .await?
-    .map_err(AppError::Validation)?;
+    .map_err(map_exchange_error)?;
 
     Ok(StatusCode::OK)
 }
@@ -163,7 +171,7 @@ pub async fn place_order(
         if err.contains("AlreadyExists") {
             AppError::Conflict(err)
         } else {
-            AppError::Validation(err)
+            map_exchange_error(err)
         }
     })?;
 
@@ -194,7 +202,7 @@ pub async fn deposit_shares(
         respond_to,
     })
     .await?
-    .map_err(AppError::Validation)?;
+    .map_err(map_exchange_error)?;
 
     Ok(StatusCode::OK)
 }
@@ -233,7 +241,7 @@ pub async fn set_risk_limit(
         respond_to,
     })
     .await?
-    .map_err(AppError::Validation)?;
+    .map_err(map_exchange_error)?;
 
     Ok(StatusCode::OK)
 }
@@ -342,7 +350,7 @@ pub async fn cancel_order(
         if err.contains("OrderNotFound") {
             AppError::NotFound
         } else {
-            AppError::Validation(err)
+            map_exchange_error(err)
         }
     })?;
 

@@ -200,8 +200,32 @@ Closes the last unmet functional requirements in the target design, plus the def
 - After a hard kill, the event-set limit and both parties' fills are rebuilt by replay.
 - `cargo fmt -- --check` passes and `cargo test` passes 70 tests.
 
+## Completed Milestone - Failure-Safe Atomic Exchange Commands
+
+Full write-up: `docs/tasks/05-failure-safe-atomic-commands.md`.
+
+### Completed Implementation
+
+- [x] Prepare complete order and cancellation transitions without mutating authoritative state.
+- [x] Validate all fills, ledger deltas, reservations, risk usage, lifecycle changes, books, and sequence effects before commit.
+- [x] Append and synchronize the full input/output batch before applying the prepared plan.
+- [x] Publish execution callbacks only after the durable commit.
+- [x] Separate business rejections from internal faults and halt on internal or storage failures.
+- [x] Return unavailable responses and a 503 health result after the worker stops.
+- [x] Remove the old mutating settlement and matching paths so there is one live command path.
+- [x] Add regression coverage for late settlement failure, later-fill failure, cancellation failure, append failure, and callback ordering.
+- [x] Run formatting and the full test suite.
+
+### Acceptance Criteria - Verified
+
+- A failed late settlement leaves balances, positions, reservations, orders, books, execution indexes, and sequence counters unchanged.
+- A failed append leaves prepared state uncommitted and publishes no callback.
+- Normal business rejections remain durable outputs and do not consume matching sequence numbers.
+- Internal faults stop further processing and are exposed as unavailable rather than ordinary validation errors.
+- `cargo fmt -- --check` passes and `cargo test` passes 76 tests.
+
 ## Next Milestone
 
-Not selected yet. Every functional requirement in the target design's API section is now implemented; what remains is the architecture beyond the critical path. All three candidates — market data publisher, reporter, hot-warm engine — are the same move: a component that subscribes to the event store and keeps its own state. See `docs/tasks/04-risk-limits-and-executions.md`, section 7.
+Not selected yet. The next discussion should choose the first consumer of the committed event stream: market data, reporting, or hot-warm replication. Do not begin that work until its boundary and acceptance test are agreed.
 
 Do not automatically begin snapshots, group commit, mmap, ring buffers, UDP, CPU pinning, multiple component threads, or per-symbol partitioning.

@@ -6,6 +6,7 @@ pub enum AppError {
     Database(sqlx::Error),
     NotFound,
     Validation(String),
+    Unavailable(String),
     /// The request collided with state that already exists — today, a reused client order id.
     Conflict(String),
 }
@@ -28,6 +29,8 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, "Resource not found").into_response(),
 
             AppError::Validation(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+
+            AppError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg).into_response(),
 
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
         }

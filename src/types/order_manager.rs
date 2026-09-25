@@ -39,6 +39,7 @@ pub enum OrderManagerError {
     /// The seller does not hold enough unreserved shares to back the order.
     PositionRejected(String),
     MatchingRejected(String),
+    Internal(String),
 }
 pub struct ManagedOrder {
     pub order: Order,
@@ -58,6 +59,53 @@ pub struct OrderManager {
     execution_callbacks: Vec<Box<dyn Fn(Execution) + Send + Sync>>,
 }
 
+pub(crate) struct WalletSettlement {
+    pub(crate) user_id: String,
+    pub(crate) balance: u64,
+    pub(crate) locked: u64,
+}
+
+pub(crate) struct PositionSettlement {
+    pub(crate) user_id: String,
+    pub(crate) symbol: String,
+    pub(crate) holding: u64,
+    pub(crate) locked: u64,
+}
+
+pub(crate) struct PreparedSettlement {
+    pub(crate) wallet: Vec<WalletSettlement>,
+    pub(crate) positions: Vec<PositionSettlement>,
+    pub(crate) order_fills: HashMap<String, u32>,
+    pub(crate) execution_views: Vec<(String, ExecutionView)>,
+}
+
+pub(crate) struct PreparedNewOrder {
+    pub(crate) order: Order,
+    pub(crate) settlement: PreparedSettlement,
+}
+
+pub(crate) struct PreparedCancel {
+    pub(crate) order_id: String,
+    pub(crate) user_id: String,
+    pub(crate) symbol: String,
+    pub(crate) side: Side,
+    pub(crate) price: Price,
+    pub(crate) remaining: u32,
+}
+
+#[derive(Default)]
+struct WalletAccum {
+    debit: u64,
+    credit: u64,
+    reserved: u64,
+}
+
+#[derive(Default)]
+struct PositionAccum {
+    sold: u64,
+    bought: u64,
+}
+
 impl OrderManager {
     pub fn new() -> Self {
         Self {
@@ -70,35 +118,468 @@ impl OrderManager {
         }
     }
 
-    pub(crate) fn prepare_order(&mut self, order: Order) -> Result<Order, OrderManagerError> {
+    pub(crate) fn validate_new_order(&self, order: &Order) -> Result<(), OrderManagerError> {
         if self.orders.contains_key(&order.order_id) {
             return Err(OrderManagerError::AlreadyExists(order.order_id.clone()));
         }
 
-        // Pre-trade, before any collateral moves, as the target design orders it: risk check, then
-        // funds, then matching.
         self.risk_manager
-            .check(&order)
+            .check_read_only(order)
             .map_err(|err| OrderManagerError::RiskRejected(format!("{:?}", err)))?;
 
-        // Both sides must post collateral before the order is allowed to rest: a buyer reserves the
-        // cash it would cost, a seller reserves the shares it would deliver. The sell branch is what
-        // stops the exchange paying out for shares that never existed.
         match order.side {
             Side::Buy => self
                 .wallet
-                .check_and_lock(&order.user_id, order.price, order.quantity as u64)
+                .validate_lock(&order.user_id, order.price, order.quantity as u64)
                 .map_err(|err| OrderManagerError::WalletRejected(format!("{:?}", err)))?,
-
             Side::Sell => self
                 .positions
-                .check_and_lock(&order.user_id, &order.symbol, order.quantity as u64)
+                .validate_lock(&order.user_id, &order.symbol, order.quantity as u64)
                 .map_err(|err| OrderManagerError::PositionRejected(format!("{:?}", err)))?,
         }
 
-        self.risk_manager.record(&order);
+        Ok(())
+    }
 
-        Ok(order)
+    pub(crate) fn prepare_new_order(
+        &self,
+        order: Order,
+        executions: &[Execution],
+    ) -> Result<PreparedNewOrder, OrderManagerError> {
+        self.validate_new_order(&order)?;
+        let settlement = self.prepare_settlement(Some(&order), executions)?;
+        Ok(PreparedNewOrder { order, settlement })
+    }
+
+    fn context(
+        &self,
+        order_id: &str,
+        candidate: Option<&Order>,
+    ) -> Result<(String, String, Side, Price, OrderState, u32), OrderManagerError> {
+        if let Some(order) = candidate.filter(|order| order.order_id == order_id) {
+            return Ok((
+                order.user_id.clone(),
+                order.symbol.clone(),
+                order.side.clone(),
+                order.price,
+                OrderState::New,
+                order.quantity,
+            ));
+        }
+
+        let managed = self.orders.get(order_id).ok_or_else(|| {
+            OrderManagerError::Internal(format!("missing matched order {}", order_id))
+        })?;
+        Ok((
+            managed.order.user_id.clone(),
+            managed.order.symbol.clone(),
+            managed.order.side.clone(),
+            managed.order.price,
+            managed.state,
+            managed.remaining_quantity,
+        ))
+    }
+
+    fn prepare_settlement(
+        &self,
+        candidate: Option<&Order>,
+        executions: &[Execution],
+    ) -> Result<PreparedSettlement, OrderManagerError> {
+        if !executions.len().is_multiple_of(2) {
+            return Err(OrderManagerError::Internal(format!(
+                "executions must arrive in buy/sell pairs, got {}",
+                executions.len()
+            )));
+        }
+
+        let mut wallet_accum: HashMap<String, WalletAccum> = HashMap::new();
+        let mut position_accum: HashMap<(String, String), PositionAccum> = HashMap::new();
+        let mut order_fills: HashMap<String, u32> = HashMap::new();
+        let mut execution_views = Vec::with_capacity(executions.len());
+
+        for pair in executions.chunks(2) {
+            let execution = &pair[0];
+            let duplicate = &pair[1];
+            if execution.buy_order_id != duplicate.buy_order_id
+                || execution.sell_order_id != duplicate.sell_order_id
+                || execution.symbol != duplicate.symbol
+                || execution.price != duplicate.price
+                || execution.quantity != duplicate.quantity
+                || execution.timestamp != duplicate.timestamp
+            {
+                return Err(OrderManagerError::Internal(
+                    "execution pair contains different trade data".to_string(),
+                ));
+            }
+
+            let (buyer_user, buyer_symbol, buyer_side, buyer_limit, buyer_state, buyer_remaining) =
+                self.context(&execution.buy_order_id, candidate)?;
+            let (
+                seller_user,
+                seller_symbol,
+                seller_side,
+                _seller_limit,
+                seller_state,
+                seller_remaining,
+            ) = self.context(&execution.sell_order_id, candidate)?;
+
+            if buyer_symbol != execution.symbol
+                || seller_symbol != execution.symbol
+                || buyer_side != Side::Buy
+                || seller_side != Side::Sell
+                || matches!(buyer_state, OrderState::Filled | OrderState::Canceled)
+                || matches!(seller_state, OrderState::Filled | OrderState::Canceled)
+            {
+                return Err(OrderManagerError::Internal(
+                    "execution references an invalid order state".to_string(),
+                ));
+            }
+
+            for order_id in [&execution.buy_order_id, &execution.sell_order_id] {
+                let filled = order_fills.entry(order_id.clone()).or_default();
+                *filled = filled.checked_add(execution.quantity).ok_or_else(|| {
+                    OrderManagerError::Internal("filled quantity overflow".to_string())
+                })?;
+                let remaining = if *order_id == execution.buy_order_id {
+                    buyer_remaining
+                } else {
+                    seller_remaining
+                };
+                if *filled > remaining {
+                    return Err(OrderManagerError::Internal(format!(
+                        "order {} would be over-filled",
+                        order_id
+                    )));
+                }
+            }
+
+            let quantity = execution.quantity as u64;
+            let spent = execution.price.checked_notional(quantity).ok_or_else(|| {
+                OrderManagerError::Internal("execution notional overflow".to_string())
+            })?;
+            let reserved = buyer_limit.checked_notional(quantity).ok_or_else(|| {
+                OrderManagerError::Internal("reserved notional overflow".to_string())
+            })?;
+
+            let buyer_cash = wallet_accum.entry(buyer_user.clone()).or_default();
+            buyer_cash.debit = buyer_cash
+                .debit
+                .checked_add(spent)
+                .ok_or_else(|| OrderManagerError::Internal("buyer debit overflow".to_string()))?;
+            buyer_cash.reserved = buyer_cash.reserved.checked_add(reserved).ok_or_else(|| {
+                OrderManagerError::Internal("buyer reservation overflow".to_string())
+            })?;
+
+            let seller_cash = wallet_accum.entry(seller_user.clone()).or_default();
+            seller_cash.credit = seller_cash
+                .credit
+                .checked_add(spent)
+                .ok_or_else(|| OrderManagerError::Internal("seller credit overflow".to_string()))?;
+
+            let seller_position = position_accum
+                .entry((seller_user.clone(), execution.symbol.clone()))
+                .or_default();
+            seller_position.sold = seller_position
+                .sold
+                .checked_add(quantity)
+                .ok_or_else(|| OrderManagerError::Internal("sold quantity overflow".to_string()))?;
+
+            let buyer_position = position_accum
+                .entry((buyer_user.clone(), execution.symbol.clone()))
+                .or_default();
+            buyer_position.bought =
+                buyer_position.bought.checked_add(quantity).ok_or_else(|| {
+                    OrderManagerError::Internal("bought quantity overflow".to_string())
+                })?;
+
+            execution_views.push((
+                buyer_user.clone(),
+                ExecutionView {
+                    execution_id: execution.execution_id.clone(),
+                    order_id: execution.buy_order_id.clone(),
+                    symbol: execution.symbol.clone(),
+                    side: Side::Buy,
+                    price: execution.price.minor_units(),
+                    quantity: execution.quantity,
+                    timestamp: execution.timestamp,
+                },
+            ));
+            execution_views.push((
+                seller_user,
+                ExecutionView {
+                    execution_id: execution.execution_id.clone(),
+                    order_id: execution.sell_order_id.clone(),
+                    symbol: execution.symbol.clone(),
+                    side: Side::Sell,
+                    price: execution.price.minor_units(),
+                    quantity: execution.quantity,
+                    timestamp: execution.timestamp,
+                },
+            ));
+        }
+
+        let candidate_wallet_lock = candidate
+            .filter(|order| matches!(order.side, Side::Buy))
+            .map(|order| {
+                order
+                    .price
+                    .checked_notional(order.quantity as u64)
+                    .ok_or_else(|| {
+                        OrderManagerError::Internal("candidate wallet lock overflow".to_string())
+                    })
+            })
+            .transpose()?
+            .unwrap_or(0);
+        let candidate_position_lock = candidate
+            .filter(|order| matches!(order.side, Side::Sell))
+            .map(|order| order.quantity as u64)
+            .unwrap_or(0);
+
+        let wallet = wallet_accum
+            .into_iter()
+            .map(|(user_id, accum)| {
+                let balance = self
+                    .wallet
+                    .balance(&user_id)
+                    .checked_sub(accum.debit)
+                    .and_then(|value| value.checked_add(accum.credit))
+                    .ok_or_else(|| {
+                        OrderManagerError::Internal(format!(
+                            "wallet balance invalid for {}",
+                            user_id
+                        ))
+                    })?;
+                let candidate_lock = candidate
+                    .filter(|order| order.user_id == user_id && matches!(order.side, Side::Buy))
+                    .map(|_| candidate_wallet_lock)
+                    .unwrap_or(0);
+                let locked = self
+                    .wallet
+                    .locked(&user_id)
+                    .checked_add(candidate_lock)
+                    .ok_or_else(|| {
+                        OrderManagerError::Internal(format!("wallet lock invalid for {}", user_id))
+                    })?
+                    .checked_sub(accum.reserved)
+                    .ok_or_else(|| {
+                        OrderManagerError::Internal(format!(
+                            "wallet reservation invalid for {}",
+                            user_id
+                        ))
+                    })?;
+                Ok(WalletSettlement {
+                    user_id,
+                    balance,
+                    locked,
+                })
+            })
+            .collect::<Result<Vec<_>, OrderManagerError>>()?;
+
+        let positions = position_accum
+            .into_iter()
+            .map(|((user_id, symbol), accum)| {
+                let holding = self
+                    .positions
+                    .holding(&user_id, &symbol)
+                    .checked_sub(accum.sold)
+                    .and_then(|value| value.checked_add(accum.bought))
+                    .ok_or_else(|| {
+                        OrderManagerError::Internal(format!(
+                            "position holding invalid for {}",
+                            user_id
+                        ))
+                    })?;
+                let candidate_lock = candidate
+                    .filter(|order| {
+                        order.user_id == user_id
+                            && order.symbol == symbol
+                            && matches!(order.side, Side::Sell)
+                    })
+                    .map(|_| candidate_position_lock)
+                    .unwrap_or(0);
+                let locked = self
+                    .positions
+                    .locked(&user_id, &symbol)
+                    .checked_add(candidate_lock)
+                    .ok_or_else(|| {
+                        OrderManagerError::Internal(format!(
+                            "position lock invalid for {}",
+                            user_id
+                        ))
+                    })?
+                    .checked_sub(accum.sold)
+                    .ok_or_else(|| {
+                        OrderManagerError::Internal(format!(
+                            "position reservation invalid for {}",
+                            user_id
+                        ))
+                    })?;
+                Ok(PositionSettlement {
+                    user_id,
+                    symbol,
+                    holding,
+                    locked,
+                })
+            })
+            .collect::<Result<Vec<_>, OrderManagerError>>()?;
+
+        Ok(PreparedSettlement {
+            wallet,
+            positions,
+            order_fills,
+            execution_views,
+        })
+    }
+
+    pub(crate) fn planned_order_view(
+        &self,
+        order: &Order,
+        settlement: &PreparedSettlement,
+    ) -> OrderView {
+        let filled_quantity = settlement
+            .order_fills
+            .get(&order.order_id)
+            .copied()
+            .unwrap_or(0);
+        let remaining_quantity = order.quantity - filled_quantity;
+        let status = if remaining_quantity == 0 {
+            OrderState::Filled
+        } else if filled_quantity > 0 {
+            OrderState::PartiallyFilled
+        } else {
+            OrderState::New
+        };
+
+        OrderView {
+            order_id: order.order_id.clone(),
+            symbol: order.symbol.clone(),
+            side: order.side.clone(),
+            price: order.price.minor_units(),
+            quantity: order.quantity,
+            filled_quantity,
+            remaining_quantity,
+            status: status.as_str().to_string(),
+            creation_time: order.timestamp,
+        }
+    }
+
+    pub(crate) fn commit_new_order(&mut self, prepared: PreparedNewOrder) {
+        let order = prepared.order;
+        match order.side {
+            Side::Buy => {
+                self.wallet
+                    .commit_lock(&order.user_id, order.price, order.quantity as u64)
+            }
+            Side::Sell => {
+                self.positions
+                    .commit_lock(&order.user_id, &order.symbol, order.quantity as u64)
+            }
+        }
+        self.risk_manager.record(&order);
+        self.register_order(order);
+        self.commit_settlement(prepared.settlement);
+    }
+
+    pub(crate) fn prepare_cancel_plan(
+        &self,
+        order_id: &str,
+        user_id: &str,
+    ) -> Result<PreparedCancel, OrderManagerError> {
+        self.validate_cancel_for_user(order_id, user_id)?;
+        let managed = self
+            .orders
+            .get(order_id)
+            .ok_or_else(|| OrderManagerError::OrderNotFound(order_id.to_string()))?;
+        let remaining = managed.remaining_quantity;
+
+        match managed.order.side {
+            Side::Buy => self
+                .wallet
+                .validate_unlock(
+                    &managed.order.user_id,
+                    managed.order.price,
+                    remaining as u64,
+                )
+                .map_err(|err| OrderManagerError::Internal(format!("{:?}", err)))?,
+            Side::Sell => self
+                .positions
+                .validate_unlock(
+                    &managed.order.user_id,
+                    &managed.order.symbol,
+                    remaining as u64,
+                )
+                .map_err(|err| OrderManagerError::Internal(format!("{:?}", err)))?,
+        }
+
+        Ok(PreparedCancel {
+            order_id: order_id.to_string(),
+            user_id: managed.order.user_id.clone(),
+            symbol: managed.order.symbol.clone(),
+            side: managed.order.side.clone(),
+            price: managed.order.price,
+            remaining,
+        })
+    }
+
+    pub(crate) fn commit_cancel_plan(&mut self, prepared: PreparedCancel) {
+        match prepared.side {
+            Side::Buy => self.wallet.commit_unlock(
+                &prepared.user_id,
+                prepared.price,
+                prepared.remaining as u64,
+            ),
+            Side::Sell => self.positions.commit_unlock(
+                &prepared.user_id,
+                &prepared.symbol,
+                prepared.remaining as u64,
+            ),
+        }
+
+        if let Some(managed) = self.orders.get(&prepared.order_id) {
+            self.risk_manager
+                .release(&managed.order, prepared.remaining);
+        }
+        if let Some(managed) = self.orders.get_mut(&prepared.order_id) {
+            managed.state = OrderState::Canceled;
+        }
+    }
+
+    fn commit_settlement(&mut self, prepared: PreparedSettlement) {
+        for update in prepared.wallet {
+            self.wallet
+                .commit_settlement(update.user_id, update.balance, update.locked);
+        }
+        for update in prepared.positions {
+            self.positions.commit_settlement(
+                update.user_id,
+                update.symbol,
+                update.holding,
+                update.locked,
+            );
+        }
+        for (order_id, filled_qty) in prepared.order_fills {
+            let managed = self
+                .orders
+                .get_mut(&order_id)
+                .expect("prepared settlement order must exist at commit");
+            managed.remaining_quantity -= filled_qty;
+            managed.state = if managed.remaining_quantity == 0 {
+                OrderState::Filled
+            } else {
+                OrderState::PartiallyFilled
+            };
+        }
+        for (user_id, view) in prepared.execution_views {
+            self.executions.entry(user_id).or_default().push(view);
+        }
+    }
+
+    pub(crate) fn notify_executions(&self, executions: &[Execution]) {
+        for execution in executions {
+            for callback in &self.execution_callbacks {
+                callback(execution.clone());
+            }
+        }
     }
 
     pub(crate) fn deposit_shares(
@@ -139,118 +620,6 @@ impl OrderManager {
         );
     }
 
-    pub(crate) fn apply_executions(
-        &mut self,
-        executions: &[Execution],
-    ) -> Result<(), OrderManagerError> {
-        // The matching engine emits two records per match, one for each side, and settlement reads
-        // the first of each pair. An odd count means that invariant broke upstream; it used to be
-        // ignored silently, which would have meant a fill that never settled.
-        for chunk in executions.chunks(2) {
-            if chunk.len() != 2 {
-                return Err(OrderManagerError::MatchingRejected(format!(
-                    "executions must arrive in buy/sell pairs, got {} for {}",
-                    executions.len(),
-                    chunk[0].execution_id
-                )));
-            }
-
-            self.apply_execution(&chunk[0])?;
-        }
-
-        for execution in executions {
-            for callback in &self.execution_callbacks {
-                callback(execution.clone());
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Settles one match across both ledgers.
-    ///
-    /// A fill has four legs, and all four must move or the books stop balancing: the buyer's cash
-    /// out, the seller's cash in, the seller's shares out, the buyer's shares in. Cash paid equals
-    /// cash received and shares delivered equals shares received, so neither total changes — which
-    /// is the property `a_fill_creates_no_cash_and_no_shares` pins down.
-    fn apply_execution(&mut self, execution: &Execution) -> Result<(), OrderManagerError> {
-        self.validate_fill(&execution.buy_order_id, execution.quantity)?;
-        self.validate_fill(&execution.sell_order_id, execution.quantity)?;
-
-        let (buyer_user_id, buyer_limit_price) = self.fill_context(&execution.buy_order_id)?;
-        let (seller_user_id, _) = self.fill_context(&execution.sell_order_id)?;
-
-        let cash_amount = execution
-            .price
-            .checked_notional(execution.quantity as u64)
-            .ok_or_else(|| OrderManagerError::WalletRejected("Overflow".to_string()))?;
-        let quantity = execution.quantity as u64;
-
-        // Shares first. The seller's reservation was taken at placement, so this cannot fail on a
-        // well-formed book — and if it ever does, it fails before any cash has moved.
-        self.positions
-            .commit_sell_fill(&seller_user_id, &execution.symbol, quantity)
-            .map_err(|err| OrderManagerError::PositionRejected(format!("{:?}", err)))?;
-        self.positions
-            .credit(&buyer_user_id, &execution.symbol, quantity)
-            .map_err(|err| OrderManagerError::PositionRejected(format!("{:?}", err)))?;
-
-        self.wallet
-            .commit_buy_fill(&buyer_user_id, buyer_limit_price, execution.price, quantity)
-            .map_err(|e| OrderManagerError::WalletRejected(format!("{:?}", e)))?;
-        self.wallet
-            .deposit(seller_user_id.clone(), cash_amount)
-            .map_err(|e| OrderManagerError::WalletRejected(format!("{:?}", e)))?;
-
-        self.record_execution(
-            &buyer_user_id,
-            &execution.buy_order_id,
-            Side::Buy,
-            execution,
-        );
-        self.record_execution(
-            &seller_user_id,
-            &execution.sell_order_id,
-            Side::Sell,
-            execution,
-        );
-
-        self.record_fill(&execution.buy_order_id, execution.quantity)?;
-        self.record_fill(&execution.sell_order_id, execution.quantity)?;
-
-        Ok(())
-    }
-
-    fn record_execution(
-        &mut self,
-        user_id: &str,
-        order_id: &str,
-        side: Side,
-        execution: &Execution,
-    ) {
-        self.executions
-            .entry(user_id.to_string())
-            .or_default()
-            .push(ExecutionView {
-                execution_id: execution.execution_id.clone(),
-                order_id: order_id.to_string(),
-                symbol: execution.symbol.clone(),
-                side,
-                price: execution.price.minor_units(),
-                quantity: execution.quantity,
-                timestamp: execution.timestamp,
-            });
-    }
-
-    fn fill_context(&self, order_id: &str) -> Result<(String, Price), OrderManagerError> {
-        let managed = self
-            .orders
-            .get(order_id)
-            .ok_or_else(|| OrderManagerError::OrderNotFound(order_id.to_string()))?;
-
-        Ok((managed.order.user_id.clone(), managed.order.price))
-    }
-
     pub(crate) fn validate_cancel_for_user(
         &self,
         order_id: &str,
@@ -282,96 +651,6 @@ impl OrderManager {
                 )));
             }
             _ => {}
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn complete_cancel(&mut self, order_id: &str) -> Result<(), OrderManagerError> {
-        let (user_id, symbol, side, price, remaining) = {
-            let managed = self
-                .orders
-                .get(order_id)
-                .ok_or_else(|| OrderManagerError::OrderNotFound(order_id.to_string()))?;
-
-            (
-                managed.order.user_id.clone(),
-                managed.order.symbol.clone(),
-                managed.order.side.clone(),
-                managed.order.price,
-                managed.remaining_quantity,
-            )
-        };
-
-        // Release whichever collateral the order was resting on — cash for a buy, shares for a
-        // sell — for the quantity that never traded.
-        match side {
-            Side::Buy => self
-                .wallet
-                .unlock_funds(&user_id, price, remaining as u64)
-                .map_err(|err| OrderManagerError::WalletRejected(format!("{:?}", err)))?,
-
-            Side::Sell => self
-                .positions
-                .unlock(&user_id, &symbol, remaining as u64)
-                .map_err(|err| OrderManagerError::PositionRejected(format!("{:?}", err)))?,
-        }
-
-        // The day's risk allowance is collateral too: quantity that never traded should not stay
-        // counted against the cap.
-        if let Some(managed) = self.orders.get(order_id) {
-            let order = managed.order.clone();
-            self.risk_manager.release(&order, remaining);
-        }
-
-        if let Some(managed) = self.orders.get_mut(order_id) {
-            managed.state = OrderState::Canceled;
-        }
-
-        Ok(())
-    }
-
-    fn record_fill(&mut self, order_id: &str, filled_qty: u32) -> Result<(), OrderManagerError> {
-        self.validate_fill(order_id, filled_qty)?;
-
-        let managed = self
-            .orders
-            .get_mut(order_id)
-            .ok_or_else(|| OrderManagerError::OrderNotFound(order_id.to_string()))?;
-
-        managed.remaining_quantity -= filled_qty;
-
-        if managed.remaining_quantity == 0 {
-            managed.state = OrderState::Filled;
-        } else {
-            managed.state = OrderState::PartiallyFilled;
-        }
-
-        Ok(())
-    }
-
-    fn validate_fill(&self, order_id: &str, filled_qty: u32) -> Result<(), OrderManagerError> {
-        let managed = self
-            .orders
-            .get(order_id)
-            .ok_or_else(|| OrderManagerError::OrderNotFound(order_id.to_string()))?;
-
-        match managed.state {
-            OrderState::Filled | OrderState::Canceled => {
-                return Err(OrderManagerError::InvalidTransition(format!(
-                    "Order {} is terminal, cannot fill",
-                    order_id
-                )));
-            }
-
-            _ => {}
-        }
-
-        if filled_qty > managed.remaining_quantity {
-            return Err(OrderManagerError::OverFill(format!(
-                "filled_qty {} > remaining_quantity {}",
-                filled_qty, managed.remaining_quantity
-            )));
         }
 
         Ok(())

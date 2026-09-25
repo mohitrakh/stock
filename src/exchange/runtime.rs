@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::{
     exchange::{
-        core::ExchangeCore,
+        core::{CoreError, ExchangeCore, PreparedAddOrder, PreparedCancelOrder},
         event_store::{EventStore, EventStoreError},
     },
     types::{
@@ -30,6 +30,21 @@ pub enum StartupError {
     Replay(ReplayError),
 }
 
+#[derive(Debug)]
+enum RuntimeFailure {
+    Store(EventStoreError),
+    Internal(String),
+}
+
+impl std::fmt::Display for RuntimeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => write!(f, "event store failure: {}", error),
+            Self::Internal(reason) => write!(f, "exchange internal fault: {}", reason),
+        }
+    }
+}
+
 impl std::fmt::Display for StartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -50,9 +65,31 @@ enum InputEventResult {
     PlaceOrder(Result<OrderView, String>),
     CancelOrder(Result<(), String>),
 }
-struct ProcessedInput {
+enum PreparedCommit {
+    None,
+    Deposit {
+        user_id: String,
+        amount: u64,
+    },
+    DepositShares {
+        user_id: String,
+        symbol: String,
+        quantity: u64,
+    },
+    RiskLimit {
+        user_id: String,
+        symbol: String,
+        limit: u64,
+    },
+    AddOrder(Box<PreparedAddOrder>),
+    CancelOrder(Box<PreparedCancelOrder>),
+}
+
+struct PreparedInput {
     result: InputEventResult,
     output_events: Vec<ExchangeOutputEvent>,
+    commit: PreparedCommit,
+    executions: Vec<crate::types::types::Execution>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -74,6 +111,7 @@ pub enum ReplayError {
         expected: ExchangeOutputEvent,
         actual: ExchangeOutputEvent,
     },
+    InternalFault(String),
 }
 
 impl InputEventResult {
@@ -113,136 +151,192 @@ impl InputEventResult {
     }
 }
 
-fn process_input_event(core: &mut ExchangeCore, event: ExchangeInputEvent) -> ProcessedInput {
+fn prepare_input_event(
+    core: &ExchangeCore,
+    event: ExchangeInputEvent,
+) -> Result<PreparedInput, CoreError> {
     match event {
         ExchangeInputEvent::FundsDepositRequested { user_id, amount } => {
-            match core.deposit(user_id.clone(), amount) {
-                Ok(()) => ProcessedInput {
+            match core.validate_deposit(&user_id, amount) {
+                Ok(()) => Ok(PreparedInput {
                     result: InputEventResult::Deposit(Ok(())),
-                    output_events: vec![ExchangeOutputEvent::FundsDeposited { user_id, amount }],
-                },
-
+                    output_events: vec![ExchangeOutputEvent::FundsDeposited {
+                        user_id: user_id.clone(),
+                        amount,
+                    }],
+                    commit: PreparedCommit::Deposit { user_id, amount },
+                    executions: Vec::new(),
+                }),
                 Err(err) => {
                     let reason = format!("{:?}", err);
-
-                    ProcessedInput {
+                    Ok(PreparedInput {
                         result: InputEventResult::Deposit(Err(reason.clone())),
                         output_events: vec![ExchangeOutputEvent::FundsDepositRejected {
                             user_id,
                             reason,
                         }],
-                    }
+                        commit: PreparedCommit::None,
+                        executions: Vec::new(),
+                    })
                 }
             }
         }
-
         ExchangeInputEvent::RiskLimitSetRequested {
             user_id,
             symbol,
             max_daily_quantity,
-        } => {
-            core.set_risk_limit(user_id.clone(), symbol.clone(), max_daily_quantity);
-
-            ProcessedInput {
-                result: InputEventResult::SetRiskLimit(Ok(())),
-                output_events: vec![ExchangeOutputEvent::RiskLimitSet {
-                    user_id,
-                    symbol,
-                    max_daily_quantity,
-                }],
-            }
-        }
-
+        } => Ok(PreparedInput {
+            result: InputEventResult::SetRiskLimit(Ok(())),
+            output_events: vec![ExchangeOutputEvent::RiskLimitSet {
+                user_id: user_id.clone(),
+                symbol: symbol.clone(),
+                max_daily_quantity,
+            }],
+            commit: PreparedCommit::RiskLimit {
+                user_id,
+                symbol,
+                limit: max_daily_quantity,
+            },
+            executions: Vec::new(),
+        }),
         ExchangeInputEvent::SharesDepositRequested {
             user_id,
             symbol,
             quantity,
-        } => match core.deposit_shares(&user_id, &symbol, quantity) {
-            Ok(()) => ProcessedInput {
+        } => match core.validate_share_deposit(&user_id, &symbol, quantity) {
+            Ok(()) => Ok(PreparedInput {
                 result: InputEventResult::DepositShares(Ok(())),
                 output_events: vec![ExchangeOutputEvent::SharesDeposited {
+                    user_id: user_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity,
+                }],
+                commit: PreparedCommit::DepositShares {
                     user_id,
                     symbol,
                     quantity,
-                }],
-            },
-
+                },
+                executions: Vec::new(),
+            }),
             Err(err) => {
                 let reason = format!("{:?}", err);
-
-                ProcessedInput {
+                Ok(PreparedInput {
                     result: InputEventResult::DepositShares(Err(reason.clone())),
                     output_events: vec![ExchangeOutputEvent::SharesDepositRejected {
                         user_id,
                         symbol,
                         reason,
                     }],
-                }
+                    commit: PreparedCommit::None,
+                    executions: Vec::new(),
+                })
             }
         },
-
         ExchangeInputEvent::NewOrderRequested { order } => {
             let order_id = order.order_id.clone();
-
-            match core.add_order(order) {
-                Ok(outcome) => {
-                    // The view rides the live reply only. Output events stay byte-identical to
-                    // what they were, so a log written before this change still replays.
-                    let view = outcome.view;
-
+            match core.prepare_add_order(order) {
+                Ok(prepared) => {
                     let mut output_events = vec![ExchangeOutputEvent::OrderAccepted {
-                        order_id: outcome.order_id,
-                        seq_num: outcome.seq_num,
+                        order_id: prepared.order.order_id.clone(),
+                        seq_num: prepared.seq_num,
                     }];
-
                     output_events.extend(
-                        outcome
+                        prepared
                             .executions
-                            .into_iter()
+                            .iter()
+                            .cloned()
                             .map(|execution| ExchangeOutputEvent::ExecutionCreated { execution }),
                     );
-
-                    ProcessedInput {
+                    let executions = prepared.executions.clone();
+                    let view = prepared.view.clone();
+                    Ok(PreparedInput {
                         result: InputEventResult::PlaceOrder(Ok(view)),
                         output_events,
-                    }
+                        commit: PreparedCommit::AddOrder(Box::new(prepared)),
+                        executions,
+                    })
                 }
-
-                Err(err) => {
+                Err(CoreError::Business(err)) => {
                     let reason = format!("{:?}", err);
-
-                    ProcessedInput {
+                    Ok(PreparedInput {
                         result: InputEventResult::PlaceOrder(Err(reason.clone())),
                         output_events: vec![ExchangeOutputEvent::OrderRejected {
                             order_id,
                             reason,
                         }],
-                    }
+                        commit: PreparedCommit::None,
+                        executions: Vec::new(),
+                    })
                 }
+                Err(CoreError::Internal(reason)) => Err(CoreError::Internal(reason)),
             }
         }
-
         ExchangeInputEvent::CancelOrderRequested { order_id, user_id } => {
-            match core.cancel_order_for_user(&order_id, &user_id) {
-                Ok(seq_num) => ProcessedInput {
+            match core.prepare_cancel_order(&order_id, &user_id) {
+                Ok(prepared) => Ok(PreparedInput {
                     result: InputEventResult::CancelOrder(Ok(())),
-                    output_events: vec![ExchangeOutputEvent::OrderCanceled { order_id, seq_num }],
-                },
-
-                Err(err) => {
+                    output_events: vec![ExchangeOutputEvent::OrderCanceled {
+                        order_id: prepared.order_id.clone(),
+                        seq_num: prepared.seq_num,
+                    }],
+                    commit: PreparedCommit::CancelOrder(Box::new(prepared)),
+                    executions: Vec::new(),
+                }),
+                Err(CoreError::Business(err)) => {
                     let reason = format!("{:?}", err);
-
-                    ProcessedInput {
+                    Ok(PreparedInput {
                         result: InputEventResult::CancelOrder(Err(reason.clone())),
                         output_events: vec![ExchangeOutputEvent::CancelRejected {
                             order_id,
                             reason,
                         }],
-                    }
+                        commit: PreparedCommit::None,
+                        executions: Vec::new(),
+                    })
                 }
+                Err(CoreError::Internal(reason)) => Err(CoreError::Internal(reason)),
             }
         }
     }
+}
+
+impl PreparedInput {
+    fn commit(
+        self,
+        core: &mut ExchangeCore,
+    ) -> (InputEventResult, Vec<crate::types::types::Execution>) {
+        let executions = self.executions;
+        match self.commit {
+            PreparedCommit::None => {}
+            PreparedCommit::Deposit { user_id, amount } => core.commit_deposit(user_id, amount),
+            PreparedCommit::DepositShares {
+                user_id,
+                symbol,
+                quantity,
+            } => core.commit_share_deposit(&user_id, &symbol, quantity),
+            PreparedCommit::RiskLimit {
+                user_id,
+                symbol,
+                limit,
+            } => core.commit_risk_limit(user_id, symbol, limit),
+            PreparedCommit::AddOrder(prepared) => core.commit_add_order(*prepared),
+            PreparedCommit::CancelOrder(prepared) => core.commit_cancel_order(*prepared),
+        }
+        (self.result, executions)
+    }
+}
+
+#[cfg(test)]
+struct ProcessedInput {
+    output_events: Vec<ExchangeOutputEvent>,
+}
+
+#[cfg(test)]
+fn process_input_event(core: &mut ExchangeCore, event: ExchangeInputEvent) -> ProcessedInput {
+    let prepared = prepare_input_event(core, event).expect("test input must prepare");
+    let output_events = prepared.output_events.clone();
+    let _ = prepared.commit(core);
+    ProcessedInput { output_events }
 }
 
 pub fn replay_event_log(event_log: &[EventEnvelope]) -> Result<ExchangeCore, ReplayError> {
@@ -276,9 +370,12 @@ pub fn replay_event_log(event_log: &[EventEnvelope]) -> Result<ExchangeCore, Rep
 
         index += 1;
 
-        let processed = process_input_event(&mut core, input);
+        let processed = prepare_input_event(&core, input).map_err(|error| match error {
+            CoreError::Business(reason) => ReplayError::InternalFault(format!("{:?}", reason)),
+            CoreError::Internal(reason) => ReplayError::InternalFault(reason),
+        })?;
 
-        for expected_output in processed.output_events {
+        for expected_output in processed.output_events.iter().cloned() {
             let Some(output_envelope) = event_log.get(index) else {
                 return Err(ReplayError::MissingOutput {
                     seq_num: index as u64 + 1,
@@ -307,6 +404,8 @@ pub fn replay_event_log(event_log: &[EventEnvelope]) -> Result<ExchangeCore, Rep
 
             index += 1;
         }
+
+        let _ = processed.commit(&mut core);
     }
 
     Ok(core)
@@ -363,13 +462,10 @@ impl ExchangeRuntime {
     pub fn run(mut self) {
         while let Some(command) = self.rx.blocking_recv() {
             if let Err(err) = self.handle_command(command) {
-                // Fail closed. The core has already applied this command in memory but the record
-                // never reached disk, so memory is ahead of durable history and there is no
-                // rollback. Accepting more work would widen the disagreement; dropping the
-                // receiver makes every later request fail fast instead.
+                // Fail closed. Preparation has not changed authoritative state, so an event-store
+                // or internal-fault failure leaves the live core at the last committed history.
                 eprintln!(
-                    "exchange worker halted: could not write the event log ({}). \
-                     In-memory state is ahead of durable history; no further commands accepted.",
+                    "exchange worker halted: {}. No further commands accepted.",
                     err
                 );
                 break;
@@ -381,7 +477,7 @@ impl ExchangeRuntime {
         &self.event_log
     }
 
-    fn handle_command(&mut self, command: ExchangeCommand) -> Result<(), EventStoreError> {
+    fn handle_command(&mut self, command: ExchangeCommand) -> Result<(), RuntimeFailure> {
         match command {
             ExchangeCommand::Deposit {
                 user_id,
@@ -547,26 +643,21 @@ impl ExchangeRuntime {
         }
     }
 
-    /// Applies one input, then makes the whole command durable before it is acknowledged.
-    ///
-    /// The input and every output it generated are numbered and written as **one** record. That is
-    /// the property replay depends on: a crash can lose the last command entirely, but it can never
-    /// leave an input on disk whose outputs are missing.
-    ///
-    /// The core is mutated before the write, because the outputs are not known until the command
-    /// has been processed. A write failure therefore leaves memory ahead of disk with no way back,
-    /// which is why the error is fatal to the worker rather than merely returned to one caller.
+    /// Prepares one input without mutating the live core, makes its complete batch durable, and
+    /// commits it only after the append succeeds. A failed append therefore leaves the live core at
+    /// the last durable state.
     fn record_and_process_input_event(
         &mut self,
         event: ExchangeInputEvent,
-    ) -> Result<InputEventResult, EventStoreError> {
-        let ProcessedInput {
-            result,
-            output_events,
-        } = process_input_event(&mut self.core, event.clone());
+    ) -> Result<InputEventResult, RuntimeFailure> {
+        let prepared =
+            prepare_input_event(&self.core, event.clone()).map_err(|error| match error {
+                CoreError::Business(reason) => RuntimeFailure::Internal(format!("{:?}", reason)),
+                CoreError::Internal(reason) => RuntimeFailure::Internal(reason),
+            })?;
 
         let mut seq_num = self.next_event_seq;
-        let mut batch = Vec::with_capacity(1 + output_events.len());
+        let mut batch = Vec::with_capacity(1 + prepared.output_events.len());
 
         batch.push(EventEnvelope {
             seq_num,
@@ -574,7 +665,7 @@ impl ExchangeRuntime {
         });
         seq_num += 1;
 
-        for output_event in output_events {
+        for output_event in prepared.output_events.iter().cloned() {
             batch.push(EventEnvelope {
                 seq_num,
                 event: ExchangeEvent::Output(output_event),
@@ -583,22 +674,22 @@ impl ExchangeRuntime {
         }
 
         if let Some(store) = self.store.as_mut() {
-            store.append(&batch)?;
+            store.append(&batch).map_err(RuntimeFailure::Store)?;
         }
 
-        // Only now is the command part of history: durable first, then visible.
+        let (result, executions) = prepared.commit(&mut self.core);
+
+        // Only now is the command part of history and visible to callbacks.
         self.next_event_seq = seq_num;
         self.event_log.extend(batch);
+        self.core.notify_executions(&executions);
 
         Ok(result)
     }
 }
 
-fn halted_message(err: &EventStoreError) -> String {
-    format!(
-        "exchange halted: the event log could not be written ({})",
-        err
-    )
+fn halted_message(err: &RuntimeFailure) -> String {
+    format!("exchange unavailable: {}", err)
 }
 
 /// Opens the event log at `path`, replays whatever history it holds, and returns a runtime ready to
@@ -615,6 +706,11 @@ pub fn recover_runtime(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use tokio::sync::oneshot;
 
     use super::*;
@@ -649,6 +745,81 @@ mod tests {
             0,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn append_failure_leaves_prepared_state_uncommitted() {
+        let path = temp_log_path("atomic-append-failure");
+        let (store, _) = EventStore::open(&path).unwrap();
+        drop(store);
+
+        let mut runtime = runtime();
+        runtime.store = Some(EventStore::open_read_only_for_test(&path).unwrap());
+
+        let result =
+            runtime.record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".to_string(),
+                amount: 1_000,
+            });
+
+        assert!(matches!(result, Err(RuntimeFailure::Store(_))));
+        assert_eq!(runtime.core.balance_view("buyer").balance, 0);
+        assert!(runtime.event_log.is_empty());
+        assert_eq!(runtime.next_event_seq, 1);
+
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn append_failure_does_not_publish_execution_callbacks() {
+        let path = temp_log_path("atomic-callback-failure");
+        let mut runtime = runtime();
+
+        runtime
+            .record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".to_string(),
+                amount: 100,
+            })
+            .unwrap();
+        runtime
+            .record_and_process_input_event(share_deposit("seller", 1))
+            .unwrap();
+        runtime
+            .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+                order: order("sell-1", "seller", "SELL", 10, 1),
+            })
+            .unwrap();
+
+        let (store, _) = EventStore::open(&path).unwrap();
+        drop(store);
+        runtime.store = Some(EventStore::open_read_only_for_test(&path).unwrap());
+
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count_for_subscriber = Arc::clone(&callback_count);
+        runtime.core.subscribe(move |_| {
+            callback_count_for_subscriber.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let result =
+            runtime.record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+                order: order("buy-1", "buyer", "BUY", 10, 1),
+            });
+
+        assert!(matches!(result, Err(RuntimeFailure::Store(_))));
+        assert_eq!(callback_count.load(Ordering::Relaxed), 0);
+        assert_eq!(runtime.core.balance_view("buyer").balance, 100);
+        assert_eq!(runtime.core.position_views("seller")[0].quantity, 1);
+        assert_eq!(
+            runtime
+                .core
+                .execution_views("buyer", None, None, None, None)
+                .len(),
+            0
+        );
+        assert!(runtime.core.order_view("sell-1", "seller").is_some());
+        assert!(runtime.core.order_view("buy-1", "buyer").is_none());
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::types::{Node, Order, Price};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PriceLevel {
     pub price: Price,
     pub(crate) nodes: Vec<Node>,

@@ -81,9 +81,35 @@ impl RiskManager {
     pub fn check(&mut self, order: &Order) -> Result<(), RiskError> {
         self.roll_day(order.timestamp);
 
-        let key = (order.user_id.clone(), order.symbol.clone());
+        self.check_current_day(order)
+    }
+
+    pub fn check_read_only(&self, order: &Order) -> Result<(), RiskError> {
+        let day = Self::day_of(order.timestamp);
+        let current_volume = if self.current_day.is_some_and(|current| day > current) {
+            0
+        } else {
+            self.volumes
+                .get(&(order.user_id.clone(), order.symbol.clone()))
+                .copied()
+                .unwrap_or(0)
+        };
+
+        self.check_projected(order, current_volume)
+    }
+
+    fn check_current_day(&self, order: &Order) -> Result<(), RiskError> {
+        let current_volume = self
+            .volumes
+            .get(&(order.user_id.clone(), order.symbol.clone()))
+            .copied()
+            .unwrap_or(0);
+
+        self.check_projected(order, current_volume)
+    }
+
+    fn check_projected(&self, order: &Order, current_volume: u64) -> Result<(), RiskError> {
         let limit = self.limit_for(&order.user_id, &order.symbol);
-        let current_volume = self.volumes.get(&key).copied().unwrap_or(0);
 
         let projected =
             current_volume
@@ -109,6 +135,7 @@ impl RiskManager {
 
     /// Counts an accepted order against the day, once its collateral has been reserved.
     pub fn record(&mut self, order: &Order) {
+        self.roll_day(order.timestamp);
         let key = (order.user_id.clone(), order.symbol.clone());
         let current = self.volumes.get(&key).copied().unwrap_or(0);
 
