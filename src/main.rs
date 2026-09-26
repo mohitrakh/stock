@@ -47,8 +47,17 @@ async fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--market-data") {
+        if let Err(error) = exchange::market_data::run(&args[1..]).await {
+            eprintln!("market data: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if !args.is_empty() {
-        eprintln!("usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once]]");
+        eprintln!(
+            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR]]"
+        );
         std::process::exit(1);
     }
     dotenv().ok();

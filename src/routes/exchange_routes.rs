@@ -18,12 +18,6 @@ pub fn exchange_routes() -> Router<AppState> {
             post(exchange_controller::set_risk_limit).get(exchange_controller::get_risk_limit),
         )
         .route("/orders/{order_id}", get(exchange_controller::get_order))
-        // Market data is the one public read: it is aggregate L2 depth and carries no user
-        // identity, matching the target design's split between private trading and public data.
-        .route(
-            "/orderbook/{symbol}",
-            get(exchange_controller::get_order_book),
-        )
 }
 
 #[cfg(test)]

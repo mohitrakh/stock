@@ -48,7 +48,7 @@ The order manager's `prepare_new_order` validates execution pairs, cumulative fi
 
 A buy reserves its limit-price notional. A sell reserves shares. Settlement transfers cash from buyer to seller and shares from seller to buyer, releases price improvement for buys, and adjusts both orders' remaining quantity. The whole command is validated before any settlement is committed. Cancellation releases the unfilled collateral and eligible risk allowance.
 
-`RiskManager` tracks limits and usage by user/symbol. The default daily cap is 1,000,000 shares. Accepted submissions count toward it; cancellation returns the unfilled allowance. The effective trading day comes from the recorded order timestamp, in UTC 86,400-second buckets, and only advances. Preparation uses `check_read_only`; accepted commit records usage and advances the day. Limit changes are journaled events. There are no market calendars or portfolio-wide limits, and the current API allows a trader to set their own cap.
+`RiskManager` tracks limits and usage by user/symbol. The default daily cap is 1,000,000 shares. Usage means quantity traded today plus quantity still open. Open exposure is tracked separately so overnight resting orders remain in the next day's starting usage. Accepted submissions increase usage and exposure; fills reduce exposure without refunding today's usage; cancellation returns only the unfilled exposure. The effective trading day comes from the recorded order timestamp, in UTC 86,400-second buckets, and only advances. Preparation validates fill and cancellation risk changes before commit. Limit changes are journaled events. There are no market calendars or portfolio-wide limits, and the current API allows a trader to set their own cap.
 
 Orders have new, partially-filled, filled, or canceled lifecycle states. Executions record each party's side and are indexed for account queries. The two execution-side records for a match must not later be counted as two distinct market trades by a market-data consumer.
 
@@ -126,11 +126,27 @@ Start the exchange writer at least once so the stream exists. The probe prints o
 
 An optional checkpoint is saved through a temporary file, file synchronization, atomic rename, and parent-directory synchronization. It is saved after stdout is flushed. A crash between output and checkpoint can repeat a batch; this diagnostic output is at-least-once across such a restart. Use one checkpoint file per consumer. The probe exits nonzero on invalid data and never repairs or truncates the journal.
 
-Raw events contain private account/order details. New stream files are mode 0600. The probe is an internal debugging tool, not a public market-data feed. A future MDP must build the appropriate projection and public schema.
+Raw events contain private account/order details. New stream files are mode 0600. The probe is an internal debugging tool, not a public market-data feed.
+
+## Market data publisher
+
+The first business subscriber runs as an independent process before database and authentication initialization:
+
+```sh
+cargo run -- --market-data exchange-events.log exchange-events.log.mmap market-data-state.json [LISTEN_ADDR]
+```
+
+The listener defaults to `127.0.0.1:4001`. The MDP uses `StreamReader` to catch up completely before binding and then follows live committed batches with 10 ms idle polling. Trading does not call or wait for this process.
+
+Its private projection contains open order id, symbol, side, price, and remaining quantity. Public bid/ask levels are aggregated with checked `u64` arithmetic. Accepted new-order batches validate their acceptance and adjacent two-sided execution pairs, apply every trade once to the incoming and known resting quantities, then rest any incoming remainder. Rejections and non-market-data commands do not change the projection. Successful cancellations remove the known remainder.
+
+For every batch, the MDP clones its current projection, applies and validates the command, then persists that candidate with the reader's advanced checkpoint before replacing the served snapshot. The version-1 JSON state stores the checkpoint and open orders; aggregates are rebuilt on load. Saving uses a private temporary file, file and directory synchronization, and atomic rename.
+
+Missing state triggers replay from journal sequence 1. Present invalid JSON, unsupported versions, invalid orders, incompatible checkpoints, and state paths that alias the journal or stream refuse startup. A terminal stream, validation, persistence, or projection-lock error marks the MDP unavailable. Its health and L2 routes then return 503 instead of serving stale data.
 
 ## HTTP read and write surface
 
-Queries use the same queue and single owner, returning through oneshot without adding journal or stream events. Existing HTTP reads do not use the mmap reader.
+Private exchange queries use the same queue and single owner, returning through oneshot without adding journal or stream events. They do not use the mmap reader.
 
 | Method | Path | Access |
 |---|---|---|
@@ -144,15 +160,23 @@ Queries use the same queue and single owner, returning through oneshot without a
 | GET | `/exchange/executions?symbol=&order_id=&start_time=&end_time=` | caller's fills; optional filters |
 | GET | `/exchange/risk/limits?symbol=` | caller's limit/usage |
 | GET | `/exchange/orders/{order_id}` | owner only; non-owner also gets 404 |
-| GET | `/exchange/orderbook/{symbol}?depth=N` | public L2 snapshot; depth defaults to 10, capped at 50 |
-| GET | `/health` | public worker availability |
+| GET | `/health` | exchange worker availability on the trading listener |
 
 PostgreSQL and SQLx support user registration/login. `AppState` holds the database pool, command sender, and worker availability flag. Database calls are outside matching, sequencing, journal recovery, and subscriber delivery.
 
+The separate MDP listener has its own public routes and no database dependency:
+
+| Method | Path | Behavior |
+|---|---|---|
+| GET | `/marketdata/orderbook/{symbol}?depth=N` | public L2; depth defaults to 10 and is clamped to 1-50; unknown symbol is 404 |
+| GET | `/health` | 200 after catch-up while following is healthy; otherwise 503 |
+
+The previous `/exchange/orderbook/{symbol}` route and `ExchangeCommand::GetOrderBook` path have been removed. Internal core L2 methods remain for correctness tests.
+
 ## Verification and remaining scope
 
-`cargo fmt -- --check` and `cargo test` pass: 92 unit tests plus 2 executable integration tests. New coverage includes independent fast/slow readers, window overwrite, oversize batches, checkpoint boundary/identity validation, cache/journal corruption, competing writers, durable-but-unpublished recovery, failed append with no publication, fatal publication failure, real cross-process reading, SIGKILL at publication boundaries, and probe output/checkpoint resume without PostgreSQL.
+`cargo fmt -- --check` and `cargo test --locked --offline` pass: 108 unit tests plus 4 executable integration tests. Coverage includes overnight risk rollover and durable replay, independent fast/slow readers, window overwrite, oversize batches, checkpoint boundary/identity validation, cache/journal corruption, competing writers, durable-but-unpublished recovery, failed append with no publication, fatal publication failure, real cross-process reading, SIGKILL at publication boundaries, probe checkpoint resume, and MDP projection/recovery/HTTP behavior without PostgreSQL.
 
-These tests include core/runtime and actual executable checks; they do not claim a new full HTTP/database deployment test, machine power-loss testing, or performance benchmarking. Clippy still reports existing compatibility/dead-code and style issues.
+These tests include core/runtime and actual executable checks. MDP coverage includes oracle comparison, multi-fill and cancellation behavior, malformed batches, aggregation beyond `u32::MAX`, state replacement failures, journal catch-up, MDP and exchange-stream restarts, live following, and fail-closed 503 responses. A manual isolated-database run also exercised authenticated trading HTTP plus the separate MDP process through rest, partial fill, cancellation, MDP restart, and resumed live publication. This does not claim machine power-loss testing or performance benchmarking. Clippy still reports existing compatibility/dead-code and style warnings.
 
-Market-data publishing, candles, reporting projections, hot-warm replication, cross-host recovery, mmap ingress, lock-free queues, snapshots, group commit, and CPU pinning remain separate milestones.
+The MDP rewrites and synchronizes its complete JSON open-order state after every command batch; this correctness-first design has not been throughput tested. Trade tape, candles, reporting projections, historical market-data storage, hot-warm replication, cross-host recovery, mmap ingress, lock-free queues, snapshots, group commit, and CPU pinning remain separate milestones.

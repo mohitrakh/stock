@@ -637,15 +637,6 @@ impl ExchangeRuntime {
                 let _ = respond_to.send(self.core.order_view(&order_id, &user_id));
                 Ok(())
             }
-
-            ExchangeCommand::GetOrderBook {
-                symbol,
-                depth,
-                respond_to,
-            } => {
-                let _ = respond_to.send(self.core.l2_snapshot(&symbol, depth));
-                Ok(())
-            }
         }
     }
 
@@ -767,6 +758,17 @@ mod tests {
     }
 
     fn order(id: &str, user: &str, side: &str, price: u64, quantity: u32) -> Order {
+        order_at(id, user, side, price, quantity, 1.0)
+    }
+
+    fn order_at(
+        id: &str,
+        user: &str,
+        side: &str,
+        price: u64,
+        quantity: u32,
+        timestamp: f64,
+    ) -> Order {
         Order::new(
             id.to_string(),
             user.to_string(),
@@ -775,7 +777,7 @@ mod tests {
             price,
             quantity,
             None,
-            1.0,
+            timestamp,
             0,
         )
         .unwrap()
@@ -1390,15 +1392,6 @@ mod tests {
             })
             .unwrap();
 
-        let (respond_to, book_rx) = oneshot::channel();
-        runtime
-            .handle_command(ExchangeCommand::GetOrderBook {
-                symbol: "AAPL".to_string(),
-                depth: 10,
-                respond_to,
-            })
-            .unwrap();
-
         // The reads answered, and the log is exactly where it was.
         let balance = balance_rx.blocking_recv().unwrap();
         assert_eq!(balance.balance, 1_000);
@@ -1406,8 +1399,6 @@ mod tests {
         assert_eq!(balance.available, 900);
 
         assert!(order_rx.blocking_recv().unwrap().is_some());
-        assert!(book_rx.blocking_recv().unwrap().is_some());
-
         assert_eq!(runtime.event_log().len(), length_before_reads);
     }
 
@@ -1711,6 +1702,81 @@ mod tests {
             1
         );
 
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn overnight_risk_usage_replays_and_continues_after_restart() {
+        let path = temp_log_path("overnight-risk");
+
+        {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let mut runtime = recover_runtime(rx, &path).unwrap();
+            for command in [
+                ExchangeInputEvent::RiskLimitSetRequested {
+                    user_id: "buyer".to_string(),
+                    symbol: "AAPL".to_string(),
+                    max_daily_quantity: 10,
+                },
+                ExchangeInputEvent::FundsDepositRequested {
+                    user_id: "buyer".to_string(),
+                    amount: 1_000,
+                },
+                share_deposit("seller", 10),
+                ExchangeInputEvent::NewOrderRequested {
+                    order: order_at("overnight", "buyer", "BUY", 10, 10, 3_600.0),
+                },
+                ExchangeInputEvent::NewOrderRequested {
+                    order: order_at("day-two-sell", "seller", "SELL", 10, 4, 90_000.0),
+                },
+                ExchangeInputEvent::CancelOrderRequested {
+                    order_id: "overnight".to_string(),
+                    user_id: "buyer".to_string(),
+                },
+            ] {
+                runtime.record_and_process_input_event(command).unwrap();
+            }
+            assert_eq!(runtime.core.risk_limit_view("buyer", "AAPL").used_today, 4);
+        }
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut restarted = recover_runtime(rx, &path).unwrap();
+        assert_eq!(
+            restarted.core.risk_limit_view("buyer", "AAPL").used_today,
+            4
+        );
+
+        let rejected = restarted
+            .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+                order: order_at("too-many", "buyer", "BUY", 10, 7, 90_001.0),
+            })
+            .unwrap()
+            .into_place_order_result();
+        assert!(rejected.is_err());
+
+        restarted
+            .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+                order: order_at("remaining", "buyer", "BUY", 10, 6, 90_002.0),
+            })
+            .unwrap()
+            .into_place_order_result()
+            .unwrap();
+        assert_eq!(
+            restarted.core.risk_limit_view("buyer", "AAPL").used_today,
+            10
+        );
+        drop(restarted);
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let recovered_again = recover_runtime(rx, &path).unwrap();
+        assert_eq!(
+            recovered_again
+                .core
+                .risk_limit_view("buyer", "AAPL")
+                .used_today,
+            10
+        );
+        drop(recovered_again);
         std::fs::remove_file(&path).unwrap();
     }
 

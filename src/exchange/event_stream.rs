@@ -516,7 +516,7 @@ pub(super) mod tests {
                 dir,
             }
         }
-        fn start(&self, capacity: usize) -> (EventStore, StreamWriter) {
+        pub fn start(&self, capacity: usize) -> (EventStore, StreamWriter) {
             let (store, events) = EventStore::open(&self.log).unwrap();
             let stream = StreamWriter::open(
                 &self.bus,

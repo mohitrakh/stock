@@ -1,4 +1,4 @@
-# Project Direction - Committed mmap Stream Completed
+# Project Direction - Market Data Publisher v1 Completed
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -12,7 +12,7 @@ The repository is a learning stock exchange with an exchange-grade architecture 
 
 ## Current Status
 
-The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log with startup recovery, and a bounded mmap stream with independent readers and durable catch-up. It also has exact integer prices, deterministic replay, collateral on both sides of a trade, client-supplied order ids, and HTTP reads for balances, positions, orders, executions, risk limits, and L2 snapshots. There is no market-data publisher yet.
+The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log with startup recovery, and a bounded mmap stream with independent readers and durable catch-up. It also has exact integer prices, deterministic replay, collateral on both sides of a trade, overnight-safe daily risk accounting, client-supplied order ids, and authenticated exchange reads for balances, positions, orders, executions, and risk limits. MDP v1 is now the first independent business subscriber: it reconstructs public L2 books from committed batches and serves them from a separate process without querying the exchange core.
 
 ```text
 Axum HTTP handler
@@ -48,6 +48,12 @@ application startup (main thread, before the listener binds)
   -> ExchangeRuntime::from_store
   -> initialize mmap watermark from the validated recovered journal
   -> exit 1 on any history that cannot be trusted; never a silent empty start
+
+independent MDP process
+  -> StreamReader over the same journal and mmap stream
+  -> atomically persist open-order projection plus reader checkpoint
+  -> serve GET /marketdata/orderbook/{symbol} on 127.0.0.1:4001 by default
+  -> return 503 after any terminal follower error; trading remains independent
 ```
 
 `ExchangeCommand` is live gateway plumbing and may contain `respond_to`. `ExchangeEvent` contains replayable business data and must remain free of HTTP response channels.
@@ -62,11 +68,11 @@ Latest verified status on 2026-09-26:
 
 ```text
 cargo fmt -- --check
-cargo test
-92 unit tests + 2 executable integration tests passed; 0 failed
+cargo test --locked --offline
+108 unit tests + 4 executable integration tests passed; 0 failed
 ```
 
-Verification includes separate OS-process readers, forced writer kills after append and during publication, reader checkpoint resume, and the actual probe executable without a database. These are local correctness tests, not throughput measurements or a machine-power-loss test. Existing compatibility APIs and repository-wide clippy warnings remain.
+Verification includes separate OS-process readers, forced writer kills after append and during publication, reader checkpoint resume, the probe executable without a database, and the MDP executable catching up from the journal, serving HTTP, restarting from state, following live publication, and failing closed after a follower error. A manual run with isolated PostgreSQL also drove the real exchange and MDP through rest, partial fill, cancellation, MDP restart, and resumed live publication. These are local correctness tests, not throughput measurements or a machine-power-loss test. Existing compatibility APIs and repository-wide clippy warnings remain.
 
 ## Completed Milestones
 
@@ -137,7 +143,7 @@ Full write-up: `docs/tasks/01-observable-exchange.md`.
 
 This milestone was inserted ahead of durable storage. An audit found that every component built since milestone 3 was unreachable from the running binary — replay, recovery, best bid/ask, order state, balance lookup, and risk limits all existed only to satisfy tests. The deployed exchange was three POST endpoints whose order response was a bare uuid string, so a client could place an order and never learn whether it filled. Durable storage could not have been honestly verified from a system with nothing readable in it.
 
-Three read endpoints now exist: `GET /exchange/balance`, `GET /exchange/orders/{order_id}` (owner only; non-owners get 404 so order ids cannot be probed), and the public `GET /exchange/orderbook/{symbol}?depth=N`. `POST /exchange/orders` returns a JSON `OrderView` with `filled_quantity`, `remaining_quantity`, and `status` instead of a uuid string.
+At this milestone, three read endpoints existed: `GET /exchange/balance`, `GET /exchange/orders/{order_id}` (owner only; non-owners get 404 so order ids cannot be probed), and the public `GET /exchange/orderbook/{symbol}?depth=N`. MDP v1 later removed the exchange-owned L2 route and replaced it with `/marketdata/orderbook/{symbol}` on the independent subscriber. `POST /exchange/orders` returns a JSON `OrderView` with `filled_quantity`, `remaining_quantity`, and `status` instead of a uuid string.
 
 Reads reach the single-owner worker through new `ExchangeCommand` query variants and are answered straight from `ExchangeCore`. They deliberately have no `ExchangeInputEvent` counterpart and never touch the event log: they mutate nothing, so recording them would lengthen every future replay without changing an outcome. A test asserts the log length is unchanged across all three queries.
 
@@ -267,7 +273,80 @@ cargo run -- --event-probe exchange-events.log exchange-events.log.mmap /tmp/sto
 
 It prints one JSON array per complete command. Omit `--once` to follow live data; omit the checkpoint path to start at the beginning. This is trusted internal account/order data, not a public market-data feed.
 
-The next milestone has not been selected. Discuss the first business subscriber separately. Market data, reporting, and hot-warm replication have different correctness and recovery requirements; the shared stream supplies their transport foundation, not their completed behavior.
+At completion of the mmap milestone, the first business subscriber had not been selected. The following milestone instead closes a correctness bug found during that review.
+
+## 13. Overnight Risk Accounting
+
+Full write-up: `docs/tasks/07-overnight-risk-accounting.md`.
+
+Daily risk usage now means "quantity traded today plus quantity still open and able to trade today." The risk manager keeps open exposure separately from current-day usage. Accepted orders increase both; fills move quantity out of open exposure without reducing the day's usage; cancellations release only the unfilled open quantity. On a day rollover, old executions expire but overnight resting orders remain counted.
+
+This closes a confirmed bypass. Previously, rollover cleared the entire counter even while old orders remained executable. Cancelling one of those orders could then subtract its remainder from the new day's usage and create additional allowance. A cap of 10 could therefore coexist with 20 resting shares and later report zero usage.
+
+Fill and cancellation risk changes are now validated during preparation and applied during the existing infallible commit. No event format changed: replay reconstructs the corrected state from accepted orders, executions, and cancellations. An old journal containing an order accepted only because of the previous bypass can refuse startup with an output mismatch; preserve that journal and handle the incompatibility explicitly.
+
+Verified on 2026-09-26: an overnight order remains counted on day two; four filled shares plus six resting shares report usage 10; cancelling the six leaves usage 4; an order for seven is rejected and an order for six is accepted. The result survives two durable recoveries. `cargo fmt -- --check` passes and `cargo test --locked --offline` passes 95 unit tests plus 2 executable integration tests.
+
+## 14. Market Data Publisher v1
+
+**Status: completed on 2026-09-26.** Full write-up: `docs/tasks/08-market-data-publisher-v1.md`.
+
+The committed mmap stream was built so independent business components could consume durable exchange history without reading mutable core state. The first such component is now the Market Data Publisher. MDP v1 consumes committed batches, independently reconstructs L2 order books, persists its derived state with its checkpoint, and exposes that data from a market-data-owned HTTP surface.
+
+```text
+single-owner exchange worker
+  -> authoritative durable journal
+  -> bounded committed mmap stream
+  -> independent MDP process using StreamReader
+       -> private per-order projection state
+       -> public per-symbol L2 price levels
+       -> market-data read surface
+```
+
+The MDP is a subscriber, not another owner of exchange state. It does not call `ExchangeCore`, send an L2 query through `ExchangeCommand`, share the matching engine's in-memory books, or delay order acceptance while it processes data. If the MDP stops, trading continues. When it returns, it catches up from the journal through the existing `StreamReader` path and then resumes live mmap consumption.
+
+### Event-to-projection contract
+
+`StreamReader` returns one complete command batch at a time. MDP v1 interprets that batch as a unit:
+
+- `NewOrderRequested` carries the full candidate order. The projection changes only when the same batch contains `OrderAccepted`; `OrderRejected` changes nothing.
+- An accepted order's `ExecutionCreated` outputs reduce the corresponding buy and sell order quantities. Any remaining quantity from the accepted incoming order becomes a resting order at its limit price.
+- The matching engine emits two execution records for one match, one for each party. MDP v1 validates the two-sided pair and applies it once. It neither doubles the quantity nor silently accepts a malformed pair.
+- `CancelOrderRequested` changes the projection only when followed by `OrderCanceled`; `CancelRejected` changes nothing.
+- Deposit, share-deposit, and risk-limit batches do not affect public market data.
+- Public output must contain market fields only. User ids, balances, positions, risk limits, and raw internal events must never be exposed by the market-data endpoint.
+
+The existing event schema is sufficient for this projection because the input and all outputs are framed together as one command. No authoritative event type or journal format changed.
+
+### Projection state and recovery
+
+The MDP owns its own order map, remaining quantities, and aggregated bid/ask levels. Price-level totals and the shared public L2 response use checked `u64` quantities. Core aggregation was widened as the correctness oracle and can now represent several valid `u32` orders at one price.
+
+A reader checkpoint is not sufficient by itself: resuming after the checkpoint with an empty projection would silently omit earlier orders. The MDP therefore persists its open orders and `ReaderCheckpoint` in one versioned state file. It saves through a synchronized temporary file and atomic rename after every batch, before replacing the served snapshot. A present but corrupt or mismatched state file refuses startup. Missing state explicitly rebuilds from sequence 1.
+
+The projection is derived and disposable. The journal remains the source of truth. Deleting the projection must be recoverable by replaying committed batches, while deleting or replacing the journal is not a market-data recovery procedure.
+
+### Completed behavior and evidence
+
+The implementation and tests demonstrate the following:
+
+- A separate OS process starts from an empty projection, consumes the journal/mmap stream through `StreamReader`, catches up, and follows new committed batches.
+- It reconstructs correct L2 state for resting orders, immediate fills, partial fills, multiple fills in one command, successful cancellations, rejected orders, rejected cancellations, and the existing self-trade-prevention behavior.
+- Each two-sided execution pair is applied once, while both affected order quantities are updated correctly.
+- A slow reader survives mmap-window overwrite by reading the missing committed records from the journal and returning to live mmap delivery without a gap.
+- After process death, projection state and checkpoint resume together without dropping or applying a command twice. Starting without saved state performs a complete rebuild from sequence 1.
+- The MDP refuses corrupt batches, sequence gaps, invalid execution pairs, incompatible checkpoints, and projection/checkpoint mismatches instead of publishing a plausible but incorrect book.
+- Public L2 output uses overflow-safe aggregate quantities and contains no private account data.
+- The public L2 read path is owned by the market-data component and does not enqueue a read against the single-owner exchange worker.
+- Core-oracle tests compare the independent projection with `ExchangeCore::l2_snapshot`; runtime and executable tests cover real stream publication, journal catch-up, MDP restart, exchange stream restart, live following, and HTTP output.
+- The executable starts without database configuration. Its old exchange-owned L2 route is gone; `GET /marketdata/orderbook/{symbol}?depth=N` and the MDP `/health` route are owned by the subscriber process.
+- `cargo fmt -- --check`, `cargo test --locked --offline`, clippy, and the task write-up complete the milestone checks.
+
+### Explicitly outside MDP v1
+
+Do not expand this milestone into candlesticks, historical analytics storage, reporting, FIX/SBE, UDP or multicast distribution, paid depth tiers, hot-warm matching, cross-host replication, lock-free ring buffers, CPU pinning, group commit, snapshots of the authoritative exchange core, or per-symbol exchange workers. Those build on a proven subscriber boundary and need separate correctness and failure models.
+
+Candlesticks are specifically deferred because they introduce interval, timestamp, exchange-calendar, and retention policy. Reporting is deferred because database effects require their own idempotency and checkpoint transaction. Hot-warm failover is deferred because it additionally requires cross-host replication, leader/fencing rules, promotion behavior, and explicit RPO/RTO tests.
 
 ## Known Prototype Limitations
 
@@ -290,7 +369,8 @@ The next milestone has not been selected. Discuss the first business subscriber 
 - replay requires the full history from an empty core; snapshots and replay from a partial history are not supported
 - event-log sequencing and matching-input sequencing remain distinct concepts
 - live HTTP replies still use `oneshot`
-- there is no market-data or reporting consumer
+- MDP state rewrites and synchronizes the complete JSON open-order projection after every command; this is correctness-first and not a high-throughput persistence design
+- there is no reporting projection, trade tape, candle service, or historical market-data store
 - mmap is a same-host Unix transport using cooperative file locks, JSON, and a bounded window; it is not lock-free, cross-server replication, or an ingress transport
 - the journal and in-memory history still grow without bound; checkpoint validation scans history on reader restart
 - mmap is not the durable recovery source; never modify, truncate, replace, or unlink mapped files while processes use them
@@ -299,7 +379,7 @@ The next milestone has not been selected. Discuss the first business subscriber 
 
 ## What Not To Work On Yet
 
-Until the next milestone is selected and discussed, do not start snapshots, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, market data, reporting, FIX/SBE, UDP, replication, or hot/warm engines. The committed mmap reader is ready for a future subscriber; inbound commands still use the existing bounded Tokio queue.
+No next milestone has been selected. Discuss and record the next architecture step before implementing it. Do not automatically expand MDP v1 into candles, reporting, snapshots, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, FIX/SBE, UDP, replication, or hot-warm engines. The committed mmap reader remains the MDP input; inbound commands remain on the existing bounded Tokio queue.
 
 ## Rule For Future Sessions
 

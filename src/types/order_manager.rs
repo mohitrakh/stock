@@ -76,7 +76,14 @@ pub(crate) struct PreparedSettlement {
     pub(crate) wallet: Vec<WalletSettlement>,
     pub(crate) positions: Vec<PositionSettlement>,
     pub(crate) order_fills: HashMap<String, u32>,
+    pub(crate) risk_fills: Vec<RiskFill>,
     pub(crate) execution_views: Vec<(String, ExecutionView)>,
+}
+
+pub(crate) struct RiskFill {
+    pub(crate) user_id: String,
+    pub(crate) symbol: String,
+    pub(crate) quantity: u64,
 }
 
 pub(crate) struct PreparedNewOrder {
@@ -423,10 +430,46 @@ impl OrderManager {
             })
             .collect::<Result<Vec<_>, OrderManagerError>>()?;
 
+        // Risk usage means "traded today plus still open". A fill therefore leaves total usage
+        // unchanged but must remove the quantity from open exposure so it expires on the next day
+        // roll. Aggregate both sides of every match before validating the infallible commit.
+        let mut risk_fills: HashMap<(String, String), u64> = HashMap::new();
+        for (order_id, filled_quantity) in &order_fills {
+            let (user_id, symbol, _, _, _, _) = self.context(order_id, candidate)?;
+            let quantity = risk_fills.entry((user_id, symbol)).or_default();
+            *quantity = quantity
+                .checked_add(*filled_quantity as u64)
+                .ok_or_else(|| OrderManagerError::Internal("risk fill overflow".to_string()))?;
+        }
+        let risk_fills = risk_fills
+            .into_iter()
+            .map(|((user_id, symbol), quantity)| {
+                let candidate_addition = candidate
+                    .filter(|order| order.user_id == user_id && order.symbol == symbol)
+                    .map(|order| order.quantity as u64)
+                    .unwrap_or(0);
+                if !self
+                    .risk_manager
+                    .validate_fill(&user_id, &symbol, candidate_addition, quantity)
+                {
+                    return Err(OrderManagerError::Internal(format!(
+                        "risk open quantity invalid for {} {}",
+                        user_id, symbol
+                    )));
+                }
+                Ok(RiskFill {
+                    user_id,
+                    symbol,
+                    quantity,
+                })
+            })
+            .collect::<Result<Vec<_>, OrderManagerError>>()?;
+
         Ok(PreparedSettlement {
             wallet,
             positions,
             order_fills,
+            risk_fills,
             execution_views,
         })
     }
@@ -510,6 +553,15 @@ impl OrderManager {
                 )
                 .map_err(|err| OrderManagerError::Internal(format!("{:?}", err)))?,
         }
+        if !self
+            .risk_manager
+            .validate_release(&managed.order, remaining)
+        {
+            return Err(OrderManagerError::Internal(format!(
+                "risk release invalid for order {}",
+                order_id
+            )));
+        }
 
         Ok(PreparedCancel {
             order_id: order_id.to_string(),
@@ -568,6 +620,10 @@ impl OrderManager {
             } else {
                 OrderState::PartiallyFilled
             };
+        }
+        for fill in prepared.risk_fills {
+            self.risk_manager
+                .record_fill(&fill.user_id, &fill.symbol, fill.quantity);
         }
         for (user_id, view) in prepared.execution_views {
             self.executions.entry(user_id).or_default().push(view);

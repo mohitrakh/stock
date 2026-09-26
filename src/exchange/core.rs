@@ -788,6 +788,38 @@ mod tests {
     }
 
     #[test]
+    fn overnight_fills_and_cancellation_cannot_refund_todays_traded_usage() {
+        let mut core = funded_core();
+        core.deposit("trader".to_string(), 1_000).unwrap();
+        core.set_risk_limit("trader".to_string(), "AAPL".to_string(), 10);
+
+        let mut overnight = order("overnight", "trader", "BUY", 10, 10);
+        overnight.timestamp = 3_600.0;
+        core.add_order(overnight).unwrap();
+
+        // Four shares trade on day two. Usage remains ten: four traded today plus six still open.
+        let mut day_two_sell = order("day-two-sell", "seller", "SELL", 10, 4);
+        day_two_sell.timestamp = 90_000.0;
+        core.add_order(day_two_sell).unwrap();
+        assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 10);
+
+        core.cancel_order_for_user("overnight", "trader").unwrap();
+        assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 4);
+
+        let mut too_many = order("too-many", "trader", "BUY", 10, 7);
+        too_many.timestamp = 90_001.0;
+        assert!(matches!(
+            core.add_order(too_many),
+            Err(OrderManagerError::RiskRejected(_))
+        ));
+
+        let mut remaining_allowance = order("remaining", "trader", "BUY", 10, 6);
+        remaining_allowance.timestamp = 90_002.0;
+        core.add_order(remaining_allowance).unwrap();
+        assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 10);
+    }
+
+    #[test]
     fn executions_are_recorded_for_both_sides_with_their_own_side_and_order() {
         let mut core = funded_core();
         core.deposit("buyer".to_string(), 1_000).unwrap();

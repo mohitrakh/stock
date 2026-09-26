@@ -180,7 +180,7 @@ pub struct RiskLimitView {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct L2Level {
     pub price: u64,
-    pub quantity: u32,
+    pub quantity: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -247,10 +247,5 @@ pub enum ExchangeCommand {
         order_id: String,
         user_id: String,
         respond_to: oneshot::Sender<Option<OrderView>>,
-    },
-    GetOrderBook {
-        symbol: String,
-        depth: usize,
-        respond_to: oneshot::Sender<Option<OrderBookView>>,
     },
 }

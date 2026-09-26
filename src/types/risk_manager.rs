@@ -15,6 +15,9 @@ pub const DEFAULT_MAX_DAILY_QUANTITY: u64 = 1_000_000;
 
 pub struct RiskManager {
     limits: HashMap<(String, String), u64>,
+    /// Quantity still resting and able to trade, including orders from earlier days.
+    open_volumes: HashMap<(String, String), u64>,
+    /// Today's executed quantity plus every quantity still open and able to execute today.
     volumes: HashMap<(String, String), u64>,
     /// Which day the counters in `volumes` belong to, as a day number derived from order
     /// timestamps. `None` until the first order is seen.
@@ -25,6 +28,7 @@ impl RiskManager {
     pub fn new() -> Self {
         Self {
             limits: HashMap::new(),
+            open_volumes: HashMap::new(),
             volumes: HashMap::new(),
             current_day: None,
         }
@@ -52,7 +56,7 @@ impl RiskManager {
         (timestamp / SECONDS_PER_DAY).floor() as i64
     }
 
-    /// Clears the day's counters when an order's own timestamp says a new day has started.
+    /// Rolls daily usage when an order's own timestamp says a new day has started.
     ///
     /// The day comes from the event, never from the system clock. A wall-clock reset would destroy
     /// deterministic replay: the same log would rebuild different state tomorrow than it did today,
@@ -67,7 +71,10 @@ impl RiskManager {
         match self.current_day {
             Some(current) if day <= current => {}
             _ => {
-                self.volumes.clear();
+                // Executed quantity belongs to the day it traded and expires here. Resting orders
+                // do not expire: they can still execute today, so their remaining quantity is the
+                // starting usage for the new day.
+                self.volumes.clone_from(&self.open_volumes);
                 self.current_day = Some(day);
             }
         }
@@ -86,13 +93,11 @@ impl RiskManager {
 
     pub fn check_read_only(&self, order: &Order) -> Result<(), RiskError> {
         let day = Self::day_of(order.timestamp);
+        let key = (order.user_id.clone(), order.symbol.clone());
         let current_volume = if self.current_day.is_some_and(|current| day > current) {
-            0
+            self.open_volumes.get(&key).copied().unwrap_or(0)
         } else {
-            self.volumes
-                .get(&(order.user_id.clone(), order.symbol.clone()))
-                .copied()
-                .unwrap_or(0)
+            self.volumes.get(&key).copied().unwrap_or(0)
         };
 
         self.check_projected(order, current_volume)
@@ -138,9 +143,53 @@ impl RiskManager {
         self.roll_day(order.timestamp);
         let key = (order.user_id.clone(), order.symbol.clone());
         let current = self.volumes.get(&key).copied().unwrap_or(0);
+        let open = self.open_volumes.get(&key).copied().unwrap_or(0);
 
-        self.volumes
-            .insert(key, current.saturating_add(order.quantity as u64));
+        self.volumes.insert(
+            key.clone(),
+            current
+                .checked_add(order.quantity as u64)
+                .expect("validated risk usage must not overflow at commit"),
+        );
+        self.open_volumes.insert(
+            key,
+            open.checked_add(order.quantity as u64)
+                .expect("validated open risk quantity must not overflow at commit"),
+        );
+    }
+
+    /// Checks that committing fills can remove their quantities from open exposure.
+    pub fn validate_fill(
+        &self,
+        user_id: &str,
+        symbol: &str,
+        added_before_fill: u64,
+        quantity: u64,
+    ) -> bool {
+        self.open_volumes
+            .get(&(user_id.to_string(), symbol.to_string()))
+            .copied()
+            .unwrap_or(0)
+            .checked_add(added_before_fill)
+            .is_some_and(|open| open >= quantity)
+    }
+
+    /// Moves filled quantity out of open exposure. Total usage does not change: during the
+    /// current day the same shares move from "could trade" to "did trade".
+    pub fn record_fill(&mut self, user_id: &str, symbol: &str, quantity: u64) {
+        let key = (user_id.to_string(), symbol.to_string());
+        let open = self.open_volumes.get(&key).copied().unwrap_or(0);
+        self.open_volumes.insert(
+            key,
+            open.checked_sub(quantity)
+                .expect("prepared fill must not exceed open risk quantity"),
+        );
+    }
+
+    pub fn validate_release(&self, order: &Order, quantity: u32) -> bool {
+        let key = (order.user_id.clone(), order.symbol.clone());
+        self.open_volumes.get(&key).copied().unwrap_or(0) >= quantity as u64
+            && self.volumes.get(&key).copied().unwrap_or(0) >= quantity as u64
     }
 
     /// Returns the allowance held by a cancelled order's unfilled quantity.
@@ -152,9 +201,19 @@ impl RiskManager {
     pub fn release(&mut self, order: &Order, quantity: u32) {
         let key = (order.user_id.clone(), order.symbol.clone());
         let current = self.volumes.get(&key).copied().unwrap_or(0);
+        let open = self.open_volumes.get(&key).copied().unwrap_or(0);
 
-        self.volumes
-            .insert(key, current.saturating_sub(quantity as u64));
+        self.volumes.insert(
+            key.clone(),
+            current
+                .checked_sub(quantity as u64)
+                .expect("prepared cancellation must not exceed risk usage"),
+        );
+        self.open_volumes.insert(
+            key,
+            open.checked_sub(quantity as u64)
+                .expect("prepared cancellation must not exceed open risk quantity"),
+        );
     }
 }
 
@@ -228,10 +287,33 @@ mod tests {
         // Same day, later: the allowance is gone.
         assert!(risk.check(&order_at("trader", 1, 7_200.0)).is_err());
 
+        // Once the order has traded, it is no longer open exposure. Its traded usage expires at
+        // the next day boundary.
+        risk.record_fill("trader", "AAPL", 10);
+
         // A timestamp in the next day resets it. Nothing here consults the system clock, which is
         // what lets a recorded history replay to the same answers on any future date.
         risk.check(&order_at("trader", 10, 90_000.0)).unwrap();
         assert_eq!(risk.used_today("trader", "AAPL"), 0);
+    }
+
+    #[test]
+    fn an_overnight_resting_order_stays_in_the_new_days_usage() {
+        let mut risk = RiskManager::new();
+        risk.set_limit("trader".to_string(), "AAPL".to_string(), 10);
+
+        let resting = order_at("trader", 10, 3_600.0);
+        risk.check(&resting).unwrap();
+        risk.record(&resting);
+
+        assert!(matches!(
+            risk.check(&order_at("trader", 1, 90_000.0)),
+            Err(RiskError::LimitExceeded {
+                current_volume: 10,
+                ..
+            })
+        ));
+        assert_eq!(risk.used_today("trader", "AAPL"), 10);
     }
 
     #[test]
@@ -261,6 +343,7 @@ mod tests {
         assert_eq!(risk.used_today("trader", "AAPL"), 10);
 
         // Four traded, six cancelled: only the four that actually traded stay counted.
+        risk.record_fill("trader", "AAPL", 4);
         risk.release(&placed, 6);
 
         assert_eq!(risk.used_today("trader", "AAPL"), 4);

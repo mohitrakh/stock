@@ -132,7 +132,7 @@ impl MatchingEngine {
         self.last_seq = prepared.seq_num;
     }
 
-    pub fn best_bid_ask(&self, symbol: &str) -> Option<((Price, u32), (Price, u32))> {
+    pub fn best_bid_ask(&self, symbol: &str) -> Option<((Price, u64), (Price, u64))> {
         let book = self.order_books.get(symbol)?;
         Some((book.best_bid()?, book.best_ask()?))
     }
@@ -140,7 +140,7 @@ impl MatchingEngine {
     pub fn l2_snapshot(&self, symbol: &str, depth: usize) -> Option<OrderBookView> {
         let book = self.order_books.get(symbol)?;
         let (bids, asks) = book.l2_snapshot(depth);
-        let to_levels = |levels: Vec<(Price, u32)>| {
+        let to_levels = |levels: Vec<(Price, u64)>| {
             levels
                 .into_iter()
                 .map(|(price, quantity)| L2Level {

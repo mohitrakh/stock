@@ -12,15 +12,9 @@ use crate::{
     middleware::auth_middleware::AuthUser,
     state::AppState,
     types::types::{
-        BalanceView, ExchangeCommand, ExecutionView, Order, OrderBookView, OrderView, PositionView,
-        RiskLimitView,
+        BalanceView, ExchangeCommand, ExecutionView, Order, OrderView, PositionView, RiskLimitView,
     },
 };
-
-/// Default and ceiling for L2 depth. The cap is a response-size bound on a public read, not a
-/// correctness rule — a client asking for 10,000 levels gets 50.
-const DEFAULT_BOOK_DEPTH: usize = 10;
-const MAX_BOOK_DEPTH: usize = 50;
 
 #[derive(Deserialize)]
 pub struct DepositeRequest {
@@ -53,11 +47,6 @@ pub struct OrderRequest {
 #[derive(Deserialize)]
 pub struct CancelRequest {
     pub order_id: String,
-}
-
-#[derive(Deserialize)]
-pub struct BookQuery {
-    pub depth: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -306,27 +295,6 @@ pub async fn get_order(
     let view = ask(&state, |respond_to| ExchangeCommand::GetOrder {
         order_id,
         user_id: auth.user_id,
-        respond_to,
-    })
-    .await?
-    .ok_or(AppError::NotFound)?;
-
-    Ok(Json(view))
-}
-
-pub async fn get_order_book(
-    State(state): State<AppState>,
-    Path(symbol): Path<String>,
-    Query(query): Query<BookQuery>,
-) -> Result<Json<OrderBookView>, AppError> {
-    let depth = query
-        .depth
-        .unwrap_or(DEFAULT_BOOK_DEPTH)
-        .clamp(1, MAX_BOOK_DEPTH);
-
-    let view = ask(&state, |respond_to| ExchangeCommand::GetOrderBook {
-        symbol,
-        depth,
         respond_to,
     })
     .await?

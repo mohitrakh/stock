@@ -5,3 +5,5 @@ exchange-events.log
 *.log
 *.mmap
 !docs/tasks/06-mmap-committed-event-stream.md
+!docs/tasks/07-overnight-risk-accounting.md
+!docs/tasks/08-market-data-publisher-v1.md

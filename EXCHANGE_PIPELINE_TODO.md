@@ -113,6 +113,8 @@ Inserted ahead of durable storage after an audit found every component built sin
 - The aggressor never rests into a book crossed against a matchable counterparty.
 - `cargo fmt -- --check` passes and `cargo test` passes 38 tests.
 
+The exchange-owned L2 command and route in this historical milestone were later removed by MDP v1. Public depth now belongs to the independent market-data process.
+
 ## Completed Milestone - Durable Event Log and Startup Recovery
 
 Full write-up: `docs/tasks/02-durable-event-log.md`.
@@ -242,8 +244,37 @@ Full write-up: `docs/tasks/06-mmap-committed-event-stream.md`.
 
 Verified on 2026-09-26: `cargo fmt -- --check`; `cargo test` passes 92 unit tests and 2 executable integration tests. This milestone supplies a synchronized same-host transport, not lock-free latency, machine-crash durability of mmap, market data, reporting, or replication. Existing clippy warnings remain repository-wide work.
 
+## Completed Milestone - Overnight Risk Accounting
+
+Full write-up: `docs/tasks/07-overnight-risk-accounting.md`.
+
+- [x] Keep remaining quantities from overnight orders in the next day's risk usage.
+- [x] Track open exposure separately from current-day total usage.
+- [x] Move fills out of open exposure without refunding the current day's allowance.
+- [x] Release only the unfilled open quantity on cancellation.
+- [x] Validate fill and cancellation risk changes during prepare-before-commit.
+- [x] Verify the corrected state through durable replay and continued processing.
+
+Verified on 2026-09-26: `cargo fmt -- --check`; `cargo test --locked --offline` passes 95 unit tests and 2 executable integration tests.
+
+## Completed Milestone - Market Data Publisher v1
+
+Full write-up: `docs/tasks/08-market-data-publisher-v1.md`.
+
+- [x] Run the MDP as a separate process before database or authentication initialization.
+- [x] Consume only complete committed batches through `StreamReader`.
+- [x] Maintain a private open-order projection and checked `u64` L2 aggregates.
+- [x] Validate accepted orders, two-sided execution pairs, resting-order fills, cancellations, and all quantity changes.
+- [x] Apply each batch to a candidate projection and save it before replacing the served snapshot.
+- [x] Persist versioned projection state and its `ReaderCheckpoint` through synchronized temporary-file replacement.
+- [x] Rebuild from journal sequence 1 when state is missing and refuse present invalid or mismatched state.
+- [x] Catch up before binding, follow live mmap publication, and fail health/L2 closed after terminal follower errors.
+- [x] Move the public L2 route out of the exchange worker to `GET /marketdata/orderbook/{symbol}?depth=N`.
+- [x] Remove `ExchangeCommand::GetOrderBook` while keeping core L2 snapshots as a correctness oracle.
+- [x] Verify journal fallback, live following, MDP restart, exchange stream restart, state corruption, and database-free executable startup.
+
+Verified on 2026-09-26: `cargo fmt -- --check`; `cargo test --locked --offline` passes 108 unit tests and 4 executable integration tests. Clippy passes with existing repository warnings. A manual isolated-database run drove the real exchange and MDP through rest, partial fill, cancellation, MDP restart, and resumed live publication.
+
 ## Next Milestone
 
-Not selected yet. The committed mmap stream and diagnostic reader now exist. Discuss the first business subscriber and its acceptance test before implementing it. Market data, reporting, and hot-warm replication need different projections and failure handling.
-
-Do not automatically begin snapshots, group commit, lock-free ring buffers, UDP, CPU pinning, multiple trading-component threads, or per-symbol partitioning.
+No next milestone is selected. Discuss the next architecture step before implementation. Candles, reporting, snapshots, group commit, lock-free transport, UDP/multicast, CPU pinning, hot-warm replication, and per-symbol partitioning remain separate milestones.

@@ -25,13 +25,13 @@ impl OrderBook {
             exec_counter: 0,
         }
     }
-    pub fn best_bid(&self) -> Option<(Price, u32)> {
+    pub fn best_bid(&self) -> Option<(Price, u64)> {
         self.buy_levels
             .first_key_value()
             .map(|(rev_price, level)| (rev_price.0, level.total_quantity()))
     }
 
-    pub fn best_ask(&self) -> Option<(Price, u32)> {
+    pub fn best_ask(&self) -> Option<(Price, u64)> {
         self.sell_levels
             .first_key_value()
             .map(|(price, level)| (*price, level.total_quantity()))
@@ -39,7 +39,7 @@ impl OrderBook {
 
     /// Aggregated resting quantity per price level, best price first, capped at `depth` levels
     /// per side. This is the L2 view: price points and their total size, no per-order identity.
-    pub fn l2_snapshot(&self, depth: usize) -> (Vec<(Price, u32)>, Vec<(Price, u32)>) {
+    pub fn l2_snapshot(&self, depth: usize) -> (Vec<(Price, u64)>, Vec<(Price, u64)>) {
         let bids = self
             .buy_levels
             .iter()

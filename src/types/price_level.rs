@@ -82,12 +82,14 @@ impl PriceLevel {
     pub fn is_empty(&self) -> bool {
         self.head_idx.is_none()
     }
-    pub fn total_quantity(&self) -> u32 {
-        let mut total = 0;
+    pub fn total_quantity(&self) -> u64 {
+        let mut total = 0u64;
         let mut current_idx = self.head_idx;
         while let Some(idx) = current_idx {
             if let Some(ref order) = self.nodes[idx].order {
-                total += order.leaves_qty;
+                total = total
+                    .checked_add(order.leaves_qty as u64)
+                    .expect("price-level quantity exceeds u64");
             }
             current_idx = self.nodes[idx].next_idx;
         }
