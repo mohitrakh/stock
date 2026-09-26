@@ -224,8 +224,26 @@ Full write-up: `docs/tasks/05-failure-safe-atomic-commands.md`.
 - Internal faults stop further processing and are exposed as unavailable rather than ordinary validation errors.
 - `cargo fmt -- --check` passes and `cargo test` passes 76 tests.
 
+## Completed Milestone - Committed mmap Event Stream
+
+Full write-up: `docs/tasks/06-mmap-committed-event-stream.md`.
+
+- [x] Keep the durable journal authoritative and the exchange core single-owner.
+- [x] Serialize each input/output batch once; synchronize it, commit core state, then publish it.
+- [x] Use a fixed-size mmap window with a committed byte/sequence watermark.
+- [x] Provide independent readers with their own sequence and byte positions.
+- [x] Catch up from the read-only journal after window overwrite, oversize batches, or restart.
+- [x] Reject corrupt/incomplete records, sequence gaps, duplicates, mismatched journals, and invalid checkpoints.
+- [x] Recover the durable-but-not-yet-published suffix after writer restart.
+- [x] Enforce one journal writer and fail closed on publication errors.
+- [x] Wire production startup and add a separate CLI probe with optional checkpoint and live following.
+- [x] Test multiple readers, separate processes, SIGKILL boundaries, append/publication failures, and executable checkpoint resume.
+- [x] Update architecture, task, and project documentation.
+
+Verified on 2026-09-26: `cargo fmt -- --check`; `cargo test` passes 92 unit tests and 2 executable integration tests. This milestone supplies a synchronized same-host transport, not lock-free latency, machine-crash durability of mmap, market data, reporting, or replication. Existing clippy warnings remain repository-wide work.
+
 ## Next Milestone
 
-Not selected yet. The next discussion should choose the first consumer of the committed event stream: market data, reporting, or hot-warm replication. Do not begin that work until its boundary and acceptance test are agreed.
+Not selected yet. The committed mmap stream and diagnostic reader now exist. Discuss the first business subscriber and its acceptance test before implementing it. Market data, reporting, and hot-warm replication need different projections and failure handling.
 
-Do not automatically begin snapshots, group commit, mmap, ring buffers, UDP, CPU pinning, multiple component threads, or per-symbol partitioning.
+Do not automatically begin snapshots, group commit, lock-free ring buffers, UDP, CPU pinning, multiple trading-component threads, or per-symbol partitioning.

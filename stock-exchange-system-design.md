@@ -1,5 +1,7 @@
 # Chapter 29: Stock Exchange
 
+> Repository status, 2026-09-26: this document remains the target architecture. The implementation now has atomic prepare/commit processing, a durable journal, and an outbound committed mmap stream with independent readers and journal catch-up. Its mmap window uses cooperative file locks; it does not yet provide the lock-free latency, mmap ingress, market-data publisher, reporting, or hot-warm replication described below. See `SYSTEM_DOCUMENTATION.md` and `docs/tasks/06-mmap-committed-event-stream.md` for the implemented boundary and tested guarantees.
+
 In this chapter, we design an electronic stock exchange system.
 
 The basic function of an exchange is to facilitate the matching of buyers and sellers efficiently. This fundamental function has not changed over time. Before the rise of computing, people exchanged tangible goods by bartering and shouting at each other to get matched. Today, orders are processed silently by supercomputers, and people trade not only for the exchange of products, but also for speculation and arbitrage. Technology has greatly changed the landscape of trading and exponentially boosted electronic market trading volume.

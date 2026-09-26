@@ -1,445 +1,158 @@
-# Stock Trading System - Current Implementation Documentation
+# Stock Exchange - Current Implementation
 
-This document describes the code that exists now. `stock-exchange-system-design.md` describes the long-term target, while `PROJECT_DIRECTION.md` records completed milestones and the next task.
+Verified against this checkout on 2026-09-26. This file describes implemented behavior. `stock-exchange-system-design.md` is the target architecture; `PROJECT_DIRECTION.md` is the milestone journal.
 
----
+## Ownership and command flow
 
-## 🏗️ System Architecture Overview
+Axum handlers send `ExchangeCommand` values through a bounded Tokio queue (10,000 commands) to one dedicated exchange-worker thread. Commands may carry a temporary `oneshot` reply channel. Persisted `ExchangeEvent` values contain only replayable business data.
 
-Axum acts as the gateway. It sends live `ExchangeCommand` values to one dedicated worker. `ExchangeRuntime` converts those commands into replayable events, records them in memory, invokes `ExchangeCore`, records output events, and returns live results through `oneshot` channels.
+`ExchangeRuntime` owns the receiver, core, durable event store, mmap stream writer, full in-memory event history, and next journal sequence. `ExchangeCore` owns the order manager, matching engine, and matching sequencer. The core does not access files, databases, queues, or HTTP.
 
-Every processed command is written to an append-only event log file before the client is answered, and application startup rebuilds the exchange from that file through deterministic replay. `main` calls `recover_runtime`, which opens the log, replays it, and refuses to start on any history it cannot trust.
+A mutating command follows this order:
 
-```mermaid
-graph TD
-    HTTP[Axum HTTP handlers] --> CMD[ExchangeCommand queue]
-    CMD --> RT[ExchangeRuntime]
-    RT --> LOG[In-memory EventEnvelope log]
-    RT --> CORE[ExchangeCore]
-    CORE --> OM[OrderManager]
-    CORE --> SEQ[Sequencer]
-    CORE --> ME[MatchingEngine]
-    OM --> RM[RiskManager]
-    OM --> W[Wallet]
-    ME --> OB[OrderBook (per Symbol)]
-    OB --> PL[PriceLevel]
-    PL --> N[Node (Doubly Linked List)]
-    N --> O[Order]
+```text
+prepare and validate the entire transition without changing live state
+  -> number input and outputs as one batch
+  -> serialize once, append to journal, sync_all
+  -> commit the prepared core transition
+  -> extend in-memory history and advance journal sequence
+  -> publish the complete batch and committed watermark through mmap
+  -> notify local execution callbacks
+  -> answer the waiting HTTP request
 ```
 
-### Current Flow of an Order Placement
+Preparation includes every fill and cumulative settlement effect. Business rejections produce a durable input/rejection batch without changing trading state or consuming matching sequence. Internal faults halt processing; they are not recorded as ordinary client rejections.
 
-1. The HTTP handler creates `ExchangeCommand::PlaceOrder` with a temporary reply channel.
-2. `ExchangeRuntime` appends `NewOrderRequested` to its in-memory event log.
-3. `ExchangeCore` asks `OrderManager` to check duplicates, risk, and wallet funds.
-4. `ExchangeCore` obtains the next matching sequence from `Sequencer`.
-5. `ExchangeCore` registers the sequenced order with `OrderManager` before calling `MatchingEngine`.
-6. `ExchangeCore` gives returned executions to `OrderManager` for lifecycle updates and wallet settlement.
-7. `ExchangeRuntime` appends `OrderAccepted` or `OrderRejected`, followed by any `ExecutionCreated` events.
-8. The runtime sends the live result back through the command's `oneshot` channel.
+An append error leaves the live core, journal sequence, in-memory history, callbacks, and mmap publication unchanged. Disk outcome can be ambiguous after an I/O error, so the writer stops and recovery decides whether a complete record survived. A publication error occurs after durable/core commit: the writer also stops, but the command can appear on recovery. An unavailable response is therefore not proof that a command did not happen.
 
-All of these core calls run synchronously on the existing single exchange-worker thread. Logical component separation did not introduce internal channels or component threads.
+The worker closes its receiver on exit. `AppState.exchange_available` becomes false, and `/health` returns 503. While the worker is available, health returns 200. This flag is not a full readiness/latency monitor.
 
-### Read Path
+## Core components
 
-`ExchangeCommand::GetBalance`, `GetOrder`, and `GetOrderBook` travel the same bounded queue to the same worker, because the worker owns the state a read has to touch. `handle_command` answers them directly from `ExchangeCore` and returns through the command's `oneshot`.
+| Component | Ownership and current role |
+|---|---|
+| `ExchangeCore` | Coordinates read-only preparation and infallible installation of validated plans. |
+| `OrderManager` | Owns lifecycle records, cash wallet, share positions, risk usage, execution indexes, and local execution callbacks. |
+| `MatchingEngine` | Owns symbol books and order-to-symbol lookup. Prepares matching/cancellation against a clone of the affected book, then installs it at commit. |
+| `OrderBook` | Holds bid/ask price levels and order-node lookup; matches price/time priority while skipping self trades. |
+| `PriceLevel` / `Node` | Maintain FIFO order at a price through indexed linked nodes. |
+| `Sequencer` | Supplies a candidate matching sequence with `peek`; `commit` advances it only when the prepared order/cancellation commits. |
 
-They are **not** mirrored by an `ExchangeInputEvent` and never reach the event log. A read mutates nothing, so recording it would make every future replay longer without changing any outcome. `queries_do_not_append_to_the_event_log` enforces this.
+The production path uses `prepare_add_order` / `commit_add_order` and `prepare_cancel_order` / `commit_cancel_order`. It does not use the former mutating `prepare_order -> apply_executions -> complete_cancel` path.
 
-HTTP surface:
+The order manager's `prepare_new_order` validates execution pairs, cumulative fills, projected cash/shares, collateral, risk, lifecycle changes, and execution views. `prepare_cancel_plan` validates ownership, state, and collateral release. Their commit methods install the prepared values. Preparation clones the affected symbol book, not the entire exchange.
 
-| Method | Path | Auth |
+## Prices, collateral, risk, and fills
+
+`Price(u64)` stores positive integer minor units. The API also uses integer minor-unit prices: with cents, 1025 represents $10.25. Checked arithmetic protects notionals and ledger credits. One shared price/currency scale is assumed; product tick-size and currency metadata are not implemented.
+
+A buy reserves its limit-price notional. A sell reserves shares. Settlement transfers cash from buyer to seller and shares from seller to buyer, releases price improvement for buys, and adjusts both orders' remaining quantity. The whole command is validated before any settlement is committed. Cancellation releases the unfilled collateral and eligible risk allowance.
+
+`RiskManager` tracks limits and usage by user/symbol. The default daily cap is 1,000,000 shares. Accepted submissions count toward it; cancellation returns the unfilled allowance. The effective trading day comes from the recorded order timestamp, in UTC 86,400-second buckets, and only advances. Preparation uses `check_read_only`; accepted commit records usage and advances the day. Limit changes are journaled events. There are no market calendars or portfolio-wide limits, and the current API allows a trader to set their own cap.
+
+Orders have new, partially-filled, filled, or canceled lifecycle states. Executions record each party's side and are indexed for account queries. The two execution-side records for a match must not later be counted as two distinct market trades by a market-data consumer.
+
+`client_order_id` is optional, trimmed, and 1-64 characters. A provided value becomes the order id; duplicate ids are rejected instead of opening another order. Generated ids use UUIDs. This is order-specific duplicate protection, not general idempotency for deposits, cancellations, or all HTTP commands.
+
+## Events and replay
+
+`ExchangeInputEvent` covers cash deposits, share deposits, risk-limit changes, new orders, and cancellations. `ExchangeOutputEvent` covers their results and executions. `EventEnvelope.seq_num` is the contiguous journal sequence across inputs and outputs.
+
+Journal sequence and matching sequence are different domains. A command may emit several envelopes, while accepted orders/cancellations consume matching sequences. Subscriber checkpoints use journal sequence.
+
+`prepare_input_event` computes the result, outputs, and prepared core change. `replay_event_log` validates contiguous journal sequencing from 1, prepares each recorded input, compares regenerated outputs with the following recorded outputs, then commits that plan. Recorded outputs are checked rather than applied a second time. Replay does not publish callbacks.
+
+Replay rejects missing/unexpected outputs, output mismatches, and sequence mismatches. It requires full history from an empty core. There are no snapshots or partial-core recovery.
+
+## Durable event store
+
+`src/exchange/event_store.rs` owns journal mutation. Independent subscribers have a separate read-only handle; they never call the recovery opener.
+
+The format is an 8-byte `EXCHLOG1` header, followed by records:
+
+```text
+payload length (u32 LE) | CRC-32 (u32 LE) | JSON Vec<EventEnvelope>
+```
+
+Each record contains exactly one input and its outputs. The maximum JSON payload is 64 MiB. The runtime calls `encode_record` before persistence and passes those same bytes to `append_record` and later mmap publication. `append_record` uses `write_all` and `sync_all`.
+
+`EventStore::open` acquires a nonblocking exclusive lifetime file lock, validates the header and records, and truncates an incomplete final frame. Complete records with invalid checksums, JSON, or command shape cause refusal. Deterministic replay then checks business correctness. Two writers cannot recover or append to the same journal concurrently through this API.
+
+New journal files are created with mode 0600, and initialization synchronizes both the file and parent directory. Existing file permissions are unchanged. Ownership is explicitly unlocked on drop; OS process death also releases the lock.
+
+The journal remains one unbounded file. Startup reads it into memory, and the runtime retains a full event vector. There is one fsync per command.
+
+## Committed mmap stream and readers
+
+`src/exchange/event_stream.rs` implements a separate, fixed-size, same-host delivery cache. The server uses 4 MiB of payload space plus an 80-byte header. The journal remains the durability source. No mmap flush is required for acceptance, and the cache is never used to rebuild authoritative core state.
+
+The header binds the stream to the journal's device/inode and publishes the committed journal byte end, last envelope sequence, and cache window bounds. A header checksum, an atomic ready marker, and per-record checksums detect interrupted or damaged publication. Shared/exclusive file locks protect raw mapped copies. Unsafe pointer access is confined to the module and documented; no mapped references escape it.
+
+The writer appends complete framed batches into the window. When the window fills, it starts a new window. An oversized batch bypasses the cache while still advancing the committed journal watermark. Readers never pin old windows or require a delivery acknowledgment from the writer.
+
+`StreamReader::open(journal, stream, checkpoint)` opens the journal read-only and maps the stream read-only. Each reader owns its position. `next_batch` returns one complete validated batch, or `None` when caught up. It copies the needed record under a shared lock, releases the lock, then validates/deserializes. Consumer processing runs outside the lock.
+
+If the required batch is no longer cached, the reader reads the framed journal record only up to the published watermark. Merely appended but unpublished bytes are invisible. The same byte/sequence cursor drives catch-up and live reading, eliminating a separate handoff race. Corruption, gaps, duplicates, invalid checkpoints, regressed watermarks, and wrong journal identity produce errors without silently skipping events.
+
+`ReaderCheckpoint` stores journal identity, the next envelope sequence, and the next record byte offset. Opening with a checkpoint scans and validates record boundaries from the beginning. Consumers should atomically persist projection state with their checkpoint. The reader API alone cannot guarantee exactly-once external side effects.
+
+This implementation is synchronized, not lock-free. A reader paused while copying can delay publication. It uses JSON, file-lock system calls, and polling; no target throughput or sub-microsecond latency has been established.
+
+## Startup and recovery
+
+Production `main` calls `recover_runtime_with_stream` before binding the HTTP listener. It acquires the journal, repairs a torn tail, deterministically rebuilds the core, then initializes the mmap watermark from the entire validated journal. The recovered cache initially contains no payload, so readers recover old batches from disk and then follow newly cached batches.
+
+A process killed after durable append but before publication leaves a recoverable command. A kill during cache copying leaves the ready marker unset; readers refuse that snapshot. Writer restart reconstructs publication from the journal. An already-running reader can continue across writer restart while the same files remain in place.
+
+| Setting | Default |
+|---|---|
+| `EVENT_LOG_PATH` | `exchange-events.log` |
+| `EVENT_STREAM_PATH` | `EVENT_LOG_PATH` plus `.mmap` |
+| HTTP listener | `127.0.0.1:4000` |
+
+A path under `/dev/shm` may be selected for the stream; it is volatile and is not the journal. A persistent-path mmap still does not become the recovery authority. Do not modify, truncate, unlink, or replace files while mapped. All participating programs must obey the protocol; these are advisory locks and trusted local files, not a hostile-process boundary.
+
+If the disposable cache is missing, startup recreates it. If it has an incompatible identity/size/magic, startup refuses instead of overwriting it. Stop all writers and readers before removing only that cache and restarting the writer. Reopen readers afterward; preserve the journal and checkpoints. A checkpoint for a replaced/copied journal is refused rather than guessed compatible. Network filesystems and cross-host readers are outside the supported model.
+
+## Diagnostic subscriber
+
+The probe is an independent process and runs before database setup:
+
+```sh
+cargo run -- --event-probe exchange-events.log exchange-events.log.mmap /tmp/stock-reader.json --once
+```
+
+Start the exchange writer at least once so the stream exists. The probe prints one JSON array per complete command. Omit `--once` to follow live publication (10 ms idle polling). Omit the checkpoint path to start at sequence 1.
+
+An optional checkpoint is saved through a temporary file, file synchronization, atomic rename, and parent-directory synchronization. It is saved after stdout is flushed. A crash between output and checkpoint can repeat a batch; this diagnostic output is at-least-once across such a restart. Use one checkpoint file per consumer. The probe exits nonzero on invalid data and never repairs or truncates the journal.
+
+Raw events contain private account/order details. New stream files are mode 0600. The probe is an internal debugging tool, not a public market-data feed. A future MDP must build the appropriate projection and public schema.
+
+## HTTP read and write surface
+
+Queries use the same queue and single owner, returning through oneshot without adding journal or stream events. Existing HTTP reads do not use the mmap reader.
+
+| Method | Path | Access |
 |---|---|---|
-| `POST` | `/exchange/deposit` | required |
-| `POST` | `/exchange/orders` | required, returns an `OrderView` |
-| `POST` | `/exchange/orders/cancel` | required |
-| `POST` | `/exchange/shares/deposit` | required |
-| `GET` | `/exchange/balance` | required |
-| `GET` | `/exchange/positions` | required |
-| `GET` | `/exchange/executions?symbol=&order_id=&start_time=&end_time=` | required, own fills only; all filters optional |
-| `POST` | `/exchange/risk/limits` | required, sets the caller's own daily cap |
-| `GET` | `/exchange/risk/limits?symbol=` | required |
-| `GET` | `/exchange/orders/{order_id}` | required, owner only (404 otherwise) |
-| `GET` | `/exchange/orderbook/{symbol}?depth=N` | public; depth defaults to 10, capped at 50 |
-
-## Exchange Core (`src/exchange/core.rs`)
-
-`ExchangeCore` is the synchronous coordinator for the critical trading path. It owns `OrderManager`, `Sequencer`, and `MatchingEngine`.
-
-For a new order, it asks `OrderManager` to validate and reserve the order, assigns the matching sequence, registers the order, calls `MatchingEngine`, and gives the returned executions back to `OrderManager`.
-
-For a cancellation, it validates ownership and lifecycle state, assigns the matching sequence, removes the order from `MatchingEngine`, and then tells `OrderManager` to unlock funds and mark the order canceled.
-
-`AddOrderOutcome` belongs to this layer because it combines results from lifecycle management, sequencing, and matching.
-
-## Event Runtime (`src/exchange/runtime.rs`)
-
-`ExchangeRuntime` owns the command receiver, `ExchangeCore`, in-memory event log, and the next event-log sequence number.
-
-`ExchangeCommand` belongs to the live HTTP boundary because it contains `respond_to`; it is not replayable. `ExchangeEvent` contains business data only, and `EventEnvelope` adds a monotonic `seq_num`.
-
-### Input and Output Events
-
-`ExchangeInputEvent` represents deposit, new-order, and cancellation requests. `ExchangeOutputEvent` represents successful deposits, order acceptance or rejection, successful or rejected cancellations, and created executions. `ExchangeEvent::Input` and `ExchangeEvent::Output` wrap these types in one ordered log. Events, envelopes, and replay-relevant order/execution values support `PartialEq` for comparison.
-
-`process_input_event` takes a mutable core and one input event. It returns `ProcessedInput`, containing the live result and generated output events, without writing the runtime log. Live processing appends the input, calls this shared processor, appends its outputs, and sends the result through the response channel.
-
-### Replay and Recovery
-
-`replay_event_log(&[EventEnvelope])` first checks that envelope sequences are contiguous starting at 1. It then creates a fresh `ExchangeCore` and processes each recorded input through `process_input_event`. Generated outputs must exactly match the following recorded outputs in both value and order. Recorded outputs are checked, not applied to the core a second time.
-
-`ReplayError` distinguishes `EventSequenceMismatch`, `MissingOutput`, `UnexpectedOutput`, and `OutputMismatch`. The rebuilt core is returned only after the entire supplied log passes validation; a failed replay does not return its partially rebuilt core.
-
-`ExchangeRuntime::from_event_log(rx, event_log)` uses that core, retains the supplied log, and sets the next event-log sequence to the last envelope's sequence plus one. An empty log produces a fresh core with next event sequence 1. Matching-input sequencing is reconstructed by replaying core operations and remains distinct from event-log sequencing.
-
-Recovery requires the full history from an empty core, including deposits and orders that affect later inputs. Snapshots and replay from a partial history are not implemented.
-
-## Event Store (`src/exchange/event_store.rs`)
-
-`EventStore` is the only code that touches the log file. `ExchangeCore` never sees it.
-
-On-disk format: an 8-byte magic header `EXCHLOG1` once, then one framed record per processed command — `[len: u32 LE][crc32: u32 LE][JSON payload]`, where the payload is the `Vec<EventEnvelope>` holding that command's input event and every output event it produced. Writing them as one record is what guarantees a crash can never leave an input on disk without its outputs.
-
-`EventStore::open(path)` creates the file if absent, validates the magic, decodes every record, truncates a torn tail left by a crash, and returns the store together with the recovered envelopes. `append(&[EventEnvelope])` frames one batch, writes it with a single `write_all`, and calls `sync_all`; it returns only once the bytes are durable.
-
-Recovery distinguishes damage a crash can cause from damage it cannot. A record that runs past the end of the file is a torn tail: decoding stops there, the file is truncated, and the history before it is accepted. A record whose bytes are all present but whose checksum or JSON fails is corruption: `open` returns `EventStoreError::Corrupt` and the exchange refuses to start.
-
-### Durable-before-visible
-
-`ExchangeRuntime::record_and_process_input_event` processes the input, numbers the input and its outputs as one batch, appends that batch to the store, and only then extends its in-memory log and returns the result. A store failure is fatal: the waiting client receives an "exchange halted" error, `run()` exits its loop, and every later request fails fast with "exchange worker is unavailable". The core has already applied the command in memory and there is no rollback, so continuing would let memory and durable history disagree.
-
-### Startup
-
-`recover_runtime(rx, path)` runs on the main thread before the listener binds. It opens the store, replays the recovered history through `replay_event_log`, and returns an `ExchangeRuntime` that continues both sequence counters and keeps writing to the same store. A `StartupError` — corrupt file, wrong magic, non-contiguous sequence, or outputs that do not match what replay regenerates — prints the reason and exits with status 1. The path comes from `EVENT_LOG_PATH`, default `exchange-events.log`.
-
-### Client order ids
-
-`POST /exchange/orders` accepts an optional `client_order_id` (trimmed, 1–64 characters). When present it becomes the order id, so a retried request collides with `OrderManager`'s existing duplicate check and returns 409 instead of opening a second order. When absent the server mints a uuid.
-
----
-
-## 🗃️ 1. Core Types (`src/types/types.rs`)
-
-This module defines the basic data structures, enums, and primitives used throughout the matching engine and risk/wallet sub-systems.
-
-### `Price` (Struct)
-A positive exact price represented as integer minor units. The prototype uses one shared unit for prices, deposits, balances, locks, and settlement. For example, `1025` represents `$10.25` when the configured minor unit is one cent.
-*   **Fields:**
-    *   `0` (`u64`): Exact minor-unit value.
-*   **Methods:**
-    *   `new(minor_units: u64) -> Result<Price, String>`
-        *   Rejects zero and constructs a positive price.
-    *   `minor_units(self) -> u64`
-        *   Returns the exact integer value used by the gateway and wallet.
-    *   `checked_notional(self, quantity: u64) -> Option<u64>`
-        *   Computes price times quantity without overflow.
-
-### `Side` (Enum)
-Represents the trade direction of an order.
-*   **Variants:**
-    *   `Buy`: Represents a bid order.
-    *   `Sell`: Represents an ask order.
-*   **Methods:**
-    *   `from_str(s: &str) -> Result<Side, String>`
-        *   Converts `"BUY"` or `"SELL"` string slices into the corresponding enum variant.
-
-### `Node` (Struct)
-A node within the doubly-linked list used inside a price level queue.
-*   **Fields:**
-    *   `order` (`Option<Order>`): The resting order stored in this node.
-    *   `prev_idx` (`Option<usize>`): The index of the previous node in the allocation vector.
-    *   `next_idx` (`Option<usize>`): The index of the next node in the allocation vector.
-
-### `Order` (Struct)
-Represents a trading order containing placement specs, volume requirements, and sequencing information.
-*   **Fields:**
-    *   `order_id` (`String`): Globally unique identifier for the order.
-    *   `user_id` (`String`): Identifier of the user placing the order.
-    *   `symbol` (`String`): Asset ticker symbol (e.g., AAPL).
-    *   `side` (`Side`): The buy or sell trade direction.
-    *   `price` (`Price`): Exact limit price in minor units.
-    *   `quantity` (`u32`): Initial requested order quantity.
-    *   `leaves_qty` (`u32`): Remaining unfilled quantity.
-    *   `timestamp` (`f64`): System epoch timestamp when the order was created.
-    *   `seq_num` (`u64`): The unique sequence number assigned to this action.
-*   **Methods:**
-    *   `new(...) -> Result<Order, String>`
-        *   Accepts an integer minor-unit price, validates positive price and quantity, and parses the side string.
-
-### `Execution` (Struct)
-Represents a match event between a buyer and a seller.
-*   **Fields:**
-    *   `execution_id` (`String`): Unique execution ID.
-    *   `buy_order_id` (`String`): The matching buy order ID.
-    *   `sell_order_id` (`String`): The matching sell order ID.
-    *   `symbol` (`String`): The ticker symbol traded.
-    *   `price` (`Price`): Exact execution price copied from the resting order.
-    *   `quantity` (`u32`): The quantity filled.
-    *   `timestamp` (`f64`): The time when matching occurred.
-
----
-
-## 📊 2. Price Level Queue (`src/types/price_level.rs`)
-
-Stores and manages resting orders at a single price point. It uses a vector-backed doubly-linked list (`Vec<Node>`) to support fast updates.
-
-### `PriceLevel` (Struct)
-*   **Fields:**
-    *   `price` (`Price`): Exact price value of this level.
-    *   `nodes` (`Vec<Node>`): The list containing the order nodes.
-    *   `head_idx` (`Option<usize>`): Index pointing to the front of the queue (oldest order).
-    *   `tail_idx` (`Option<usize>`): Index pointing to the back of the queue (newest order).
-    *   `order_map` (`HashMap<String, usize>`): Maps an order ID to its index in `nodes` for $O(1)$ lookups.
-*   **Methods:**
-    *   `new(price: Price) -> PriceLevel`
-        *   Creates an empty price level.
-    *   `append(&mut self, order: Order)`
-        *   Appends a new order to the tail of the queue ($O(1)$ time-priority tracking).
-    *   `remove(&mut self, order_id: &str) -> Option<Order>`
-        *   Removes an order anywhere in the queue by updating the linked list node pointers ($O(1)$ cancel).
-    *   `peek_front(&self) -> Option<&Order>`
-        *   Returns a reference to the order at the front of the queue without removing it.
-    *   `pop_front(&mut self) -> Option<Order>`
-        *   Removes and returns the oldest order (front of queue).
-    *   `is_empty(&self) -> bool`
-        *   Checks if the queue contains any active orders.
-    *   `total_quantity(&self) -> u32`
-        *   Traverses the active queue and returns the sum of `leaves_qty` of all resting orders.
-    *   `first_matchable_mut(&mut self, exclude_user: &str) -> Option<&mut Order>`
-        *   Walks from the head and returns the oldest resting order **not** owned by `exclude_user`. This is what makes self-trade prevention a skip rather than a stop: a self-order at the front of the queue can no longer hide a valid counterparty behind it.
-
----
-
-## 📖 3. Order Book (`src/types/order_book.rs`)
-
-Maintains two separate sides (bid and ask) for a single symbol using self-balancing trees (`BTreeMap`) sorted by price.
-
-### `OrderBook` (Struct)
-*   **Fields:**
-    *   `symbol` (`String`): The ticker symbol.
-    *   `buy_levels` (`BTreeMap<Reverse<Price>, PriceLevel>`): Buy orders sorted by price descending (highest bid first).
-    *   `sell_levels` (`BTreeMap<Price, PriceLevel>`): Sell orders sorted by price ascending (lowest ask first).
-    *   `order_map` (`HashMap<String, (Price, Side)>`): Maps an active order ID to its price and side for $O(1)$ routing.
-    *   `exec_counter` (`u64`): Monotonic counter used to generate unique trade execution IDs.
-*   **Methods:**
-    *   `new(symbol: String) -> OrderBook`
-        *   Initializes a clean, empty order book.
-    *   `best_bid(&self) -> Option<(Price, u32)>`
-        *   Returns the highest bid price and its total depth/quantity.
-    *   `best_ask(&self) -> Option<(Price, u32)>`
-        *   Returns the lowest ask price and its total depth/quantity.
-    *   `cancel_order(&mut self, order_id: &str) -> Option<Order>`
-        *   Locates, removes, and returns the order. Removes the price level map entry if it becomes empty.
-    *   `l2_snapshot(&self, depth: usize) -> (Vec<(Price, u32)>, Vec<(Price, u32)>)`
-        *   Aggregated resting quantity per price level, best price first, capped at `depth` levels per side.
-    *   `match_order(&mut self, order: &mut Order) -> Vec<Execution>`
-        *   Matches an incoming order against resting opposite-side orders. Snapshots the crossing price levels first — `range(..=price)` on the asks, `range(..=Reverse(price))` on the bids, both yielding best price first — then walks them in order. The snapshot matters: self-trade prevention can leave a level standing, so re-reading "the best level" each pass would spin forever on a level holding only the aggressor's own orders.
-    *   `match_at_level(&mut self, order, price, executions)`
-        *   Consumes as much of the aggressor as one price level allows, using `first_matchable_mut` so the aggressor's own resting orders are skipped instead of blocking the match. Emits two `Execution` records per match, one for each side.
-    *   `place_order(&mut self, mut order: Order) -> Vec<Execution>`
-        *   Attempts to match the incoming order. If there is a remaining quantity, appends it as a resting order in the book.
-    *   `is_resting(&self, order_id: &str) -> bool`
-        *   Checks if the order ID is currently resting in the book's map.
-
----
-
-## ⚙️ 4. Matching Engine (`src/types/matching_engine.rs`)
-
-Routes incoming orders and cancellations to the appropriate `OrderBook` and enforces sequence consistency.
-
-### `MatchingEngine` (Struct)
-*   **Fields:**
-    *   `order_books` (`HashMap<String, OrderBook>`): Maps ticker symbols to their respective order books.
-    *   `order_location` (`HashMap<String, String>`): Maps order IDs to their symbol to optimize cancellation lookups.
-    *   `last_seq` (`u64`): The last processed sequence number to guard against out-of-order execution.
-*   **Methods:**
-    *   `new() -> MatchingEngine`
-        *   Creates a new matching engine instance.
-    *   `process_order(&mut self, order: Order) -> Result<Vec<Execution>, String>`
-        *   Validates the sequence number, obtains/creates the symbol's book, places/matches the order, updates `last_seq`, and tracks the location if it becomes a resting order.
-    *   `best_bid_ask(&self, symbol: &str) -> Option<((Price, u32), (Price, u32))>`
-        *   Retrieves the current best bid and ask (prices and quantities) for a given symbol.
-    *   `l2_snapshot(&self, symbol: &str, depth: usize) -> Option<OrderBookView>`
-        *   L2 depth for one symbol as a serializable view, or `None` when no book has been opened for that symbol yet. Backs `GET /exchange/orderbook/{symbol}`.
-    *   `cancel_order(&mut self, order_id: &str, cancel_seq: u64) -> Result<Option<Order>, String>`
-        *   Enforces sequence order, routes the cancel request to the correct order book, updates tracking maps, and updates `last_seq`.
-    *   `is_resting(&self, order_id: &str) -> bool`
-        *   Returns true if the order ID exists in the resting order tracking index.
-    *   `get_order_leaves(&self, order_id: &str) -> Option<u32>`
-        *   Retrieves the remaining unfilled quantity (`leaves_qty`) of a resting order.
-
----
-
-## 🛡️ 5. Risk Manager (`src/types/risk_manager.rs`)
-
-Validates if trading activity stays within allowed constraints to prevent over-exposure.
-
-The cap counts **shares at submission**, not notional and not fills: the check runs before matching, so it cannot know fills that have not happened yet. Counting submissions also prevents a user submitting unlimited orders and exceeding the cap as they fill.
-
-### `RiskManager` (Struct)
-*   **Fields:**
-    *   `limits` (`HashMap<(String, String), u64>`): Maps `(user_id, symbol)` to the daily cap. Absent means `DEFAULT_MAX_DAILY_QUANTITY`.
-    *   `volumes` (`HashMap<(String, String), u64>`): Quantity counted against the current day.
-    *   `current_day` (`Option<i64>`): Which day `volumes` belongs to, as a day number derived from order timestamps.
-*   **Constant:**
-    *   `DEFAULT_MAX_DAILY_QUANTITY` (`u64` = 1,000,000): the design document's own figure, applied when no explicit limit exists. Compiled in rather than configured, because a limit read from the environment would make replay depend on the environment.
-*   **Methods:**
-    *   `set_limit(&mut self, user_id: String, symbol: String, limit: u64)`
-        *   Configures a cap. Reached only through the `RiskLimitSetRequested` event, so limits live in the log and replay exactly.
-    *   `limit_for(&self, user_id, symbol) -> u64` / `used_today(&self, user_id, symbol) -> u64`
-    *   `check(&mut self, order: &Order) -> Result<(), RiskError>`
-        *   Rolls the trading day if this order starts one, then validates against the cap with checked arithmetic. Takes `&mut self` because the day roll is state.
-    *   `record(&mut self, order: &Order)`
-        *   Counts an accepted order against the day, after its collateral is reserved.
-    *   `release(&mut self, order: &Order, quantity: u32)`
-        *   Returns a cancelled order's unfilled allowance. Filled quantity is never returned, so the counter means "traded today, plus currently at risk of trading".
-
-### The trading day, and why it is not the clock
-
-`roll_day` clears the counters when an order's own timestamp crosses into a new day:
-
-```rust
-fn day_of(timestamp: f64) -> i64 { (timestamp / SECONDS_PER_DAY).floor() as i64 }
-```
-
-Resetting from `SystemTime::now()` would break deterministic replay outright — the same log would rebuild different state tomorrow, orders that were accepted would start being rejected, and startup would fail with an `OutputMismatch`. `Order.timestamp` is already recorded in `NewOrderRequested`, so deriving the day from it replays exactly. The roll only moves forward, so gateway clock jitter cannot hand an allowance back twice.
-
-"Day" is a UTC 86,400-second bucket: no market hours, weekends, or holidays.
-
----
-
-## 💳 6. Wallet Ledger (`src/types/wallet.rs`)
-
-Tracks capital, manages buy-side order locks (collateral), and settles balances during executions.
-
-### `Wallet` (Struct)
-*   **Fields:**
-    *   `balances` (`HashMap<String, u64>`): Maps user IDs to total cash balances.
-    *   `locked` (`HashMap<String, u64>`): Maps user IDs to locked/escrowed cash balances.
-*   **Methods:**
-    *   `new() -> Wallet`
-        *   Initializes an empty wallet.
-    *   `deposit(&mut self, user_id: String, amount: u64)`
-        *   Credits cash directly to a user's balance.
-    *   `check_and_lock(&mut self, user_id: &str, side: &Side, price: Price, quantity: u64) -> Result<(), WalletError>`
-        *   For buy orders, computes the exact notional with checked multiplication and lock-reserves it. Sell orders pass through without locking cash.
-    *   `commit_buy_fill(&mut self, user_id: &str, limit_price: Price, execution_price: Price, qty_filled: u64) -> Result<(), WalletError>`
-        *   Atomically settles a buyer at the exact execution price and releases any excess lock caused by price improvement.
-    *   `unlock_funds(&mut self, user_id: &str, side: &Side, price: Price, qty_unlocked: u64) -> Result<(), WalletError>`
-        *   Releases the exact remaining lock during cancellation. Notional overflow is returned as `WalletError::Overflow`.
-
----
-
-## 📦 6b. Positions (`src/types/positions.rs`)
-
-Share holdings per `(user_id, symbol)`, with the same three numbers the wallet keeps for cash: what is held, what is reserved behind resting sell orders, and what remains available to sell.
-
-This is what makes a sell order backed. Before it existed, `Wallet::check_and_lock` returned `Ok(())` for any sell and `apply_execution` credited the seller cash regardless, so a user could sell shares they did not own and be paid for them — cash was created from nothing on every such trade.
-
-### `Positions` (Struct)
-*   **Fields:**
-    *   `holdings` (`HashMap<(String, String), u64>`): `(user_id, symbol)` to shares held.
-    *   `locked` (`HashMap<(String, String), u64>`): shares reserved behind resting sell orders.
-*   **Methods:**
-    *   `credit(&mut self, user_id, symbol, quantity) -> Result<(), PositionError>`
-        *   Adds shares: an external deposit, or the buyer's side of a fill. Reports overflow rather than wrapping, unlike `Wallet::deposit`.
-    *   `check_and_lock(&mut self, user_id, symbol, quantity) -> Result<(), PositionError>`
-        *   Reserves shares behind a sell order, the mirror of locking cash behind a buy.
-    *   `commit_sell_fill(&mut self, user_id, symbol, quantity) -> Result<(), PositionError>`
-        *   Delivers shares on a fill; holding and reservation drop together so the same shares cannot be delivered twice.
-    *   `unlock(&mut self, user_id, symbol, quantity) -> Result<(), PositionError>`
-        *   Releases a cancelled sell order's remaining reservation. The shares were never spent, so only the lock moves.
-    *   `holding` / `locked` / `available` (`-> u64`)
-    *   `holdings_for(&self, user_id) -> Vec<(String, u64, u64)>`
-        *   Every `(symbol, holding, locked)` the user has, sorted by symbol. Backs `GET /exchange/positions`.
-
-### Settlement
-
-`OrderManager::apply_execution` moves four legs per match — the buyer's cash out, the seller's cash in, the seller's shares out, the buyer's shares in. Cash paid equals cash received and shares delivered equals shares received, so neither total changes. Shares move before cash so that a failure, were one ever possible, happens before any money has.
-
-## 🎛️ 7. Order Manager (`src/types/order_manager.rs`)
-
-Owns order lifecycle state, risk checks, wallet reservation, cancellation completion, fill validation, and settlement. It does not own sequencing or order books.
-
-### `OrderState` (Enum)
-*   **Variants:**
-    *   `New`: Fresh order.
-    *   `PartiallyFilled`: Order has matched some shares, but has remaining leaves.
-    *   `Filled`: Order is completely filled.
-    *   `Canceled`: Remaining leaves quantity cancelled.
-
-### `ManagedOrder` (Struct)
-*   **Fields:**
-    *   `order` (`Order`): The core order.
-    *   `state` (`OrderState`): Current order state.
-    *   `remaining_quantity` (`u32`): Outstanding quantity to match.
-
-### `OrderManager` (Struct)
-*   **Fields:**
-    *   `orders` (`HashMap<String, ManagedOrder>`): Stores all historical and active orders.
-    *   `risk_manager` (`RiskManager`): Manages risk checks.
-    *   `wallet` (`Wallet`): Manages cash balances.
-    *   `execution_callbacks` (`Vec<Box<dyn Fn(Execution)>>`): List of subscriber callbacks triggered upon trade match.
-*   **Methods:**
-    *   `new() -> OrderManager`
-        *   Creates a fresh lifecycle manager, risk manager, and wallet.
-    *   `prepare_order(&mut self, order: Order) -> Result<Order, OrderManagerError>`
-        *   Rejects duplicates, runs risk checks, locks wallet funds, and records accepted risk volume before sequencing.
-    *   `register_order(&mut self, order: Order)`
-        *   Stores the sequenced order before matching so immediate executions can update both orders.
-    *   `apply_executions(&mut self, executions: &[Execution]) -> Result<(), OrderManagerError>`
-        *   Validates fills, settles wallets, updates order states, and triggers execution callbacks.
-    *   `validate_cancel_for_user(&self, order_id: &str, user_id: &str) -> Result<(), OrderManagerError>`
-        *   Validates order existence, ownership, and non-terminal state before cancellation sequencing.
-    *   `complete_cancel(&mut self, order_id: &str) -> Result<(), OrderManagerError>`
-        *   Unlocks remaining funds and records the canceled state after matching-engine removal succeeds.
-    *   `record_fill(&mut self, order_id: &str, filled_qty: u32) -> Result<(), OrderManagerError>`
-        *   Internal helper. Updates remaining quantity, transitions lifecycle states, and processes wallet adjustments.
-    *   `get_state(&self, order_id: &str) -> Option<OrderState>`
-        *   Inspects the lifecycle state of an order.
-    *   `order_view(&self, order_id: &str, user_id: &str) -> Option<OrderView>`
-        *   The client-facing view of one order: quantity, filled, remaining, status, price, creation time. Returns `None` when the order does not exist **or belongs to someone else** — a non-owner gets the same answer as a missing order, so order ids cannot be probed for existence.
-    *   `balance_view(&self, user_id: &str) -> BalanceView`
-        *   Balance, locked, and available cash for one user.
-    *   `subscribe<F>(&mut self, callback: F)`
-        *   Subscribes listener closures to receive execution notices.
-
----
-
-## ⏱️ 8. Sequencer (`src/sequencer.rs`)
-
-Generates monotonic sequence numbers to serialize instructions.
-
-### `Sequencer` (Struct)
-*   **Fields:**
-    *   `next_seq` (`u64`): The next sequence number to assign.
-*   **Methods:**
-    *   `new(start_seq: u64) -> Sequencer`
-        *   Creates a sequencer starting from the specified number.
-    *   `next(&mut self) -> u64`
-        *   Returns the current sequence number and increments the counter by 1.
-
----
-
-## 🗄️ 9. Database & State (`src/db.rs` & `src/state.rs`)
-
-Simple connection utilities for PostgreSQL backing.
-
-### `connect_db` (Function in `src/db.rs`)
-*   `connect_db() -> PgPool`
-    *   Reads `DATABASE_URL` from the environment, sets up a connection pool, and returns it.
-
-### `AppState` (Struct in `src/state.rs`)
-*   **Fields:**
-    *   `db` (`PgPool`): The shared SQLx connection pool shared across web routes.
-    *   `tx` (`Sender<ExchangeCommand>`): Bounded command-queue sender used by HTTP handlers to reach the single exchange worker.
-
----
-
-## Current Verification
-
-As of 2026-09-16, `cargo fmt -- --check` passes and `cargo test` passes 70 tests with no failures. Position coverage includes rejection of unbacked and oversized sells, reservation and release behaviour, resale of shares received in a fill, and `a_fill_creates_no_cash_and_no_shares`, which asserts that total cash and total shares are unchanged across a partial fill. Event-store coverage includes the CRC-32 check vector, write/read symmetry across reopen, torn-tail truncation, refusal of a flipped byte and of a foreign file, a real write failure reported rather than swallowed, a three-run restart that verifies balances, locks, order state, book, and both sequence counters, and refusal of a well-formed record whose recorded outcome does not replay. The restart flow was additionally exercised live across two hard kills, a torn log, and a corrupted log; see `docs/tasks/02-durable-event-log.md`. These cover the exchange-core lifecycle, matching, exact minor-unit prices, wallet settlement, cancellation, rejected-operation sequence behavior, and sequential consumption of the runtime event log.
-
-Replay coverage includes deterministic output generation, all four replay error categories, reconstruction of matching state with sequence continuation, and live processing after runtime recovery. The recovery test rebuilds an eight-event deposit/partial-fill history and verifies a live cancellation at event sequences 9 and 10 with matching sequence 3.
-
-Read-path coverage includes self-trade prevention filling the next user rather than stopping, the book never being left crossed against a matchable counterparty, a level of only the aggressor's own orders not blocking a worse level, queries leaving the event log untouched, ownership isolation on order reads, exact JSON shapes for all three views, and axum route construction. The HTTP surface was additionally exercised against a running server; see `docs/tasks/01-observable-exchange.md`.
+| POST | `/exchange/deposit` | authenticated |
+| POST | `/exchange/shares/deposit` | authenticated |
+| POST | `/exchange/orders` | authenticated; returns order view |
+| POST | `/exchange/orders/cancel` | authenticated |
+| POST | `/exchange/risk/limits` | authenticated; caller's cap |
+| GET | `/exchange/balance` | caller's balance |
+| GET | `/exchange/positions` | caller's shares and reservations |
+| GET | `/exchange/executions?symbol=&order_id=&start_time=&end_time=` | caller's fills; optional filters |
+| GET | `/exchange/risk/limits?symbol=` | caller's limit/usage |
+| GET | `/exchange/orders/{order_id}` | owner only; non-owner also gets 404 |
+| GET | `/exchange/orderbook/{symbol}?depth=N` | public L2 snapshot; depth defaults to 10, capped at 50 |
+| GET | `/health` | public worker availability |
+
+PostgreSQL and SQLx support user registration/login. `AppState` holds the database pool, command sender, and worker availability flag. Database calls are outside matching, sequencing, journal recovery, and subscriber delivery.
+
+## Verification and remaining scope
+
+`cargo fmt -- --check` and `cargo test` pass: 92 unit tests plus 2 executable integration tests. New coverage includes independent fast/slow readers, window overwrite, oversize batches, checkpoint boundary/identity validation, cache/journal corruption, competing writers, durable-but-unpublished recovery, failed append with no publication, fatal publication failure, real cross-process reading, SIGKILL at publication boundaries, and probe output/checkpoint resume without PostgreSQL.
+
+These tests include core/runtime and actual executable checks; they do not claim a new full HTTP/database deployment test, machine power-loss testing, or performance benchmarking. Clippy still reports existing compatibility/dead-code and style issues.
+
+Market-data publishing, candles, reporting projections, hot-warm replication, cross-host recovery, mmap ingress, lock-free queues, snapshots, group commit, and CPU pinning remain separate milestones.

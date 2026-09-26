@@ -3,7 +3,8 @@ use std::path::Path;
 use crate::{
     exchange::{
         core::{CoreError, ExchangeCore, PreparedAddOrder, PreparedCancelOrder},
-        event_store::{EventStore, EventStoreError},
+        event_store::{EventStore, EventStoreError, encode_record},
+        event_stream::{DEFAULT_CAPACITY, StreamWriter},
     },
     types::{
         exchange_event::{EventEnvelope, ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent},
@@ -19,20 +20,21 @@ pub struct ExchangeRuntime {
     /// `None` runs the exchange in memory only, which is what the unit tests and
     /// `ExchangeRuntime::new` want. The server always supplies a store.
     store: Option<EventStore>,
+    stream: Option<StreamWriter>,
 }
 
-/// Why the exchange refused to start. Both variants mean the same thing operationally: there is
-/// history on disk that cannot be trusted, so starting would either lose it or build state that
-/// disagrees with it.
+/// Startup refuses untrustworthy history or an unusable committed-event stream.
 #[derive(Debug)]
 pub enum StartupError {
     Store(EventStoreError),
     Replay(ReplayError),
+    Stream(std::io::Error),
 }
 
 #[derive(Debug)]
 enum RuntimeFailure {
     Store(EventStoreError),
+    Stream(std::io::Error),
     Internal(String),
 }
 
@@ -40,6 +42,7 @@ impl std::fmt::Display for RuntimeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Store(error) => write!(f, "event store failure: {}", error),
+            Self::Stream(error) => write!(f, "committed event publication failed: {}", error),
             Self::Internal(reason) => write!(f, "exchange internal fault: {}", reason),
         }
     }
@@ -49,6 +52,7 @@ impl std::fmt::Display for StartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Store(err) => write!(f, "{}", err),
+            Self::Stream(err) => write!(f, "event stream: {}", err),
             Self::Replay(err) => write!(
                 f,
                 "stored history did not replay deterministically: {:?}",
@@ -419,6 +423,7 @@ impl ExchangeRuntime {
             event_log: Vec::new(),
             next_event_seq: 1,
             store: None,
+            stream: None,
         }
     }
 
@@ -456,14 +461,15 @@ impl ExchangeRuntime {
             event_log,
             next_event_seq,
             store,
+            stream: None,
         })
     }
 
     pub fn run(mut self) {
         while let Some(command) = self.rx.blocking_recv() {
             if let Err(err) = self.handle_command(command) {
-                // Fail closed. Preparation has not changed authoritative state, so an event-store
-                // or internal-fault failure leaves the live core at the last committed history.
+                // Fail closed. Store/preparation errors occur before commit. A publication error
+                // occurs AFTER durable commit: recovery must publish that command on restart.
                 eprintln!(
                     "exchange worker halted: {}. No further commands accepted.",
                     err
@@ -673,8 +679,12 @@ impl ExchangeRuntime {
             seq_num += 1;
         }
 
+        // Serialize once before changing state; these exact framed bytes go to disk and mmap.
+        let record = encode_record(&batch).map_err(RuntimeFailure::Store)?;
         if let Some(store) = self.store.as_mut() {
-            store.append(&batch).map_err(RuntimeFailure::Store)?;
+            store
+                .append_record(&record)
+                .map_err(RuntimeFailure::Store)?;
         }
 
         let (result, executions) = prepared.commit(&mut self.core);
@@ -682,6 +692,11 @@ impl ExchangeRuntime {
         // Only now is the command part of history and visible to callbacks.
         self.next_event_seq = seq_num;
         self.event_log.extend(batch);
+        if let Some(stream) = self.stream.as_mut() {
+            stream
+                .append(&record, seq_num - 1)
+                .map_err(RuntimeFailure::Stream)?;
+        }
         self.core.notify_executions(&executions);
 
         Ok(result)
@@ -702,6 +717,25 @@ pub fn recover_runtime(
     let (store, recovered) = EventStore::open(path).map_err(StartupError::Store)?;
 
     ExchangeRuntime::from_store(rx, store, recovered).map_err(StartupError::Replay)
+}
+
+/// Production startup: validate/replay first, then publish the recovered committed prefix.
+/// Never publish merely because a record parsed: replay must also prove its business outputs.
+pub fn recover_runtime_with_stream(
+    rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
+    journal_path: impl AsRef<Path>,
+    stream_path: impl AsRef<Path>,
+) -> Result<ExchangeRuntime, StartupError> {
+    let mut runtime = recover_runtime(rx, journal_path)?;
+    let stream = StreamWriter::open(
+        stream_path,
+        runtime.store.as_ref().unwrap().file(),
+        runtime.next_event_seq - 1,
+        DEFAULT_CAPACITY,
+    )
+    .map_err(StartupError::Stream)?;
+    runtime.stream = Some(stream);
+    Ok(runtime)
 }
 
 #[cfg(test)]
@@ -1417,6 +1451,107 @@ mod tests {
     }
 
     #[test]
+    fn committed_stream_matches_runtime_history_and_survives_restart() {
+        use crate::exchange::event_stream::tests::Fixture;
+        let fixture = Fixture::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let mut reader = fixture.reader();
+        let mut expected = Vec::new();
+        for input in [
+            ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 1000,
+            },
+            share_deposit("seller", 10),
+            ExchangeInputEvent::NewOrderRequested {
+                order: order("sell", "seller", "SELL", 10, 10),
+            },
+            ExchangeInputEvent::NewOrderRequested {
+                order: order("buy", "buyer", "BUY", 10, 5),
+            },
+            ExchangeInputEvent::NewOrderRequested {
+                order: order("buy", "buyer", "BUY", 10, 5),
+            },
+            ExchangeInputEvent::CancelOrderRequested {
+                order_id: "sell".into(),
+                user_id: "seller".into(),
+            },
+        ] {
+            runtime.record_and_process_input_event(input).unwrap();
+            let batch = reader.next_batch().unwrap().unwrap();
+            assert!(matches!(batch[0].event, ExchangeEvent::Input(_)));
+            expected.extend(batch);
+            assert_eq!(expected, runtime.event_log());
+            assert!(reader.next_batch().unwrap().is_none());
+        }
+        let checkpoint = reader.checkpoint();
+        drop(runtime);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let mut resumed = crate::exchange::event_stream::StreamReader::open(
+            &fixture.log,
+            &fixture.bus,
+            Some(checkpoint),
+        )
+        .unwrap();
+        assert!(resumed.next_batch().unwrap().is_none());
+        runtime
+            .record_and_process_input_event(share_deposit("seller", 1))
+            .unwrap();
+        assert_eq!(resumed.next_batch().unwrap(), reader.next_batch().unwrap());
+    }
+
+    #[test]
+    fn failed_durable_append_never_publishes_to_mmap() {
+        use crate::exchange::event_stream::tests::Fixture;
+        let fixture = Fixture::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let mut reader = fixture.reader();
+        runtime.store = Some(EventStore::open_read_only_for_test(&fixture.log).unwrap());
+        assert!(matches!(
+            runtime.record_and_process_input_event(share_deposit("seller", 1)),
+            Err(RuntimeFailure::Store(_))
+        ));
+        assert!(reader.next_batch().unwrap().is_none());
+        assert!(runtime.event_log().is_empty());
+        assert!(runtime.core.position_views("seller").is_empty());
+    }
+
+    #[test]
+    fn publication_failure_halts_worker_but_recovers_the_committed_command() {
+        use crate::exchange::event_stream::tests::Fixture;
+        let fixture = Fixture::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        runtime.stream.as_mut().unwrap().fail_publication_for_test();
+        let mut reader = fixture.reader();
+        let (respond_to, reply) = oneshot::channel();
+        tx.blocking_send(ExchangeCommand::Deposit {
+            user_id: "buyer".into(),
+            amount: 10,
+            respond_to,
+        })
+        .unwrap();
+        runtime.run();
+        assert!(
+            reply
+                .blocking_recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("publication")
+        );
+        assert!(tx.is_closed());
+        assert!(reader.next_batch().unwrap().is_none());
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        assert_eq!(runtime.core.balance_view("buyer").balance, 10);
+        assert_eq!(reader.next_batch().unwrap().unwrap(), runtime.event_log());
+        assert!(reader.next_batch().unwrap().is_none());
+    }
+
+    #[test]
     fn a_durable_exchange_survives_a_restart_and_continues_both_sequences() {
         let path = temp_log_path("restart");
 
@@ -1644,6 +1779,14 @@ mod tests {
             recover_runtime(rx, &path),
             Err(StartupError::Replay(_))
         ));
+
+        let bus = path.with_extension("mmap");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        assert!(matches!(
+            recover_runtime_with_stream(rx, &path, &bus),
+            Err(StartupError::Replay(_))
+        ));
+        assert!(!bus.exists(), "unvalidated history must never be published");
 
         std::fs::remove_file(&path).unwrap();
     }

@@ -1,4 +1,4 @@
-# Project Direction - Next Milestone Not Yet Selected
+# Project Direction - Committed mmap Stream Completed
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -12,14 +12,14 @@ The repository is a learning stock exchange with an exchange-grade architecture 
 
 ## Current Status
 
-The project has a working HTTP-to-exchange boundary, a durable append-only event log with startup recovery, a separated exchange-core pipeline, exact integer price handling, deterministic replay, collateral on both sides of a trade (cash for buys, shares for sells), client-supplied order ids for retry safety, and a read surface that lets a client observe balances, positions, order state, and L2 market data.
+The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log with startup recovery, and a bounded mmap stream with independent readers and durable catch-up. It also has exact integer prices, deterministic replay, collateral on both sides of a trade, client-supplied order ids, and HTTP reads for balances, positions, orders, executions, risk limits, and L2 snapshots. There is no market-data publisher yet.
 
 ```text
 Axum HTTP handler
   -> bounded Tokio mpsc command queue
   -> dedicated exchange worker thread
   -> ExchangeRuntime
-       -> ExchangeCore
+       -> prepare the complete transition through ExchangeCore (no live mutation)
             -> OrderManager
                  -> RiskManager (daily cap; day derived from the order's own timestamp)
                  -> Wallet      (cash: locks a buy's notional)
@@ -28,8 +28,11 @@ Axum HTTP handler
             -> MatchingEngine
                  -> OrderBook
        -> number the input and every output it produced as one batch
-       -> EventStore::append   (one framed record, write_all + sync_all; fatal on failure)
+       -> EventStore::append_record (one framed record, write_all + sync_all)
+       -> commit the prepared core transition
        -> extend the in-memory event log
+       -> publish complete batch and committed watermark through mmap
+       -> notify local execution callbacks
        -> reply through temporary oneshot channel
 
 Axum HTTP handler (reads)
@@ -43,26 +46,27 @@ application startup (main thread, before the listener binds)
   -> EventStore::open      (magic header, length + CRC-32 framing, torn-tail truncation)
   -> replay_event_log      (contiguous sequence, deterministic outputs)
   -> ExchangeRuntime::from_store
+  -> initialize mmap watermark from the validated recovered journal
   -> exit 1 on any history that cannot be trusted; never a silent empty start
 ```
 
 `ExchangeCommand` is live gateway plumbing and may contain `respond_to`. `ExchangeEvent` contains replayable business data and must remain free of HTTP response channels.
 
-`ExchangeRuntime` owns the command receiver, the `EventStore`, and the ordered in-memory `Vec<EventEnvelope>` that mirrors it. `ExchangeCore` owns the deterministic trading components and coordinates their calls; it never touches the file. All core operations still run on the one existing exchange-worker thread.
+`ExchangeRuntime` owns the command receiver, `EventStore`, `StreamWriter`, and the ordered in-memory event history. `ExchangeCore` owns the deterministic trading components; it never touches the files. All core operations still run on one exchange-worker thread. Readers are separate consumers, not additional owners of exchange state.
 
-`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. `recover_runtime` opens the event log file, replays it, and returns a runtime that continues both sequence counters and keeps writing to the same file. `main` calls it before binding the listener and exits with a clear message on any history that cannot be trusted. The path comes from `EVENT_LOG_PATH`, default `exchange-events.log`.
+`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. Production startup calls `recover_runtime_with_stream` before binding the listener. It recovers both sequence domains, then exposes the validated journal prefix to subscribers. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`. The journal is authoritative; the mmap file is a disposable delivery cache.
 
 Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
 
-Latest verified status on 2026-09-16:
+Latest verified status on 2026-09-26:
 
 ```text
 cargo fmt -- --check
 cargo test
-70 passed; 0 failed
+92 unit tests + 2 executable integration tests passed; 0 failed
 ```
 
-The compiler reports four dead-code warnings, all pre-existing: accessors superseded by the view methods, `set_limit` awaiting the risk milestone, and constructors only tests call. The replay machinery is now live from `main`. The restart flow was additionally verified against a running server across two hard kills, a torn log, and a corrupted log.
+Verification includes separate OS-process readers, forced writer kills after append and during publication, reader checkpoint resume, and the actual probe executable without a database. These are local correctness tests, not throughput measurements or a machine-power-loss test. Existing compatibility APIs and repository-wide clippy warnings remain.
 
 ## Completed Milestones
 
@@ -119,7 +123,7 @@ Tests cover exact settlement through a partial fill and cancellation at `1025` m
 
 `ExchangeInputEvent` and `ExchangeOutputEvent` distinguish requests from outcomes inside the common `ExchangeEvent` wrapper. Failed cancellations now produce `CancelRejected`, so their outcomes are recorded as well as returned to the caller.
 
-The shared `process_input_event` function applies one input to a core and returns its live result and output events without writing the log. Live processing records these events; replay uses the same function to rebuild state and compare outputs.
+At this milestone, the shared `process_input_event` function applied inputs and generated outputs for both live processing and replay. Milestone 11 replaced it with `prepare_input_event` plus explicit commit, preserving the shared deterministic logic while moving mutation after durable append.
 
 `replay_event_log` requires contiguous envelope sequence numbers starting at 1. It applies only input events to a fresh `ExchangeCore`, checks the exact values and order of regenerated outputs, and returns the core only after validating the complete supplied history. Sequence mismatches, missing outputs, unexpected outputs, and output mismatches return `ReplayError`.
 
@@ -211,15 +215,15 @@ The regression suite now covers seller-credit overflow, buyer-position overflow,
 
 This milestone deliberately does not start market data, reporting, hot-warm replication, mmap, ring buffers, snapshots, or performance work. Those components must consume committed events after this boundary rather than observe tentative state.
 
-The prior implementation description below is retained as historical context; the prepare/commit path is now the live path.
+### Historical problem and acceptance criteria (resolved in milestone 11)
 
-The current order and cancellation paths are not atomic. A command can change some authoritative state and then fail during a later operation. For a new order, the current path can reserve collateral and risk, consume a matching sequence, register the order, mutate the book, and then settle executions. Settlement changes the seller's shares, buyer's shares, buyer's cash, seller's cash, execution indexes, and order states one operation at a time. If a later balance, position, or invariant check fails, the earlier changes remain.
+The previous order and cancellation paths were not atomic. They could reserve collateral and risk, consume a matching sequence, register an order, mutate the book, and then fail during settlement, leaving earlier changes in place. The current prepare/commit path resolves that failure.
 
-This is a real correctness failure, not only a theoretical edge case. For example, a seller whose cash balance is already at the maximum can sell successfully through the first settlement legs, then fail when the exchange credits the seller. The order is reported as rejected even though shares, cash, order state, book state, reservations, and sequencing may already have changed. A multi-fill order can apply earlier fills before a later fill fails. Cancellation has the same shape because the order is removed from the matching engine before collateral release and lifecycle completion finish.
+This was a real correctness failure. A seller at the maximum cash balance could fail during credit after earlier settlement legs had changed state. Multi-fill orders and cancellation had similar partial-mutation risks. Regression tests now verify that these failures leave authoritative state unchanged.
 
-The runtime currently converts every core error into an ordinary `OrderRejected` or `CancelRejected` output. That incorrectly treats internal arithmetic or invariant failures as client mistakes. It also means replay can reproduce the same partial mutation and the same rejection. Deterministic replay proves that the same result is repeated; it does not prove that the result is correct.
+The old runtime converted every core error into an ordinary rejection. Replay could reproduce the same partial mutation, so determinism alone did not establish correctness. Internal faults now halt processing instead of being recorded as client mistakes.
 
-The milestone must establish this command boundary:
+Milestone 11 established this command boundary:
 
 ```text
 prepare the complete command without mutating authoritative state
@@ -239,9 +243,31 @@ The error boundary is part of the milestone:
 - An event-store append or synchronization failure does not acknowledge a commit. The worker stops, and a restart recovers from the last durable history.
 - Notifications and future subscribers run only after the durable commit boundary, never during tentative settlement.
 
-The first implementation checkpoint is a regression test that forces a late settlement failure and proves that balances, positions, orders, reservations, the book, and the matching sequence remain unchanged. The milestone is complete only when tests also cover buyer-position overflow, a failure in a later fill, cancellation failure after book removal, storage failure before commit, no notification before durability, typed internal-fault handling, and unavailable/503 behavior after worker failure. `cargo fmt -- --check` and `cargo test` must pass before this journal is marked complete.
+The acceptance tests covered late settlement failure, buyer-position overflow, a later-fill failure, cancellation failure, storage failure before commit, no notification before durability, internal-fault handling, and worker unavailability. Those checks remain part of the suite.
 
-Market data remains part of the long-term system-design target, but it is removed from the current milestone. A market-data publisher needs a trustworthy committed event stream before it can safely build live L2 data and candlesticks. Reporting needs the same committed truth for compliance records. Hot-warm needs the same deterministic, failure-safe state transitions before a second engine can safely replay them. These are later consumers of committed events, not substitutes for fixing the command boundary first.
+Market data was deferred while this command boundary was repaired. The following mmap milestone supplies committed delivery; business consumers remain separate work.
+
+## 12. Committed mmap Event Stream
+
+Full write-up: `docs/tasks/06-mmap-committed-event-stream.md`.
+
+The selected task was to connect the existing durable, atomic engine to independent same-host readers before building market data. It is now implemented end to end. Production startup creates a fixed-size 4 MiB cache, and every successful durable/core commit publishes the exact framed batch and its journal byte/sequence watermark. Input and output envelopes remain together, including business rejections. HTTP queries never enter this stream.
+
+Each `StreamReader` has its own checkpoint. Current batches come from mmap; overwritten or oversized batches come from the read-only durable journal, bounded by the published watermark. Catch-up and live reading use the same cursor, so the handoff does not skip or redeliver batches within a reader session. A saved checkpoint is tied to the journal's device/inode and validated against whole-command boundaries. Consumer state and checkpoint must be saved together for transactional processing; the probe's stdout and checkpoint are not one transaction.
+
+The writer owns an exclusive lifetime journal lock. mmap copies use short shared/exclusive file locks, an atomic publication marker, and checksums. Readers release their lock before deserializing or doing consumer work. This is a correctness-first, synchronized implementation, not the target lock-free ring buffer. A paused reader inside its copy can delay the writer; no low-latency claim is made.
+
+A crash after durable append but before publication is recovered by replay and publishing the recovered journal watermark. A failed durable append publishes nothing and commits no live state. A publication failure happens after durable commit and halts the worker; the client's outcome is uncertain until recovery. Interrupted copies are refused rather than consumed as complete data.
+
+Run the diagnostic subscriber independently, without PostgreSQL:
+
+```sh
+cargo run -- --event-probe exchange-events.log exchange-events.log.mmap /tmp/stock-reader.json --once
+```
+
+It prints one JSON array per complete command. Omit `--once` to follow live data; omit the checkpoint path to start at the beginning. This is trusted internal account/order data, not a public market-data feed.
+
+The next milestone has not been selected. Discuss the first business subscriber separately. Market data, reporting, and hot-warm replication have different correctness and recovery requirements; the shared stream supplies their transport foundation, not their completed behavior.
 
 ## Known Prototype Limitations
 
@@ -265,11 +291,15 @@ Market data remains part of the long-term system-design target, but it is remove
 - event-log sequencing and matching-input sequencing remain distinct concepts
 - live HTTP replies still use `oneshot`
 - there is no market-data or reporting consumer
+- mmap is a same-host Unix transport using cooperative file locks, JSON, and a bounded window; it is not lock-free, cross-server replication, or an ingress transport
+- the journal and in-memory history still grow without bound; checkpoint validation scans history on reader restart
+- mmap is not the durable recovery source; never modify, truncate, replace, or unlink mapped files while processes use them
+- consumer crashes require checkpoint/state coordination; arbitrary downstream effects are not exactly-once
 - internal matching and settlement failures are rejected before commit and halt the worker if they cannot be represented as a business rejection
 
 ## What Not To Work On Yet
 
-Until the next milestone is selected and discussed, do not start on snapshots, group commit, Crossbeam, ring buffers, mmap, CPU pinning, component threads, per-symbol workers, market data, reporting, FIX/SBE, UDP, replication, or hot/warm engines. The single append-only file is the event store for now, and it is what the target design's downstream consumers will read from when their turn comes.
+Until the next milestone is selected and discussed, do not start snapshots, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, market data, reporting, FIX/SBE, UDP, replication, or hot/warm engines. The committed mmap reader is ready for a future subscriber; inbound commands still use the existing bounded Tokio queue.
 
 ## Rule For Future Sessions
 

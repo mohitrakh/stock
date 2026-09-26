@@ -1,6 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
 
@@ -9,14 +10,14 @@ use crate::types::exchange_event::EventEnvelope;
 /// Marks the file as an exchange event log and pins the on-disk format. A format change bumps the
 /// trailing digit, so an old file is rejected with a clear message instead of failing somewhere
 /// deep in a JSON parse.
-const FILE_MAGIC: &[u8; 8] = b"EXCHLOG1";
+pub(super) const FILE_MAGIC: &[u8; 8] = b"EXCHLOG1";
 
 /// `[len: u32 LE][crc: u32 LE]` ahead of every payload.
-const RECORD_HEADER_LEN: usize = 8;
+pub(super) const RECORD_HEADER_LEN: usize = 8;
 
 /// Refuses a length field that could only come from corruption, before it is used to size an
 /// allocation.
-const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
+pub(super) const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum EventStoreError {
@@ -52,7 +53,7 @@ impl From<std::io::Error> for EventStoreError {
 ///
 /// Hand-rolled rather than pulled in as a dependency: it is ten lines, and `crc32_matches_known_vector`
 /// pins it to the standard check value so a mistake here cannot go unnoticed.
-fn crc32(data: &[u8]) -> u32 {
+pub(super) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
 
     for &byte in data {
@@ -76,6 +77,15 @@ pub struct EventStore {
     file: File,
 }
 
+impl Drop for EventStore {
+    fn drop(&mut self) {
+        // Explicitly release ownership before closing. A concurrent fork/exec can briefly
+        // inherit the descriptor even with CLOEXEC, otherwise retaining this process's lock
+        // after the owner is dropped and spuriously preventing its immediate restart.
+        let _ = self.file.unlock();
+    }
+}
+
 impl EventStore {
     #[cfg(test)]
     pub(crate) fn open_read_only_for_test(path: impl AsRef<Path>) -> Result<Self, EventStoreError> {
@@ -97,7 +107,12 @@ impl EventStore {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(0o600)
             .open(&path)?;
+
+        // One writer owns recovery/truncation as well as appends. Independent stream readers
+        // never take this lifetime lock; they read only the published, immutable prefix.
+        file.try_lock().map_err(std::io::Error::from)?;
 
         // ponytail: reads the whole log into memory. Fine while history is small; stream it, or
         // add snapshots, when startup time actually starts to hurt.
@@ -107,6 +122,11 @@ impl EventStore {
         if bytes.is_empty() {
             file.write_all(FILE_MAGIC)?;
             file.sync_all()?;
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            File::open(parent)?.sync_all()?;
 
             return Ok((Self { file }, Vec::new()));
         }
@@ -130,32 +150,46 @@ impl EventStore {
 
     /// Writes one command's envelopes as a single framed record and synchronizes it to disk.
     ///
-    /// Returns only once the bytes are durable, so a caller may reply to a client the moment this
-    /// returns `Ok`. A failure means the record is not durable and must be treated as fatal by the
-    /// caller: the core has already moved on in memory, and there is no rollback.
+    /// Returns after synchronization. The runtime then commits its prepared core transition.
+    /// Any error is fatal; an I/O failure has an ambiguous disk outcome and must not be retried
+    /// in this writer. Recovery decides whether a complete record survived.
+    #[cfg(test)]
     pub fn append(&mut self, envelopes: &[EventEnvelope]) -> Result<(), EventStoreError> {
         if envelopes.is_empty() {
             return Ok(());
         }
 
-        let payload = serde_json::to_vec(envelopes).map_err(|err| {
-            EventStoreError::Corrupt(format!("could not serialize record: {}", err))
-        })?;
+        let record = encode_record(envelopes)?;
+        self.append_record(&record)
+    }
 
-        let mut record = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
-        record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        record.extend_from_slice(&crc32(&payload).to_le_bytes());
-        record.extend_from_slice(&payload);
-
+    pub(super) fn append_record(&mut self, record: &[u8]) -> Result<(), EventStoreError> {
         // One write_all, so a partial write can only ever truncate the tail of this record —
         // never interleave with the next one.
-        self.file.write_all(&record)?;
+        self.file.write_all(record)?;
         // ponytail: one fsync per command. Group-commit several records behind one sync when the
         // worker ever has a batch to commit; today it processes one command at a time.
         self.file.sync_all()?;
 
         Ok(())
     }
+
+    pub(super) fn file(&self) -> &File {
+        &self.file
+    }
+}
+
+pub(super) fn encode_record(envelopes: &[EventEnvelope]) -> Result<Vec<u8>, EventStoreError> {
+    let payload = serde_json::to_vec(envelopes)
+        .map_err(|err| EventStoreError::Corrupt(format!("could not serialize record: {err}")))?;
+    if payload.len() > MAX_RECORD_LEN as usize {
+        return Err(EventStoreError::Corrupt("record exceeds size limit".into()));
+    }
+    let mut record = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
+    record.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    record.extend_from_slice(&crc32(&payload).to_le_bytes());
+    record.extend_from_slice(&payload);
+    Ok(record)
 }
 
 /// Walks the framed records after the magic header.
@@ -210,6 +244,18 @@ fn decode_records(bytes: &[u8]) -> Result<(Vec<EventEnvelope>, usize), EventStor
             ))
         })?;
 
+        use crate::types::exchange_event::ExchangeEvent;
+        if batch.len() < 2
+            || !matches!(batch[0].event, ExchangeEvent::Input(_))
+            || batch[1..]
+                .iter()
+                .any(|event| !matches!(event.event, ExchangeEvent::Output(_)))
+        {
+            return Err(EventStoreError::Corrupt(format!(
+                "record at byte {offset} is not one complete input/output batch"
+            )));
+        }
+
         events.extend(batch);
         offset = payload_end;
     }
@@ -252,6 +298,21 @@ mod tests {
         // The canonical CRC-32/ISO-HDLC check value; matches zlib.crc32 exactly.
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn recovery_refuses_records_that_split_one_command_across_frames() {
+        let path = temp_path("split-batch");
+        let (mut store, _) = EventStore::open(&path).unwrap();
+        let batch = deposit_batch(1, 10);
+        store.append(&batch[..1]).unwrap();
+        store.append(&batch[1..]).unwrap();
+        drop(store);
+        assert!(matches!(
+            EventStore::open(&path),
+            Err(EventStoreError::Corrupt(_))
+        ));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

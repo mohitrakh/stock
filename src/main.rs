@@ -32,32 +32,47 @@ mod db;
 mod state;
 use state::AppState;
 
-use crate::exchange::runtime::recover_runtime;
+use crate::exchange::runtime::recover_runtime_with_stream;
 
 const EXCHANGE_COMMAND_QUEUE_SIZE: usize = 10_000;
 const DEFAULT_EVENT_LOG_PATH: &str = "exchange-events.log";
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--event-probe") {
+        if let Err(error) = exchange::event_probe::run(&args[1..]) {
+            eprintln!("event probe: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if !args.is_empty() {
+        eprintln!("usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once]]");
+        std::process::exit(1);
+    }
     dotenv().ok();
     let db = db::connect_db().await;
     let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
 
     let event_log_path =
         std::env::var("EVENT_LOG_PATH").unwrap_or_else(|_| DEFAULT_EVENT_LOG_PATH.to_string());
+    let event_stream_path =
+        std::env::var("EVENT_STREAM_PATH").unwrap_or_else(|_| format!("{event_log_path}.mmap"));
 
     // Recovery happens before the listener binds, and on the main thread. History that cannot be
     // trusted must stop the process, not kill a worker thread and leave a server answering
     // requests it can never fulfil.
-    let runtime = recover_runtime(rx, &event_log_path).unwrap_or_else(|err| {
-        eprintln!("refusing to start: {}", err);
-        eprintln!("event log: {}", event_log_path);
-        eprintln!(
-            "The exchange will not start on history it cannot replay. Move the file aside to \
-             start a new exchange, understanding that its history is then abandoned."
-        );
-        std::process::exit(1);
-    });
+    let runtime = recover_runtime_with_stream(rx, &event_log_path, &event_stream_path)
+        .unwrap_or_else(|err| {
+            eprintln!("refusing to start: {}", err);
+            eprintln!("event log: {}", event_log_path);
+            eprintln!("event stream: {}", event_stream_path);
+            eprintln!(
+                "Resolve the reported error before restarting; preserve the durable history."
+            );
+            std::process::exit(1);
+        });
 
     println!(
         "Event log {} recovered with {} events",

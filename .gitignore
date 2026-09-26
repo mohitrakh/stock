@@ -3,3 +3,5 @@ AGENTS.md
 *.md
 exchange-events.log
 *.log
+*.mmap
+!docs/tasks/06-mmap-committed-event-stream.md
