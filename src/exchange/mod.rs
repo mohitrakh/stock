@@ -1,3 +1,4 @@
+pub mod candles;
 pub mod committed_batch;
 pub mod core;
 pub mod event_probe;

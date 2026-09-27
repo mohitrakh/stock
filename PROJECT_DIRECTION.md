@@ -452,6 +452,27 @@ On a normal start, a valid snapshot restores the core and `EventStore::open_suff
 
 Verified on 2026-09-27: `cargo fmt -- --check`; `cargo test --locked --offline` passes 118 unit tests and 4 executable integration tests. The new tests cover normalized core state, FIFO and sequence continuation, snapshot-plus-suffix recovery, corrupt artifact preservation and full fallback, replacement failure, journal identity, complete suffix boundaries, torn suffix repair, and failed append safety.
 
+## 17. Candlestick Publisher v1
+
+Full write-up: `docs/tasks/12-candlestick-publisher-v1.md`.
+
+MDP now derives one-minute UTC OHLCV candles from the same complete committed batches that feed
+its public L2 book. One adjacent two-sided execution pair is one trade, never two. The bucket uses
+the recorded execution timestamp, floored to its UTC minute; this preserves deterministic replay
+without introducing a clock read into matching or subscriber processing.
+
+The MDP's version-2 state file holds open orders, all derived candle buckets, and one shared
+reader checkpoint. Each batch is applied to candidate L2 and candle projections, then the whole
+state is synchronized and atomically replaced before either in-memory view advances. A restart
+therefore cannot advance the checkpoint without the corresponding candle update. Missing state
+replays from the journal; malformed or version-1 state fails closed and must be rebuilt from the
+authoritative journal.
+
+`GET /marketdata/candles?symbol=&start_time=&end_time=` returns ascending one-minute candles for
+an inclusive epoch-second range. All three parameters are required, `start_time` must not exceed
+`end_time`, and a valid range with no trades returns an empty array. The endpoint shares MDP's
+availability behavior: a terminal stream, projection, or persistence error returns 503.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -473,8 +494,9 @@ Verified on 2026-09-27: `cargo fmt -- --check`; `cargo test --locked --offline` 
 - snapshots rely on the journal file identity and committed boundary; an invalid snapshot falls back to full replay and is retained for diagnosis
 - event-log sequencing and matching-input sequencing remain distinct concepts
 - live HTTP replies still use `oneshot`
-- MDP state rewrites and synchronizes the complete JSON open-order projection after every command; this is correctness-first and not a high-throughput persistence design
-- there is no public reporting API, trade tape, candle service, or historical market-data store
+- MDP state rewrites and synchronizes the complete JSON open-order and candle projection after every command; this is correctness-first and not a high-throughput persistence design
+- candle state retains every one-minute bucket without a retention limit, rollups, or external historical store
+- there is no public reporting API or trade-tape service
 - mmap is a same-host Unix transport using cooperative file locks, JSON, and a bounded window; it is not lock-free, cross-server replication, or an ingress transport
 - the journal still grows without bound; a snapshot-recovered exchange retains only its suffix in memory, while reader checkpoint validation still scans history on reader restart
 - mmap is not the durable recovery source; never modify, truncate, replace, or unlink mapped files while processes use them
@@ -483,7 +505,7 @@ Verified on 2026-09-27: `cargo fmt -- --check`; `cargo test --locked --offline` 
 
 ## What Not To Work On Yet
 
-No next milestone is selected. Do not expand completed snapshot work into candles, tax or customer statements, settlement, historical market-data APIs, journal compaction, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, FIX/SBE, UDP, replication, or hot-warm engines. The committed mmap reader remains the input for both independent subscribers; inbound commands remain on the existing bounded Tokio queue.
+No next milestone is selected. Do not expand the completed candle work into tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, FIX/SBE, UDP, replication, or hot-warm engines. The committed mmap reader remains the input for all independent subscribers; inbound commands remain on the existing bounded Tokio queue.
 
 ## Rule For Future Sessions
 

@@ -312,6 +312,19 @@ Full write-up: `docs/tasks/11-authoritative-core-snapshots.md`.
 
 Verified on 2026-09-27: `cargo fmt -- --check`; `cargo test --locked --offline` passes 118 unit tests and 4 executable integration tests. This is a recovery accelerator only: the journal remains complete and authoritative, with no compaction or subscriber-retention change.
 
+## Completed Milestone - Candlestick Publisher v1
+
+Full write-up: `docs/tasks/12-candlestick-publisher-v1.md`.
+
+- [x] Extend the independent MDP with a deterministic one-minute UTC OHLCV projection from complete committed execution pairs.
+- [x] Count each validated two-sided execution pair as one trade, using its first execution record.
+- [x] Persist L2 orders, all candles, and the shared reader checkpoint in one versioned state replacement.
+- [x] Rebuild both views from journal history when state is absent; fail closed on corrupt, invalid, or incompatible state.
+- [x] Add `GET /marketdata/candles?symbol=&start_time=&end_time=` with required inclusive epoch-second bounds.
+- [x] Verify range validation, journal catch-up, restart without duplicate candle volume, live mmap following, and existing MDP fail-closed behavior.
+
+The bucket timestamp is the recorded execution timestamp floored to a UTC minute. Candles are retained without a limit in v1; resolution rollups, retention, and external historical storage remain separate architecture decisions.
+
 ## Next Milestone
 
-No next milestone is selected. Discuss the next architecture step before implementation. Candles, journal compaction, group commit, lock-free transport, UDP/multicast, CPU pinning, hot-warm replication, and per-symbol partitioning remain separate milestones.
+No next milestone is selected. Discuss the next architecture step before implementation. Journal compaction, group commit, lock-free transport, UDP/multicast, CPU pinning, hot-warm replication, and per-symbol partitioning remain separate milestones.

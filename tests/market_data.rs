@@ -196,6 +196,46 @@ fn accepted_order(
     ]))
 }
 
+fn accepted_buy_with_trade(
+    first_sequence: u64,
+    order_id: &str,
+    quantity: u32,
+    matching_sequence: u64,
+    sell_order_id: &str,
+    price: u64,
+    timestamp: f64,
+) -> Vec<u8> {
+    record(serde_json::json!([
+        {
+            "seq_num": first_sequence,
+            "event": {"direction":"input","event":{"kind":"new_order_requested","data":{"order":{
+                "order_id":order_id,"user_id":"private-buyer","symbol":"AAPL","side":"buy",
+                "price":price,"quantity":quantity,"leaves_qty":quantity,"timestamp":timestamp,"seq_num":0
+            }}}}
+        },
+        {
+            "seq_num": first_sequence + 1,
+            "event": {"direction":"output","event":{"kind":"order_accepted","data":{
+                "order_id":order_id,"seq_num":matching_sequence
+            }}}
+        },
+        {
+            "seq_num": first_sequence + 2,
+            "event": {"direction":"output","event":{"kind":"execution_created","data":{"execution":{
+                "execution_id":format!("{order_id}-buy"),"buy_order_id":order_id,"sell_order_id":sell_order_id,
+                "symbol":"AAPL","price":price,"quantity":quantity,"timestamp":timestamp
+            }}}}
+        },
+        {
+            "seq_num": first_sequence + 3,
+            "event": {"direction":"output","event":{"kind":"execution_created","data":{"execution":{
+                "execution_id":format!("{order_id}-sell"),"buy_order_id":order_id,"sell_order_id":sell_order_id,
+                "symbol":"AAPL","price":price,"quantity":quantity,"timestamp":timestamp
+            }}}}
+        }
+    ]))
+}
+
 fn create_stream(
     journal: &Path,
     stream: &Path,
@@ -412,6 +452,77 @@ fn mdp_catches_up_serves_l2_resumes_state_and_follows_restarted_stream() {
         request(&address, "/marketdata/orderbook/AAPL").unwrap().0,
         503
     );
+    restarted.stop();
+}
+
+#[test]
+fn mdp_catches_up_persists_and_follows_one_minute_candles() {
+    let fixture = Fixture::new();
+    let records = vec![
+        accepted_order(1, "sell-100", "private-seller", "sell", 100, 2, 1),
+        accepted_buy_with_trade(3, "buy-100", 2, 2, "sell-100", 100, 61.9),
+    ];
+    fixture.initialize(&records, 6);
+    let address = unused_address();
+    let mut child = fixture.spawn(&address);
+
+    let (_, body) = wait_for(
+        &mut child,
+        &address,
+        "/marketdata/candles?symbol=AAPL&start_time=0&end_time=119",
+        |status, body| status == 200 && body.contains("trade_count"),
+    );
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        view,
+        serde_json::json!({"symbol":"AAPL","candles":[{
+            "symbol":"AAPL","start_time":60,"open":100,"high":100,"low":100,
+            "close":100,"volume":2,"trade_count":1
+        }]})
+    );
+    assert_eq!(
+        request(
+            &address,
+            "/marketdata/candles?symbol=AAPL&start_time=120&end_time=119"
+        )
+        .unwrap()
+        .0,
+        400
+    );
+    assert_eq!(
+        request(&address, "/marketdata/candles?start_time=0&end_time=119")
+            .unwrap()
+            .0,
+        400
+    );
+    child.stop();
+
+    fixture.reset_stream_after_writer_restart(6);
+    let mut restarted = fixture.spawn(&address);
+    let (_, restarted_body) = wait_for(
+        &mut restarted,
+        &address,
+        "/marketdata/candles?symbol=AAPL&start_time=0&end_time=119",
+        |status, _| status == 200,
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&restarted_body).unwrap(),
+        view
+    );
+
+    let resting = accepted_order(7, "sell-101", "private-seller", "sell", 101, 3, 3);
+    fixture.append_and_publish(&resting, 8);
+    let trade = accepted_buy_with_trade(9, "buy-101", 3, 4, "sell-101", 101, 120.0);
+    fixture.append_and_publish(&trade, 12);
+    let (_, live_body) = wait_for(
+        &mut restarted,
+        &address,
+        "/marketdata/candles?symbol=AAPL&start_time=0&end_time=179",
+        |status, body| status == 200 && body.matches("start_time").count() == 2,
+    );
+    let live: serde_json::Value = serde_json::from_str(&live_body).unwrap();
+    assert_eq!(live["candles"][1]["start_time"], 120);
+    assert_eq!(live["candles"][1]["volume"], 3);
     restarted.stop();
 }
 

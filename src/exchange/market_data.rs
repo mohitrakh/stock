@@ -28,6 +28,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use super::{
+    candles::{Candle, CandleProjection},
     committed_batch::{self, CancelOutcome, CommittedCommand, NewOrderOutcome},
     event_stream::{ReaderCheckpoint, StreamReader},
 };
@@ -36,7 +37,7 @@ use crate::types::{
     types::{Execution, L2Level, Order, OrderBookView, Side},
 };
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 const DEFAULT_ADDR: &str = "127.0.0.1:4001";
 const DEFAULT_DEPTH: usize = 10;
 const MAX_DEPTH: usize = 50;
@@ -348,9 +349,17 @@ struct ProjectionFile {
     version: u32,
     checkpoint: ReaderCheckpoint,
     orders: Vec<ProjectedOrder>,
+    candles: Vec<Candle>,
 }
 
-fn load_state(path: &Path) -> MdResult<(MarketDataProjection, Option<ReaderCheckpoint>, bool)> {
+fn load_state(
+    path: &Path,
+) -> MdResult<(
+    MarketDataProjection,
+    CandleProjection,
+    Option<ReaderCheckpoint>,
+    bool,
+)> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let saved: ProjectionFile = serde_json::from_slice(&bytes)?;
@@ -362,11 +371,15 @@ fn load_state(path: &Path) -> MdResult<(MarketDataProjection, Option<ReaderCheck
                 .into());
             }
             let projection = MarketDataProjection::from_orders(saved.orders).map_err(invalid)?;
-            Ok((projection, Some(saved.checkpoint), true))
+            let candles = CandleProjection::from_candles(saved.candles).map_err(invalid)?;
+            Ok((projection, candles, Some(saved.checkpoint), true))
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Ok((MarketDataProjection::default(), None, false))
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((
+            MarketDataProjection::default(),
+            CandleProjection::default(),
+            None,
+            false,
+        )),
         Err(error) => Err(error.into()),
     }
 }
@@ -374,9 +387,10 @@ fn load_state(path: &Path) -> MdResult<(MarketDataProjection, Option<ReaderCheck
 fn save_state(
     path: &Path,
     projection: &MarketDataProjection,
+    candles: &CandleProjection,
     checkpoint: &ReaderCheckpoint,
 ) -> MdResult<()> {
-    save_state_with_rename(path, projection, checkpoint, |from, to| {
+    save_state_with_rename(path, projection, candles, checkpoint, |from, to| {
         std::fs::rename(from, to)
     })
 }
@@ -384,6 +398,7 @@ fn save_state(
 fn save_state_with_rename<F>(
     path: &Path,
     projection: &MarketDataProjection,
+    candles: &CandleProjection,
     checkpoint: &ReaderCheckpoint,
     rename: F,
 ) -> MdResult<()>
@@ -403,6 +418,7 @@ where
         version: STATE_VERSION,
         checkpoint: checkpoint.clone(),
         orders: projection.persisted_orders(),
+        candles: candles.persisted_candles(),
     };
     let result: MdResult<()> = (|| {
         let mut file = OpenOptions::new()
@@ -458,25 +474,42 @@ fn ensure_safe_state_path(journal: &Path, stream: &Path, state: &Path) -> MdResu
 
 fn apply_and_save(
     current: &MarketDataProjection,
+    current_candles: &CandleProjection,
     batch: &[EventEnvelope],
     checkpoint: &ReaderCheckpoint,
     state_path: &Path,
-) -> MdResult<MarketDataProjection> {
+) -> MdResult<(MarketDataProjection, CandleProjection)> {
     let mut candidate = current.clone();
     candidate.apply_batch(batch).map_err(invalid)?;
-    save_state(state_path, &candidate, checkpoint)?;
-    Ok(candidate)
+    let mut candle_candidate = current_candles.clone();
+    candle_candidate.apply_batch(batch).map_err(invalid)?;
+    save_state(state_path, &candidate, &candle_candidate, checkpoint)?;
+    Ok((candidate, candle_candidate))
 }
 
 #[derive(Clone)]
 struct MarketDataState {
     projection: Arc<RwLock<MarketDataProjection>>,
+    candles: Arc<RwLock<CandleProjection>>,
     available: Arc<AtomicBool>,
 }
 
 #[derive(Deserialize)]
 struct BookQuery {
     depth: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct CandleQuery {
+    symbol: Option<String>,
+    start_time: Option<u64>,
+    end_time: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct CandleView {
+    symbol: String,
+    candles: Vec<Candle>,
 }
 
 async fn health(State(state): State<MarketDataState>) -> impl IntoResponse {
@@ -508,10 +541,44 @@ async fn order_book(
         .ok_or((StatusCode::NOT_FOUND, "market-data symbol not found"))
 }
 
+async fn candle_history(
+    State(state): State<MarketDataState>,
+    Query(query): Query<CandleQuery>,
+) -> Result<Json<CandleView>, (StatusCode, &'static str)> {
+    if !state.available.load(Ordering::Acquire) {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "market data unavailable"));
+    }
+    let start_time = query
+        .start_time
+        .ok_or((StatusCode::BAD_REQUEST, "start_time is required"))?;
+    let end_time = query
+        .end_time
+        .ok_or((StatusCode::BAD_REQUEST, "end_time is required"))?;
+    if start_time > end_time {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "start_time must not exceed end_time",
+        ));
+    }
+    let symbol = query
+        .symbol
+        .filter(|symbol| !symbol.trim().is_empty())
+        .ok_or((StatusCode::BAD_REQUEST, "symbol is required"))?;
+    let projection = state
+        .candles
+        .read()
+        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "market data unavailable"))?;
+    Ok(Json(CandleView {
+        candles: projection.candles_in_range(&symbol, start_time, end_time),
+        symbol,
+    }))
+}
+
 fn follow(
     mut reader: StreamReader,
     state_path: PathBuf,
     projection: Arc<RwLock<MarketDataProjection>>,
+    candles: Arc<RwLock<CandleProjection>>,
 ) -> MdResult<()> {
     loop {
         match reader.next_batch()? {
@@ -520,11 +587,23 @@ fn follow(
                     .read()
                     .map_err(|_| invalid("market-data projection lock poisoned"))?
                     .clone();
-                let candidate =
-                    apply_and_save(&current, &batch, &reader.checkpoint(), &state_path)?;
+                let current_candles = candles
+                    .read()
+                    .map_err(|_| invalid("market-data candle lock poisoned"))?
+                    .clone();
+                let (candidate, candle_candidate) = apply_and_save(
+                    &current,
+                    &current_candles,
+                    &batch,
+                    &reader.checkpoint(),
+                    &state_path,
+                )?;
                 *projection
                     .write()
                     .map_err(|_| invalid("market-data projection lock poisoned"))? = candidate;
+                *candles
+                    .write()
+                    .map_err(|_| invalid("market-data candle lock poisoned"))? = candle_candidate;
             }
             None => thread::sleep(IDLE_POLL),
         }
@@ -547,25 +626,33 @@ pub async fn run(args: &[String]) -> MdResult<()> {
         .parse()?;
 
     ensure_safe_state_path(&journal_path, &stream_path, &state_path)?;
-    let (mut projection, checkpoint, state_existed) = load_state(&state_path)?;
+    let (mut projection, mut candles, checkpoint, state_existed) = load_state(&state_path)?;
     let mut reader = StreamReader::open(&journal_path, &stream_path, checkpoint)?;
     let mut advanced = false;
     while let Some(batch) = reader.next_batch()? {
-        projection = apply_and_save(&projection, &batch, &reader.checkpoint(), &state_path)?;
+        (projection, candles) = apply_and_save(
+            &projection,
+            &candles,
+            &batch,
+            &reader.checkpoint(),
+            &state_path,
+        )?;
         advanced = true;
     }
     if !state_existed && !advanced {
-        save_state(&state_path, &projection, &reader.checkpoint())?;
+        save_state(&state_path, &projection, &candles, &reader.checkpoint())?;
     }
 
     let projection = Arc::new(RwLock::new(projection));
+    let candles = Arc::new(RwLock::new(candles));
     let available = Arc::new(AtomicBool::new(true));
     let follower_projection = Arc::clone(&projection);
+    let follower_candles = Arc::clone(&candles);
     let follower_available = Arc::clone(&available);
     thread::Builder::new()
         .name("market-data-follower".into())
         .spawn(move || {
-            if let Err(error) = follow(reader, state_path, follower_projection) {
+            if let Err(error) = follow(reader, state_path, follower_projection, follower_candles) {
                 eprintln!("market-data follower halted: {error}");
             }
             follower_available.store(false, Ordering::Release);
@@ -574,8 +661,10 @@ pub async fn run(args: &[String]) -> MdResult<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/marketdata/orderbook/{symbol}", get(order_book))
+        .route("/marketdata/candles", get(candle_history))
         .with_state(MarketDataState {
             projection,
+            candles,
             available,
         });
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -1001,11 +1090,26 @@ mod tests {
             remaining: 7,
         }])
         .unwrap();
-        save_state(&state_path, &projection, &checkpoint).unwrap();
+        let candles = CandleProjection::from_candles(vec![Candle {
+            symbol: "AAPL".into(),
+            start_time: 60,
+            open: 100,
+            high: 101,
+            low: 99,
+            close: 101,
+            volume: 7,
+            trade_count: 2,
+        }])
+        .unwrap();
+        save_state(&state_path, &projection, &candles, &checkpoint).unwrap();
 
-        let (loaded, loaded_checkpoint, existed) = load_state(&state_path).unwrap();
+        let (loaded, loaded_candles, loaded_checkpoint, existed) = load_state(&state_path).unwrap();
         assert!(existed);
         assert_eq!(loaded.persisted_orders(), projection.persisted_orders());
+        assert_eq!(
+            loaded_candles.persisted_candles(),
+            candles.persisted_candles()
+        );
         assert_eq!(loaded_checkpoint.unwrap(), checkpoint);
 
         std::fs::write(&state_path, b"not json").unwrap();
@@ -1015,6 +1119,7 @@ mod tests {
             version: 99,
             checkpoint,
             orders: vec![],
+            candles: vec![],
         };
         std::fs::write(&state_path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
         assert!(
@@ -1039,7 +1144,8 @@ mod tests {
             remaining: 7,
         }])
         .unwrap();
-        save_state(&state_path, &original, &checkpoint).unwrap();
+        let candles = CandleProjection::default();
+        save_state(&state_path, &original, &candles, &checkpoint).unwrap();
         let original_bytes = std::fs::read(&state_path).unwrap();
 
         let replacement = MarketDataProjection::from_orders(vec![ProjectedOrder {
@@ -1053,6 +1159,7 @@ mod tests {
         let result = save_state_with_rename(
             &state_path,
             &replacement,
+            &candles,
             &checkpoint,
             |_temporary, _destination| Err(io::Error::other("injected rename failure")),
         );
@@ -1088,7 +1195,8 @@ mod tests {
                 vec![],
             ))
             .unwrap();
-        save_state(&state_path, &current, &checkpoint).unwrap();
+        let candles = CandleProjection::default();
+        save_state(&state_path, &current, &candles, &checkpoint).unwrap();
         let original_view = current.view("AAPL", 10);
         let original_state = std::fs::read(&state_path).unwrap();
 
@@ -1098,7 +1206,7 @@ mod tests {
         executions.extend(second_pair);
         let malformed = accepted(order("buy", "buyer", "BUY", 100, 2), executions);
 
-        assert!(apply_and_save(&current, &malformed, &checkpoint, &state_path).is_err());
+        assert!(apply_and_save(&current, &candles, &malformed, &checkpoint, &state_path).is_err());
         assert_eq!(current.view("AAPL", 10), original_view);
         assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
     }
