@@ -287,6 +287,31 @@ Full write-up: `docs/tasks/09-reporter-v1.md`.
 
 Verified on 2026-09-26: `cargo fmt -- --check`; `cargo test --locked --offline` passes 109 unit tests and 4 executable integration tests, plus one ignored opt-in Reporter test. The Reporter executable test passed against an isolated local PostgreSQL instance after applying migrations.
 
+## Completed Milestone - Reporter v1 Recovery Qualification
+
+Full write-up: `docs/tasks/10-reporter-recovery-qualification.md`.
+
+- [x] Make the isolated Reporter test reset and apply its own versioned migration.
+- [x] Inject a checkpoint-write failure after lifecycle/trade writes begin and prove the SQL transaction rolls back all three effects.
+- [x] Verify journal catch-up, mmap handoff, multi-fill trades, cancellations, rejected orders, and rejected cancellations in the real Reporter process.
+- [x] Kill a ready Reporter, restart it against the same journal/database, and prove its checkpoint prevents duplicate order or trade rows.
+
+Verified on 2026-09-27: `cargo fmt -- --check`; `cargo test --locked --offline` passes 109 unit tests and 4 executable integration tests. `REPORTER_TEST_DATABASE_URL=... cargo test --locked --offline --test reporter -- --ignored --nocapture` passed against a freshly initialized local PostgreSQL 18 instance.
+
+## Completed Milestone - Authoritative Core Snapshots and Suffix Replay
+
+Full write-up: `docs/tasks/11-authoritative-core-snapshots.md`.
+
+- [x] Serialize all deterministic core state in a normalized, versioned, checksummed snapshot.
+- [x] Bind each checkpoint to the exact journal device/inode, complete-record byte offset, next event sequence, and next matching sequence.
+- [x] Rebuild FIFO books and transient indexes on load, then validate ledger collateral, book/order agreement, and sequence domains.
+- [x] Publish snapshots through temporary-file sync, atomic rename, and parent-directory sync without touching the journal.
+- [x] Recover from a valid checkpoint by validating and replaying only its journal suffix.
+- [x] Preserve corrupt, malformed, or journal-mismatched checkpoints and safely fall back to full deterministic replay.
+- [x] Verify suffix boundaries/torn tails, replacement failure, journal identity, both sequence continuations, and no snapshot advance after failed append.
+
+Verified on 2026-09-27: `cargo fmt -- --check`; `cargo test --locked --offline` passes 118 unit tests and 4 executable integration tests. This is a recovery accelerator only: the journal remains complete and authoritative, with no compaction or subscriber-retention change.
+
 ## Next Milestone
 
-No next milestone is selected. Discuss the next architecture step before implementation. Candles, snapshots, group commit, lock-free transport, UDP/multicast, CPU pinning, hot-warm replication, and per-symbol partitioning remain separate milestones.
+No next milestone is selected. Discuss the next architecture step before implementation. Candles, journal compaction, group commit, lock-free transport, UDP/multicast, CPU pinning, hot-warm replication, and per-symbol partitioning remain separate milestones.

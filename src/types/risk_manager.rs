@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::types::{Order, RiskError};
 
 /// Seconds in a trading day, used to turn an order's timestamp into a day number.
@@ -22,6 +24,23 @@ pub struct RiskManager {
     /// Which day the counters in `volumes` belong to, as a day number derived from order
     /// timestamps. `None` until the first order is seen.
     current_day: Option<i64>,
+}
+
+/// Risk counters are persisted as rows because JSON object keys cannot faithfully represent the
+/// `(user, symbol)` keys used by the in-memory lookup maps.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct RiskManagerSnapshot {
+    current_day: Option<i64>,
+    entries: Vec<RiskSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct RiskSnapshotEntry {
+    user_id: String,
+    symbol: String,
+    limit: Option<u64>,
+    open_volume: u64,
+    volume: u64,
 }
 
 impl RiskManager {
@@ -214,6 +233,75 @@ impl RiskManager {
             open.checked_sub(quantity as u64)
                 .expect("prepared cancellation must not exceed open risk quantity"),
         );
+    }
+
+    pub(crate) fn snapshot(&self) -> RiskManagerSnapshot {
+        let mut keys: Vec<_> = self
+            .limits
+            .keys()
+            .chain(self.open_volumes.keys())
+            .chain(self.volumes.keys())
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+
+        RiskManagerSnapshot {
+            current_day: self.current_day,
+            entries: keys
+                .into_iter()
+                .map(|(user_id, symbol)| {
+                    let key = (user_id.clone(), symbol.clone());
+                    RiskSnapshotEntry {
+                        limit: self.limits.get(&key).copied(),
+                        open_volume: self.open_volumes.get(&key).copied().unwrap_or(0),
+                        volume: self.volumes.get(&key).copied().unwrap_or(0),
+                        user_id,
+                        symbol,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: RiskManagerSnapshot) -> Result<Self, String> {
+        let mut limits = HashMap::new();
+        let mut open_volumes = HashMap::new();
+        let mut volumes = HashMap::new();
+
+        for entry in snapshot.entries {
+            if entry.open_volume > entry.volume {
+                return Err(format!(
+                    "risk snapshot has open exposure above total usage for {} {}",
+                    entry.user_id, entry.symbol
+                ));
+            }
+            let key = (entry.user_id, entry.symbol);
+            if volumes.insert(key.clone(), entry.volume).is_some() {
+                return Err(format!(
+                    "risk snapshot contains duplicate entry for {} {}",
+                    key.0, key.1
+                ));
+            }
+            open_volumes.insert(key.clone(), entry.open_volume);
+            if let Some(limit) = entry.limit {
+                limits.insert(key, limit);
+            }
+        }
+
+        if snapshot.current_day.is_none()
+            && (open_volumes.values().any(|&volume| volume != 0)
+                || volumes.values().any(|&volume| volume != 0))
+        {
+            return Err("risk snapshot has usage without a current trading day".to_string());
+        }
+
+        Ok(Self {
+            limits,
+            open_volumes,
+            volumes,
+            current_day: snapshot.current_day,
+        })
     }
 }
 

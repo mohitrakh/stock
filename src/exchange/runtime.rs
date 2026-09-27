@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
     exchange::{
         core::{CoreError, ExchangeCore, PreparedAddOrder, PreparedCancelOrder},
         event_store::{EventStore, EventStoreError, encode_record},
         event_stream::{DEFAULT_CAPACITY, StreamWriter},
+        snapshot::{self, SnapshotBoundary},
     },
     types::{
         exchange_event::{EventEnvelope, ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent},
@@ -21,7 +22,19 @@ pub struct ExchangeRuntime {
     /// `ExchangeRuntime::new` want. The server always supplies a store.
     store: Option<EventStore>,
     stream: Option<StreamWriter>,
+    snapshot: Option<SnapshotSchedule>,
 }
+
+/// Snapshotting is intentionally periodic: writing a whole authoritative-state checkpoint for
+/// every order would turn a recovery optimization into a new trading-path bottleneck.
+struct SnapshotSchedule {
+    path: PathBuf,
+    stream_path: PathBuf,
+    every_commands: u64,
+    commands_since_snapshot: u64,
+}
+
+pub const DEFAULT_SNAPSHOT_INTERVAL: u64 = 10_000;
 
 /// Startup refuses untrustworthy history or an unusable committed-event stream.
 #[derive(Debug)]
@@ -344,8 +357,18 @@ fn process_input_event(core: &mut ExchangeCore, event: ExchangeInputEvent) -> Pr
 }
 
 pub fn replay_event_log(event_log: &[EventEnvelope]) -> Result<ExchangeCore, ReplayError> {
+    replay_event_log_from_core(ExchangeCore::new(), 1, event_log)
+}
+
+fn replay_event_log_from_core(
+    mut core: ExchangeCore,
+    first_sequence: u64,
+    event_log: &[EventEnvelope],
+) -> Result<ExchangeCore, ReplayError> {
     for (index, envelope) in event_log.iter().enumerate() {
-        let expected = index as u64 + 1;
+        let expected = first_sequence
+            .checked_add(index as u64)
+            .ok_or_else(|| ReplayError::InternalFault("journal sequence overflow".to_string()))?;
 
         if envelope.seq_num != expected {
             return Err(ReplayError::EventSequenceMismatch {
@@ -355,7 +378,6 @@ pub fn replay_event_log(event_log: &[EventEnvelope]) -> Result<ExchangeCore, Rep
         }
     }
 
-    let mut core = ExchangeCore::new();
     let mut index = 0;
 
     while index < event_log.len() {
@@ -382,7 +404,9 @@ pub fn replay_event_log(event_log: &[EventEnvelope]) -> Result<ExchangeCore, Rep
         for expected_output in processed.output_events.iter().cloned() {
             let Some(output_envelope) = event_log.get(index) else {
                 return Err(ReplayError::MissingOutput {
-                    seq_num: index as u64 + 1,
+                    seq_num: first_sequence.checked_add(index as u64).ok_or_else(|| {
+                        ReplayError::InternalFault("journal sequence overflow".to_string())
+                    })?,
                     expected: expected_output,
                 });
             };
@@ -424,6 +448,7 @@ impl ExchangeRuntime {
             next_event_seq: 1,
             store: None,
             stream: None,
+            snapshot: None,
         }
     }
 
@@ -462,7 +487,77 @@ impl ExchangeRuntime {
             next_event_seq,
             store,
             stream: None,
+            snapshot: None,
         })
+    }
+
+    fn from_snapshot_suffix(
+        rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
+        store: EventStore,
+        core: ExchangeCore,
+        suffix: Vec<EventEnvelope>,
+        next_event_seq: u64,
+    ) -> Self {
+        Self {
+            rx,
+            core,
+            // History before the snapshot is still available in the authoritative journal. Keep
+            // only the replayed suffix in process memory so snapshot recovery actually bounds the
+            // runtime's retained event vector.
+            event_log: suffix,
+            next_event_seq,
+            store: Some(store),
+            stream: None,
+            snapshot: None,
+        }
+    }
+
+    fn write_snapshot(&self, path: &Path, stream_path: &Path) -> Result<(), String> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| "cannot snapshot an in-memory-only runtime".to_string())?;
+        let metadata = store
+            .file()
+            .metadata()
+            .map_err(|error| format!("could not inspect journal for snapshot: {error}"))?;
+        let boundary = SnapshotBoundary {
+            journal_device: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.dev()
+            },
+            journal_inode: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.ino()
+            },
+            byte_offset: metadata.len(),
+            next_event_sequence: self.next_event_seq,
+        };
+        snapshot::write(
+            path,
+            store.file(),
+            stream_path,
+            boundary,
+            self.core.snapshot(),
+        )
+    }
+
+    fn maybe_write_snapshot(&mut self) {
+        let Some((path, stream_path)) = self.snapshot.as_mut().and_then(|schedule| {
+            schedule.commands_since_snapshot = schedule.commands_since_snapshot.saturating_add(1);
+            if schedule.commands_since_snapshot < schedule.every_commands {
+                return None;
+            }
+            // A failed write cannot invalidate the journal or the previous snapshot. Retry after
+            // another full interval rather than making a disk failure stall every later command.
+            schedule.commands_since_snapshot = 0;
+            Some((schedule.path.clone(), schedule.stream_path.clone()))
+        }) else {
+            return;
+        };
+        if let Err(error) = self.write_snapshot(&path, &stream_path) {
+            eprintln!("snapshot checkpoint was not updated: {error}");
+        }
     }
 
     pub fn run(mut self) {
@@ -479,8 +574,15 @@ impl ExchangeRuntime {
         }
     }
 
+    #[cfg(test)]
     pub fn event_log(&self) -> &[EventEnvelope] {
         &self.event_log
+    }
+
+    /// The sequence to assign to the next durable envelope. This is the durable journal's
+    /// high-water mark even when snapshot recovery keeps only its replayed suffix in memory.
+    pub fn next_event_sequence(&self) -> u64 {
+        self.next_event_seq
     }
 
     fn handle_command(&mut self, command: ExchangeCommand) -> Result<(), RuntimeFailure> {
@@ -689,6 +791,7 @@ impl ExchangeRuntime {
                 .map_err(RuntimeFailure::Stream)?;
         }
         self.core.notify_executions(&executions);
+        self.maybe_write_snapshot();
 
         Ok(result)
     }
@@ -712,6 +815,7 @@ pub fn recover_runtime(
 
 /// Production startup: validate/replay first, then publish the recovered committed prefix.
 /// Never publish merely because a record parsed: replay must also prove its business outputs.
+#[cfg(test)]
 pub fn recover_runtime_with_stream(
     rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
     journal_path: impl AsRef<Path>,
@@ -727,6 +831,94 @@ pub fn recover_runtime_with_stream(
     .map_err(StartupError::Stream)?;
     runtime.stream = Some(stream);
     Ok(runtime)
+}
+
+/// Production recovery with a journal-bound authoritative-core snapshot. Snapshot problems are
+/// deliberately non-fatal: the journal is still the source of truth, so startup logs the issue
+/// and falls back to the existing full deterministic replay.
+pub fn recover_runtime_with_stream_and_snapshot(
+    rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
+    journal_path: impl AsRef<Path>,
+    stream_path: impl AsRef<Path>,
+    snapshot_path: impl AsRef<Path>,
+    snapshot_interval: u64,
+) -> Result<ExchangeRuntime, StartupError> {
+    if snapshot_interval == 0 {
+        return Err(StartupError::Replay(ReplayError::InternalFault(
+            "snapshot interval must be at least one command".to_string(),
+        )));
+    }
+    let journal_path = journal_path.as_ref().to_path_buf();
+    let stream_path = stream_path.as_ref().to_path_buf();
+    let snapshot_path = snapshot_path.as_ref().to_path_buf();
+
+    let (mut runtime, snapshot_is_safe_to_replace) =
+        match snapshot::load(&snapshot_path, &journal_path) {
+            Ok(Some(loaded)) => match recover_snapshot_state(&journal_path, loaded) {
+                Ok((store, core, suffix, next_event_seq)) => (
+                    ExchangeRuntime::from_snapshot_suffix(rx, store, core, suffix, next_event_seq),
+                    true,
+                ),
+                Err(error) => {
+                    eprintln!(
+                        "ignoring snapshot and replaying the journal from sequence 1: {error}"
+                    );
+                    (recover_runtime(rx, &journal_path)?, false)
+                }
+            },
+            Ok(None) => (recover_runtime(rx, &journal_path)?, true),
+            Err(error) => {
+                eprintln!("ignoring snapshot and replaying the journal from sequence 1: {error}");
+                (recover_runtime(rx, &journal_path)?, false)
+            }
+        };
+
+    let stream = StreamWriter::open(
+        &stream_path,
+        runtime.store.as_ref().unwrap().file(),
+        runtime.next_event_seq - 1,
+        DEFAULT_CAPACITY,
+    )
+    .map_err(StartupError::Stream)?;
+    runtime.stream = Some(stream);
+    if snapshot_is_safe_to_replace {
+        runtime.snapshot = Some(SnapshotSchedule {
+            path: snapshot_path,
+            stream_path,
+            every_commands: snapshot_interval,
+            commands_since_snapshot: 0,
+        });
+        if let Some(schedule) = &runtime.snapshot
+            && let Err(error) = runtime.write_snapshot(&schedule.path, &schedule.stream_path)
+        {
+            // This does not affect a durable, replayable exchange. Retain an older snapshot if
+            // one exists and retry after the configured number of later commits.
+            eprintln!("snapshot checkpoint was not updated during startup: {error}");
+        }
+    }
+    Ok(runtime)
+}
+
+fn recover_snapshot_state(
+    journal_path: &Path,
+    loaded: snapshot::LoadedSnapshot,
+) -> Result<(EventStore, ExchangeCore, Vec<EventEnvelope>, u64), String> {
+    let core = ExchangeCore::from_snapshot(loaded.core)?;
+    let (store, suffix) = EventStore::open_suffix(journal_path, loaded.boundary.byte_offset)
+        .map_err(|error| error.to_string())?;
+    let core = replay_event_log_from_core(core, loaded.boundary.next_event_sequence, &suffix)
+        .map_err(|error| format!("snapshot suffix did not replay deterministically: {error:?}"))?;
+    let next_event_seq = suffix
+        .last()
+        .map(|envelope| {
+            envelope
+                .seq_num
+                .checked_add(1)
+                .ok_or_else(|| "journal sequence overflow".to_string())
+        })
+        .transpose()?
+        .unwrap_or(loaded.boundary.next_event_sequence);
+    Ok((store, core, suffix, next_event_seq))
 }
 
 #[cfg(test)]
@@ -1645,6 +1837,163 @@ mod tests {
         assert_eq!(seller_position.available, 5);
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_recovery_replays_only_the_suffix_and_continues_both_sequences() {
+        let path = temp_log_path("snapshot-suffix");
+        let stream = path.with_extension("mmap");
+        let snapshot = path.with_extension("snapshot");
+        let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(&snapshot);
+
+        {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let mut runtime =
+                recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot, u64::MAX)
+                    .unwrap();
+            for input in [
+                ExchangeInputEvent::FundsDepositRequested {
+                    user_id: "buyer".into(),
+                    amount: 100,
+                },
+                share_deposit("seller-a", 5),
+                share_deposit("seller-b", 5),
+                ExchangeInputEvent::NewOrderRequested {
+                    order: order("sell-a", "seller-a", "SELL", 10, 5),
+                },
+                ExchangeInputEvent::NewOrderRequested {
+                    order: order("sell-b", "seller-b", "SELL", 10, 5),
+                },
+                ExchangeInputEvent::NewOrderRequested {
+                    order: order("buy", "buyer", "BUY", 10, 7),
+                },
+            ] {
+                runtime.record_and_process_input_event(input).unwrap();
+            }
+            runtime.write_snapshot(&snapshot, &stream).unwrap();
+            runtime
+                .record_and_process_input_event(ExchangeInputEvent::CancelOrderRequested {
+                    order_id: "sell-b".into(),
+                    user_id: "seller-b".into(),
+                })
+                .unwrap();
+        }
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut restarted =
+            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot, u64::MAX)
+                .unwrap();
+
+        // The checkpoint already owns the first six commands; only the cancellation is held and
+        // replayed as the suffix. The full history remains in the journal for subscribers.
+        assert_eq!(restarted.event_log().len(), 2);
+        // The six checkpointed commands produced sixteen envelopes: the crossing buy emits two
+        // execution events for each fill as well as its accepted event. The cancellation begins
+        // the two-envelope suffix at event sequence 17.
+        assert_eq!(restarted.event_log()[0].seq_num, 17);
+        assert_eq!(
+            restarted
+                .core
+                .order_view("sell-b", "seller-b")
+                .unwrap()
+                .status,
+            "canceled"
+        );
+        assert_eq!(restarted.core.balance_view("buyer").balance, 30);
+        assert_eq!(
+            restarted
+                .core
+                .execution_views("buyer", None, None, None, None)
+                .len(),
+            2
+        );
+        assert!(
+            restarted
+                .core
+                .l2_snapshot("AAPL", 10)
+                .unwrap()
+                .asks
+                .is_empty()
+        );
+
+        restarted
+            .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+                order: order("next", "buyer", "BUY", 9, 1),
+            })
+            .unwrap();
+        match &restarted.event_log()[3].event {
+            ExchangeEvent::Output(ExchangeOutputEvent::OrderAccepted { seq_num, .. }) => {
+                assert_eq!(*seq_num, 5);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        drop(restarted);
+        let _ = std::fs::remove_file(&snapshot);
+        let _ = std::fs::remove_file(&stream);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn corrupt_snapshot_is_preserved_and_startup_falls_back_to_full_replay() {
+        let path = temp_log_path("corrupt-snapshot");
+        let stream = path.with_extension("mmap");
+        let snapshot = path.with_extension("snapshot");
+        let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(&snapshot);
+        {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let mut runtime = recover_runtime(rx, &path).unwrap();
+            runtime
+                .record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
+                    user_id: "buyer".into(),
+                    amount: 10,
+                })
+                .unwrap();
+        }
+        let corrupt = b"not an exchange snapshot";
+        std::fs::write(&snapshot, corrupt).unwrap();
+
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let restarted =
+            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot, 1).unwrap();
+        assert_eq!(restarted.event_log().len(), 2);
+        assert_eq!(restarted.core.balance_view("buyer").balance, 10);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), corrupt);
+
+        drop(restarted);
+        let _ = std::fs::remove_file(&snapshot);
+        let _ = std::fs::remove_file(&stream);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_append_cannot_advance_or_replace_a_snapshot() {
+        let path = temp_log_path("snapshot-before-commit");
+        let stream = path.with_extension("mmap");
+        let snapshot = path.with_extension("snapshot");
+        let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(&snapshot);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut runtime =
+            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot, 1).unwrap();
+        let before = std::fs::read(&snapshot).unwrap();
+        runtime.store = Some(EventStore::open_read_only_for_test(&path).unwrap());
+
+        assert!(matches!(
+            runtime.record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 10,
+            }),
+            Err(RuntimeFailure::Store(_))
+        ));
+        assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+        assert_eq!(runtime.core.balance_view("buyer").balance, 0);
+
+        drop(runtime);
+        let _ = std::fs::remove_file(&snapshot);
+        let _ = std::fs::remove_file(&stream);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

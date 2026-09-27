@@ -32,7 +32,9 @@ mod db;
 mod state;
 use state::AppState;
 
-use crate::exchange::runtime::recover_runtime_with_stream;
+use crate::exchange::runtime::{
+    DEFAULT_SNAPSHOT_INTERVAL, recover_runtime_with_stream_and_snapshot,
+};
 
 const EXCHANGE_COMMAND_QUEUE_SIZE: usize = 10_000;
 const DEFAULT_EVENT_LOG_PATH: &str = "exchange-events.log";
@@ -75,25 +77,45 @@ async fn main() {
         std::env::var("EVENT_LOG_PATH").unwrap_or_else(|_| DEFAULT_EVENT_LOG_PATH.to_string());
     let event_stream_path =
         std::env::var("EVENT_STREAM_PATH").unwrap_or_else(|_| format!("{event_log_path}.mmap"));
+    let event_snapshot_path = std::env::var("EVENT_SNAPSHOT_PATH")
+        .unwrap_or_else(|_| format!("{event_log_path}.snapshot"));
+    let snapshot_interval = std::env::var("EVENT_SNAPSHOT_INTERVAL")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|&value| value > 0)
+                .ok_or(())
+        })
+        .unwrap_or(Ok(DEFAULT_SNAPSHOT_INTERVAL))
+        .unwrap_or_else(|_| {
+            eprintln!("EVENT_SNAPSHOT_INTERVAL must be a positive integer");
+            std::process::exit(1);
+        });
 
     // Recovery happens before the listener binds, and on the main thread. History that cannot be
     // trusted must stop the process, not kill a worker thread and leave a server answering
     // requests it can never fulfil.
-    let runtime = recover_runtime_with_stream(rx, &event_log_path, &event_stream_path)
-        .unwrap_or_else(|err| {
-            eprintln!("refusing to start: {}", err);
-            eprintln!("event log: {}", event_log_path);
-            eprintln!("event stream: {}", event_stream_path);
-            eprintln!(
-                "Resolve the reported error before restarting; preserve the durable history."
-            );
-            std::process::exit(1);
-        });
+    let runtime = recover_runtime_with_stream_and_snapshot(
+        rx,
+        &event_log_path,
+        &event_stream_path,
+        &event_snapshot_path,
+        snapshot_interval,
+    )
+    .unwrap_or_else(|err| {
+        eprintln!("refusing to start: {}", err);
+        eprintln!("event log: {}", event_log_path);
+        eprintln!("event stream: {}", event_stream_path);
+        eprintln!("event snapshot: {}", event_snapshot_path);
+        eprintln!("Resolve the reported error before restarting; preserve the durable history.");
+        std::process::exit(1);
+    });
 
     println!(
-        "Event log {} recovered with {} events",
+        "Event log {} recovered through event sequence {}",
         event_log_path,
-        runtime.event_log().len()
+        runtime.next_event_sequence().saturating_sub(1)
     );
 
     let exchange_available = Arc::new(AtomicBool::new(true));

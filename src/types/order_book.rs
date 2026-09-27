@@ -1,7 +1,9 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
 };
+
+use serde::{Deserialize, Serialize};
 
 use super::price_level::PriceLevel;
 use super::types::{Execution, Order, Price, Side};
@@ -12,6 +14,22 @@ pub struct OrderBook {
     pub(crate) buy_levels: BTreeMap<Reverse<Price>, PriceLevel>,
     pub(crate) sell_levels: BTreeMap<Price, PriceLevel>,
     pub(crate) order_map: HashMap<String, (Price, Side)>,
+    exec_counter: u64,
+}
+
+/// Snapshot form of a price level. Orders are stored in FIFO order; the linked-node indexes are
+/// an in-memory implementation detail and are regenerated on load.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PriceLevelSnapshot {
+    price: Price,
+    orders: Vec<Order>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct OrderBookSnapshot {
+    pub(crate) symbol: String,
+    buy_levels: Vec<PriceLevelSnapshot>,
+    sell_levels: Vec<PriceLevelSnapshot>,
     exec_counter: u64,
 }
 
@@ -211,5 +229,132 @@ impl OrderBook {
     }
     pub fn is_resting(&self, order_id: &str) -> bool {
         self.order_map.contains_key(order_id)
+    }
+
+    pub(crate) fn snapshot(&self) -> OrderBookSnapshot {
+        let snapshot_level = |price: Price, level: &PriceLevel| PriceLevelSnapshot {
+            price,
+            orders: level.orders_in_queue(),
+        };
+        OrderBookSnapshot {
+            symbol: self.symbol.clone(),
+            buy_levels: self
+                .buy_levels
+                .iter()
+                .map(|(price, level)| snapshot_level(price.0, level))
+                .collect(),
+            sell_levels: self
+                .sell_levels
+                .iter()
+                .map(|(price, level)| snapshot_level(*price, level))
+                .collect(),
+            exec_counter: self.exec_counter,
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: OrderBookSnapshot) -> Result<Self, String> {
+        let mut book = Self::new(snapshot.symbol.clone());
+        book.exec_counter = snapshot.exec_counter;
+        let mut order_ids = HashSet::new();
+
+        for level in snapshot.buy_levels {
+            let price = level.price;
+            if book.buy_levels.contains_key(&Reverse(price)) {
+                return Err(format!(
+                    "order-book snapshot contains duplicate buy level {}",
+                    price.minor_units()
+                ));
+            }
+            let restored = Self::restore_level(
+                &snapshot.symbol,
+                price,
+                Side::Buy,
+                level.orders,
+                &mut order_ids,
+            )?;
+            book.buy_levels.insert(Reverse(price), restored);
+        }
+
+        for level in snapshot.sell_levels {
+            let price = level.price;
+            if book.sell_levels.contains_key(&price) {
+                return Err(format!(
+                    "order-book snapshot contains duplicate sell level {}",
+                    price.minor_units()
+                ));
+            }
+            let restored = Self::restore_level(
+                &snapshot.symbol,
+                price,
+                Side::Sell,
+                level.orders,
+                &mut order_ids,
+            )?;
+            book.sell_levels.insert(price, restored);
+        }
+
+        for order in book.resting_orders() {
+            if book
+                .order_map
+                .insert(order.order_id.clone(), (order.price, order.side))
+                .is_some()
+            {
+                return Err(format!(
+                    "order-book snapshot contains duplicate resting order {}",
+                    order.order_id
+                ));
+            }
+        }
+
+        Ok(book)
+    }
+
+    fn restore_level(
+        symbol: &str,
+        price: Price,
+        side: Side,
+        orders: Vec<Order>,
+        order_ids: &mut HashSet<String>,
+    ) -> Result<PriceLevel, String> {
+        if orders.is_empty() {
+            return Err(format!(
+                "order-book snapshot contains an empty {} level {}",
+                match side {
+                    Side::Buy => "buy",
+                    Side::Sell => "sell",
+                },
+                price.minor_units()
+            ));
+        }
+        let mut level = PriceLevel::new(price);
+        for order in orders {
+            if order.symbol != symbol
+                || order.side != side
+                || order.price != price
+                || order.leaves_qty == 0
+                || order.leaves_qty > order.quantity
+            {
+                return Err(format!(
+                    "order-book snapshot has an invalid resting order {}",
+                    order.order_id
+                ));
+            }
+            if !order_ids.insert(order.order_id.clone()) {
+                return Err(format!(
+                    "order-book snapshot contains duplicate resting order {}",
+                    order.order_id
+                ));
+            }
+            level.append(order);
+        }
+        Ok(level)
+    }
+
+    pub(crate) fn resting_orders(&self) -> Vec<Order> {
+        self.buy_levels
+            .values()
+            .chain(self.sell_levels.values())
+            .flat_map(PriceLevel::orders_in_queue)
+            .collect()
     }
 }

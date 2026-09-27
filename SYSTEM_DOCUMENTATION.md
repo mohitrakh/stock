@@ -1,12 +1,12 @@
 # Stock Exchange - Current Implementation
 
-Verified against this checkout on 2026-09-26. This file describes implemented behavior. `stock-exchange-system-design.md` is the target architecture; `PROJECT_DIRECTION.md` is the milestone journal.
+Verified against this checkout on 2026-09-27. This file describes implemented behavior. `stock-exchange-system-design.md` is the target architecture; `PROJECT_DIRECTION.md` is the milestone journal.
 
 ## Ownership and command flow
 
 Axum handlers send `ExchangeCommand` values through a bounded Tokio queue (10,000 commands) to one dedicated exchange-worker thread. Commands may carry a temporary `oneshot` reply channel. Persisted `ExchangeEvent` values contain only replayable business data.
 
-`ExchangeRuntime` owns the receiver, core, durable event store, mmap stream writer, full in-memory event history, and next journal sequence. `ExchangeCore` owns the order manager, matching engine, and matching sequencer. The core does not access files, databases, queues, or HTTP.
+`ExchangeRuntime` owns the receiver, core, durable event store, mmap stream writer, optional core-snapshot schedule, in-memory replay history, and next journal sequence. After a snapshot restart the in-memory vector holds only the replayed suffix; the complete history remains in the durable journal. `ExchangeCore` owns the order manager, matching engine, and matching sequencer. The core does not access files, databases, queues, or HTTP.
 
 A mutating command follows this order:
 
@@ -18,6 +18,7 @@ prepare and validate the entire transition without changing live state
   -> extend in-memory history and advance journal sequence
   -> publish the complete batch and committed watermark through mmap
   -> notify local execution callbacks
+  -> periodically replace a snapshot of this committed core state
   -> answer the waiting HTTP request
 ```
 
@@ -62,7 +63,7 @@ Journal sequence and matching sequence are different domains. A command may emit
 
 `prepare_input_event` computes the result, outputs, and prepared core change. `replay_event_log` validates contiguous journal sequencing from 1, prepares each recorded input, compares regenerated outputs with the following recorded outputs, then commits that plan. Recorded outputs are checked rather than applied a second time. Replay does not publish callbacks.
 
-Replay rejects missing/unexpected outputs, output mismatches, and sequence mismatches. It requires full history from an empty core. There are no snapshots or partial-core recovery.
+Replay rejects missing/unexpected outputs, output mismatches, and sequence mismatches. Full replay starts from an empty core at event sequence 1. Snapshot recovery validates a restored core and starts the same deterministic replay at the snapshot's recorded next event sequence, over only the later journal suffix.
 
 ## Durable event store
 
@@ -80,7 +81,7 @@ Each record contains exactly one input and its outputs. The maximum JSON payload
 
 New journal files are created with mode 0600, and initialization synchronizes both the file and parent directory. Existing file permissions are unchanged. Ownership is explicitly unlocked on drop; OS process death also releases the lock.
 
-The journal remains one unbounded file. Startup reads it into memory, and the runtime retains a full event vector. There is one fsync per command.
+The journal remains one unbounded file. A start with no usable snapshot reads and replays it from the beginning. A valid core snapshot lets exchange startup read, validate, and retain only the later suffix. There is one journal fsync per command.
 
 ## Committed mmap stream and readers
 
@@ -100,7 +101,11 @@ This implementation is synchronized, not lock-free. A reader paused while copyin
 
 ## Startup and recovery
 
-Production `main` calls `recover_runtime_with_stream` before binding the HTTP listener. It acquires the journal, repairs a torn tail, deterministically rebuilds the core, then initializes the mmap watermark from the entire validated journal. The recovered cache initially contains no payload, so readers recover old batches from disk and then follow newly cached batches.
+Production `main` calls `recover_runtime_with_stream_and_snapshot` before binding the HTTP listener. It first attempts to load `EXCHSNP1`, a versioned CRC-protected snapshot of the complete deterministic core. The snapshot records the journal device/inode, a complete-batch byte boundary, next journal-envelope sequence, next matching sequence, ledgers, risk state, order lifecycle/execution indexes, and FIFO book state.
+
+When that snapshot and its restored invariants validate, `EventStore::open_suffix` acquires the writer lock, validates only records after the boundary, repairs only a torn suffix tail, and deterministically replays the suffix. The mmap writer is then initialized from the recovered journal high-water mark. The cache initially contains no payload, so readers recover old batches from disk and then follow newly cached batches.
+
+A missing snapshot performs the established full journal recovery and creates a checkpoint after startup. A present invalid, corrupt, inconsistent, or journal-mismatched snapshot is preserved, reported, and falls back to full replay; it is not automatically replaced during that run. This makes a checkpoint a recovery accelerator, never a second journal or a silent empty-start path. Snapshot replacement writes and syncs a private temporary file, atomically renames it, then syncs its parent directory. It never compacts, truncates, or replaces the journal.
 
 A process killed after durable append but before publication leaves a recoverable command. A kill during cache copying leaves the ready marker unset; readers refuse that snapshot. Writer restart reconstructs publication from the journal. An already-running reader can continue across writer restart while the same files remain in place.
 
@@ -108,6 +113,8 @@ A process killed after durable append but before publication leaves a recoverabl
 |---|---|
 | `EVENT_LOG_PATH` | `exchange-events.log` |
 | `EVENT_STREAM_PATH` | `EVENT_LOG_PATH` plus `.mmap` |
+| `EVENT_SNAPSHOT_PATH` | `EVENT_LOG_PATH` plus `.snapshot` |
+| `EVENT_SNAPSHOT_INTERVAL` | `10000` processed commands; must be positive |
 | HTTP listener | `127.0.0.1:4000` |
 
 A path under `/dev/shm` may be selected for the stream; it is volatile and is not the journal. A persistent-path mmap still does not become the recovery authority. Do not modify, truncate, unlink, or replace files while mapped. All participating programs must obey the protocol; these are advisory locks and trusted local files, not a hostile-process boundary.
@@ -156,7 +163,7 @@ cargo run -- --reporter exchange-events.log exchange-events.log.mmap [LISTEN_ADD
 
 It defaults to `127.0.0.1:4002` and requires `DATABASE_URL`. It catches up before binding `GET /health`; a terminal stream, decoder, projection, or database error makes that route return 503 without affecting trading or MDP.
 
-`reporter_checkpoint` stores the journal identity and next complete-batch cursor. `reported_orders` preserves each submitted order's current lifecycle and outcome; `reported_trades` stores exactly one row for each adjacent two-sided execution pair. Exact unsigned journal identities and prices are stored as PostgreSQL `NUMERIC(20,0)`. Each batch performs projection writes and checkpoint advancement in one SQL transaction, so a pre-commit crash retries the whole batch and a post-commit restart resumes after it.
+`reporter_checkpoint` stores the journal identity and next complete-batch cursor. `reported_orders` preserves each submitted order's current lifecycle and outcome; `reported_trades` stores exactly one row for each adjacent two-sided execution pair. Exact unsigned journal identities and prices are stored as PostgreSQL `NUMERIC(20,0)`. Each batch performs projection writes and checkpoint advancement in one SQL transaction, so a pre-commit crash retries the whole batch and a post-commit restart resumes after it. The isolated Reporter acceptance test injects a failing checkpoint trigger after order/trade writes begin and verifies all of those writes roll back; it then restarts a committed reporter and verifies no rows are duplicated.
 
 The projection uses the shared committed-batch decoder with MDP, but owns its own order-state and database checks. Missing checkpoint with existing report rows, incompatible journal identity, malformed batches, duplicate trade/execution identities, missing resting rows, and impossible state changes fail closed. There is no reporting query API in v1.
 
@@ -189,8 +196,8 @@ The previous `/exchange/orderbook/{symbol}` route and `ExchangeCommand::GetOrder
 
 ## Verification and remaining scope
 
-`cargo fmt -- --check` and `cargo test --locked --offline` pass: 109 unit tests plus 4 executable integration tests. Coverage includes overnight risk rollover and durable replay, independent fast/slow readers, window overwrite, oversize batches, checkpoint boundary/identity validation, cache/journal corruption, competing writers, durable-but-unpublished recovery, failed append with no publication, fatal publication failure, real cross-process reading, SIGKILL at publication boundaries, probe checkpoint resume, and MDP projection/recovery/HTTP behavior without PostgreSQL. The ignored opt-in Reporter executable test is run with `REPORTER_TEST_DATABASE_URL` after migrations and proved catch-up, persisted lifecycle data, and checkpoint advancement against an isolated PostgreSQL instance.
+`cargo fmt -- --check` and `cargo test --locked --offline` pass: 118 unit tests plus 4 executable integration tests. Coverage includes overnight risk rollover and durable replay, independent fast/slow readers, window overwrite, oversize batches, checkpoint boundary/identity validation, cache/journal corruption, competing writers, durable-but-unpublished recovery, failed append with no publication, fatal publication failure, real cross-process reading, SIGKILL at publication boundaries, probe checkpoint resume, and MDP projection/recovery/HTTP behavior without PostgreSQL. Core-snapshot coverage restores normalized FIFO books and ledgers, verifies suffix-only replay with both sequence domains continuing, rejects a journal mismatch, repairs only torn suffix tails, preserves a corrupt artifact while falling back to full replay, keeps the prior checkpoint on replacement failure, and proves a failed append cannot advance a snapshot. The ignored opt-in Reporter executable test resets a supplied isolated database, applies the migration, injects a checkpoint transaction failure, then verifies rollback, journal-to-mmap catch-up, lifecycle/trade rows, and no duplicates after process restart. It passed against a freshly initialized local PostgreSQL 18 instance on 2026-09-27.
 
 These tests include core/runtime and actual executable checks. MDP coverage includes oracle comparison, multi-fill and cancellation behavior, malformed batches, aggregation beyond `u32::MAX`, state replacement failures, journal catch-up, MDP and exchange-stream restarts, live following, and fail-closed 503 responses. A manual isolated-database run also exercised authenticated trading HTTP plus the separate MDP process through rest, partial fill, cancellation, MDP restart, and resumed live publication. This does not claim machine power-loss testing or performance benchmarking. Clippy still reports existing compatibility/dead-code and style warnings.
 
-Both subscribers are correctness-first and have not been throughput tested. Candles, tax/customer statements, settlement, historical reporting APIs, hot-warm replication, cross-host recovery, mmap ingress, lock-free queues, snapshots, group commit, and CPU pinning remain separate milestones.
+Both subscribers are correctness-first and have not been throughput tested. Candles, tax/customer statements, settlement, historical reporting APIs, journal compaction/retention, hot-warm replication, cross-host recovery, mmap ingress, lock-free queues, group commit, and CPU pinning remain separate milestones.

@@ -135,7 +135,8 @@ impl EventStore {
             return Err(EventStoreError::BadMagic);
         }
 
-        let (events, good_len) = decode_records(&bytes)?;
+        let (events, decoded_len) = decode_records(&bytes[FILE_MAGIC.len()..], FILE_MAGIC.len())?;
+        let good_len = FILE_MAGIC.len() + decoded_len;
 
         // Drop a torn tail so the next append cannot be written after damaged bytes.
         if good_len < bytes.len() {
@@ -145,6 +146,51 @@ impl EventStore {
 
         file.seek(SeekFrom::End(0))?;
 
+        Ok((Self { file }, events))
+    }
+
+    /// Opens the writer-owned journal at an already committed command boundary and recovers only
+    /// records after it. A validated core snapshot supplies the skipped prefix; the journal still
+    /// owns truncation of a torn suffix and remains the only authoritative history.
+    pub(crate) fn open_suffix(
+        path: impl AsRef<Path>,
+        boundary: u64,
+    ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
+        let path = path.as_ref().to_path_buf();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .open(&path)?;
+        file.try_lock().map_err(std::io::Error::from)?;
+
+        let file_len = file.metadata()?.len();
+        if boundary < FILE_MAGIC.len() as u64 || boundary > file_len {
+            return Err(EventStoreError::Corrupt(format!(
+                "snapshot boundary {} is outside the journal length {}",
+                boundary, file_len
+            )));
+        }
+
+        let mut magic = [0; FILE_MAGIC.len()];
+        file.read_exact(&mut magic)?;
+        if &magic != FILE_MAGIC {
+            return Err(EventStoreError::BadMagic);
+        }
+
+        file.seek(SeekFrom::Start(boundary))?;
+        let mut suffix = Vec::new();
+        file.read_to_end(&mut suffix)?;
+        let (events, good_suffix_len) = decode_records(&suffix, boundary as usize)?;
+        let good_len = boundary
+            .checked_add(good_suffix_len as u64)
+            .ok_or_else(|| EventStoreError::Corrupt("journal length overflow".to_string()))?;
+
+        if good_len < file_len {
+            file.set_len(good_len)?;
+            file.sync_all()?;
+        }
+        file.seek(SeekFrom::End(0))?;
         Ok((Self { file }, events))
     }
 
@@ -198,9 +244,12 @@ pub(super) fn encode_record(envelopes: &[EventEnvelope]) -> Result<Vec<u8>, Even
 /// off the end of the file is a torn tail from a crash: decoding stops and the caller truncates.
 /// A checksum failure is different — the bytes are all there but wrong — so it is reported as
 /// corruption rather than silently dropped.
-fn decode_records(bytes: &[u8]) -> Result<(Vec<EventEnvelope>, usize), EventStoreError> {
+fn decode_records(
+    bytes: &[u8],
+    first_offset: usize,
+) -> Result<(Vec<EventEnvelope>, usize), EventStoreError> {
     let mut events = Vec::new();
-    let mut offset = FILE_MAGIC.len();
+    let mut offset = 0;
 
     loop {
         if offset == bytes.len() {
@@ -217,7 +266,9 @@ fn decode_records(bytes: &[u8]) -> Result<(Vec<EventEnvelope>, usize), EventStor
         if len > MAX_RECORD_LEN {
             return Err(EventStoreError::Corrupt(format!(
                 "record at byte {} claims {} bytes, above the {} byte ceiling",
-                offset, len, MAX_RECORD_LEN
+                first_offset + offset,
+                len,
+                MAX_RECORD_LEN
             )));
         }
 
@@ -233,14 +284,15 @@ fn decode_records(bytes: &[u8]) -> Result<(Vec<EventEnvelope>, usize), EventStor
         if crc32(payload) != expected_crc {
             return Err(EventStoreError::Corrupt(format!(
                 "checksum mismatch in the record at byte {}",
-                offset
+                first_offset + offset
             )));
         }
 
         let batch: Vec<EventEnvelope> = serde_json::from_slice(payload).map_err(|err| {
             EventStoreError::Corrupt(format!(
                 "record at byte {} passed its checksum but did not parse: {}",
-                offset, err
+                first_offset + offset,
+                err
             ))
         })?;
 
@@ -252,7 +304,8 @@ fn decode_records(bytes: &[u8]) -> Result<(Vec<EventEnvelope>, usize), EventStor
                 .any(|event| !matches!(event.event, ExchangeEvent::Output(_)))
         {
             return Err(EventStoreError::Corrupt(format!(
-                "record at byte {offset} is not one complete input/output batch"
+                "record at byte {} is not one complete input/output batch",
+                first_offset + offset
             )));
         }
 
@@ -427,5 +480,45 @@ mod tests {
         assert!(store.append(&deposit_batch(3, 250)).is_err());
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn suffix_recovery_starts_at_a_committed_record_boundary() {
+        let path = temp_path("suffix");
+        let boundary;
+        {
+            let (mut store, _) = EventStore::open(&path).unwrap();
+            store.append(&deposit_batch(1, 10)).unwrap();
+            boundary = store.file.metadata().unwrap().len();
+            store.append(&deposit_batch(3, 20)).unwrap();
+        }
+
+        let (_store, suffix) = EventStore::open_suffix(&path, boundary).unwrap();
+        assert_eq!(suffix, deposit_batch(3, 20));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn suffix_recovery_drops_only_a_torn_suffix_tail() {
+        let path = temp_path("suffix-torn-tail");
+        let boundary;
+        {
+            let (mut store, _) = EventStore::open(&path).unwrap();
+            store.append(&deposit_batch(1, 10)).unwrap();
+            boundary = store.file.metadata().unwrap().len();
+            store.append(&deposit_batch(3, 20)).unwrap();
+        }
+        let full = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(full - 4)
+            .unwrap();
+
+        let (_store, suffix) = EventStore::open_suffix(&path, boundary).unwrap();
+        assert!(suffix.is_empty());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), boundary);
+        std::fs::remove_file(path).unwrap();
     }
 }

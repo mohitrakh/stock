@@ -6,3 +6,4 @@ pub mod event_stream;
 pub mod market_data;
 pub mod reporter;
 pub mod runtime;
+pub mod snapshot;

@@ -1,10 +1,26 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use super::types::{Price, WalletError};
 
 pub struct Wallet {
     balances: HashMap<String, u64>,
     locked: HashMap<String, u64>,
+}
+
+/// Normalized on-disk form of the cash ledger. The runtime maps are intentionally kept private
+/// and use a convenient lookup shape; snapshots use rows so JSON never has to encode map keys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WalletSnapshot {
+    pub(crate) entries: Vec<WalletSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WalletSnapshotEntry {
+    pub(crate) user_id: String,
+    pub(crate) balance: u64,
+    pub(crate) locked: u64,
 }
 
 impl Wallet {
@@ -201,5 +217,53 @@ impl Wallet {
     pub(crate) fn commit_settlement(&mut self, user_id: String, balance: u64, locked: u64) {
         self.balances.insert(user_id.clone(), balance);
         self.locked.insert(user_id, locked);
+    }
+
+    pub(crate) fn snapshot(&self) -> WalletSnapshot {
+        let mut user_ids: Vec<_> = self
+            .balances
+            .keys()
+            .chain(self.locked.keys())
+            .cloned()
+            .collect();
+        user_ids.sort();
+        user_ids.dedup();
+
+        WalletSnapshot {
+            entries: user_ids
+                .into_iter()
+                .map(|user_id| WalletSnapshotEntry {
+                    balance: self.balance(&user_id),
+                    locked: self.locked(&user_id),
+                    user_id,
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: WalletSnapshot) -> Result<Self, String> {
+        let mut balances = HashMap::new();
+        let mut locked = HashMap::new();
+
+        for entry in snapshot.entries {
+            if entry.locked > entry.balance {
+                return Err(format!(
+                    "wallet snapshot locks more cash than it holds for {}",
+                    entry.user_id
+                ));
+            }
+            if balances
+                .insert(entry.user_id.clone(), entry.balance)
+                .is_some()
+            {
+                return Err(format!(
+                    "wallet snapshot contains duplicate user {}",
+                    entry.user_id
+                ));
+            }
+            locked.insert(entry.user_id, entry.locked);
+        }
+
+        Ok(Self { balances, locked })
     }
 }

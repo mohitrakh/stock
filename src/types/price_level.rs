@@ -95,6 +95,21 @@ impl PriceLevel {
         }
         total
     }
+
+    /// FIFO-resting orders, head to tail. The index/node representation is deliberately rebuilt
+    /// from this normalized form on snapshot recovery rather than being persisted directly.
+    pub(crate) fn orders_in_queue(&self) -> Vec<Order> {
+        let mut orders = Vec::with_capacity(self.order_map.len());
+        let mut current_idx = self.head_idx;
+        while let Some(idx) = current_idx {
+            let node = &self.nodes[idx];
+            if let Some(order) = &node.order {
+                orders.push(order.clone());
+            }
+            current_idx = node.next_idx;
+        }
+        orders
+    }
     /// The oldest resting order at this level not owned by `exclude_user`.
     ///
     /// Self-trade prevention walks past the aggressor's own orders instead of stopping at them,

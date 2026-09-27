@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 
-use super::positions::Positions;
-use super::risk_manager::RiskManager;
+use serde::{Deserialize, Serialize};
+
+use super::positions::{Positions, PositionsSnapshot};
+use super::risk_manager::{RiskManager, RiskManagerSnapshot};
 use super::types::{
     BalanceView, Execution, ExecutionView, Order, OrderView, PositionView, Price, RiskLimitView,
     Side,
 };
-use super::wallet::Wallet;
+use super::wallet::{Wallet, WalletSnapshot};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum OrderState {
     New,
     PartiallyFilled,
@@ -41,6 +43,7 @@ pub enum OrderManagerError {
     MatchingRejected(String),
     Internal(String),
 }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManagedOrder {
     pub order: Order,
     pub state: OrderState,
@@ -57,6 +60,21 @@ pub struct OrderManager {
     /// which side of the trade each party was on.
     executions: HashMap<String, Vec<ExecutionView>>,
     execution_callbacks: Vec<Box<dyn Fn(Execution) + Send + Sync>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct OrderManagerSnapshot {
+    orders: Vec<ManagedOrder>,
+    risk_manager: RiskManagerSnapshot,
+    wallet: WalletSnapshot,
+    positions: PositionsSnapshot,
+    executions: Vec<UserExecutionSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct UserExecutionSnapshot {
+    user_id: String,
+    executions: Vec<ExecutionView>,
 }
 
 pub(crate) struct WalletSettlement {
@@ -795,5 +813,172 @@ impl OrderManager {
 
     pub fn subscribe<F: Fn(Execution) + Send + Sync + 'static>(&mut self, callback: F) {
         self.execution_callbacks.push(Box::new(callback));
+    }
+
+    pub(crate) fn snapshot(&self) -> OrderManagerSnapshot {
+        let mut orders: Vec<_> = self.orders.values().cloned().collect();
+        orders.sort_by(|left, right| left.order.order_id.cmp(&right.order.order_id));
+
+        let mut executions: Vec<_> = self
+            .executions
+            .iter()
+            .map(|(user_id, executions)| UserExecutionSnapshot {
+                user_id: user_id.clone(),
+                executions: executions.clone(),
+            })
+            .collect();
+        executions.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+
+        OrderManagerSnapshot {
+            orders,
+            risk_manager: self.risk_manager.snapshot(),
+            wallet: self.wallet.snapshot(),
+            positions: self.positions.snapshot(),
+            executions,
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: OrderManagerSnapshot) -> Result<Self, String> {
+        let mut orders = HashMap::new();
+        for managed in snapshot.orders {
+            Self::validate_managed_order(&managed)?;
+            let order_id = managed.order.order_id.clone();
+            if orders.insert(order_id.clone(), managed).is_some() {
+                return Err(format!(
+                    "order-manager snapshot contains duplicate order {}",
+                    order_id
+                ));
+            }
+        }
+
+        let mut executions = HashMap::new();
+        for entry in snapshot.executions {
+            if executions
+                .insert(entry.user_id.clone(), entry.executions)
+                .is_some()
+            {
+                return Err(format!(
+                    "order-manager snapshot contains duplicate execution owner {}",
+                    entry.user_id
+                ));
+            }
+        }
+
+        Ok(Self {
+            orders,
+            risk_manager: RiskManager::from_snapshot(snapshot.risk_manager)?,
+            wallet: Wallet::from_snapshot(snapshot.wallet)?,
+            positions: Positions::from_snapshot(snapshot.positions)?,
+            executions,
+            execution_callbacks: Vec::new(),
+        })
+    }
+
+    fn validate_managed_order(managed: &ManagedOrder) -> Result<(), String> {
+        if managed.order.quantity == 0 || managed.remaining_quantity > managed.order.quantity {
+            return Err(format!(
+                "order-manager snapshot has invalid quantity for {}",
+                managed.order.order_id
+            ));
+        }
+
+        let state_matches_remaining = match managed.state {
+            OrderState::New => managed.remaining_quantity == managed.order.quantity,
+            OrderState::PartiallyFilled => {
+                managed.remaining_quantity > 0
+                    && managed.remaining_quantity < managed.order.quantity
+            }
+            OrderState::Filled => managed.remaining_quantity == 0,
+            OrderState::Canceled => managed.remaining_quantity > 0,
+        };
+        if !state_matches_remaining {
+            return Err(format!(
+                "order-manager snapshot has inconsistent state for {}",
+                managed.order.order_id
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_collateral(&self) -> Result<(), String> {
+        let mut expected_cash = HashMap::<String, u64>::new();
+        let mut expected_shares = HashMap::<(String, String), u64>::new();
+
+        for managed in self.orders.values() {
+            if !matches!(managed.state, OrderState::New | OrderState::PartiallyFilled) {
+                continue;
+            }
+            match managed.order.side {
+                Side::Buy => {
+                    let notional = managed
+                        .order
+                        .price
+                        .checked_notional(managed.remaining_quantity as u64)
+                        .ok_or_else(|| {
+                            format!(
+                                "order-manager snapshot has overflowing collateral for {}",
+                                managed.order.order_id
+                            )
+                        })?;
+                    let entry = expected_cash
+                        .entry(managed.order.user_id.clone())
+                        .or_default();
+                    *entry = entry.checked_add(notional).ok_or_else(|| {
+                        format!(
+                            "order-manager snapshot has overflowing cash collateral for {}",
+                            managed.order.user_id
+                        )
+                    })?;
+                }
+                Side::Sell => {
+                    let key = (managed.order.user_id.clone(), managed.order.symbol.clone());
+                    let entry = expected_shares.entry(key).or_default();
+                    *entry = entry
+                        .checked_add(managed.remaining_quantity as u64)
+                        .ok_or_else(|| {
+                            format!(
+                                "order-manager snapshot has overflowing share collateral for {}",
+                                managed.order.order_id
+                            )
+                        })?;
+                }
+            }
+        }
+
+        let mut wallet_users: Vec<_> = self.wallet.snapshot().entries;
+        wallet_users.sort_by(|left, right| left.user_id.cmp(&right.user_id));
+        for entry in wallet_users {
+            if entry.locked != expected_cash.remove(&entry.user_id).unwrap_or(0) {
+                return Err(format!(
+                    "wallet lock does not match active orders for {}",
+                    entry.user_id
+                ));
+            }
+        }
+        if let Some(user_id) = expected_cash.keys().next() {
+            return Err(format!(
+                "active buy order has no wallet entry for {}",
+                user_id
+            ));
+        }
+
+        let positions = self.positions.snapshot().entries;
+        for entry in positions {
+            let key = (entry.user_id.clone(), entry.symbol.clone());
+            if entry.locked != expected_shares.remove(&key).unwrap_or(0) {
+                return Err(format!(
+                    "position lock does not match active orders for {} {}",
+                    entry.user_id, entry.symbol
+                ));
+            }
+        }
+        if let Some((user_id, symbol)) = expected_shares.keys().next() {
+            return Err(format!(
+                "active sell order has no position entry for {} {}",
+                user_id, symbol
+            ));
+        }
+
+        Ok(())
     }
 }

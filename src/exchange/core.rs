@@ -10,6 +10,8 @@ use crate::{
     },
 };
 
+use serde::{Deserialize, Serialize};
+
 pub struct AddOrderOutcome {
     pub order_id: String,
     pub seq_num: u64,
@@ -45,6 +47,15 @@ pub struct ExchangeCore {
     order_manager: OrderManager,
     matching_engine: MatchingEngine,
     sequencer: Sequencer,
+}
+
+/// Complete deterministic state required to resume the single-owner exchange core. It has no
+/// filesystem, queue, HTTP, callback, or mmap handles; those remain runtime concerns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CoreSnapshot {
+    order_manager: crate::types::order_manager::OrderManagerSnapshot,
+    matching_engine: crate::types::matching_engine::MatchingEngineSnapshot,
+    next_matching_sequence: u64,
 }
 
 impl ExchangeCore {
@@ -257,6 +268,85 @@ impl ExchangeCore {
         let cancel_seq = prepared.seq_num;
         self.commit_cancel_order(prepared);
         Ok(cancel_seq)
+    }
+
+    pub(crate) fn snapshot(&self) -> CoreSnapshot {
+        CoreSnapshot {
+            order_manager: self.order_manager.snapshot(),
+            matching_engine: self.matching_engine.snapshot(),
+            next_matching_sequence: self.sequencer.next_sequence(),
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: CoreSnapshot) -> Result<Self, String> {
+        if snapshot.next_matching_sequence == 0 {
+            return Err("core snapshot has an invalid next matching sequence".to_string());
+        }
+        let order_manager = OrderManager::from_snapshot(snapshot.order_manager)?;
+        let matching_engine = MatchingEngine::from_snapshot(snapshot.matching_engine)?;
+        if matching_engine
+            .last_sequence()
+            .checked_add(1)
+            .filter(|sequence| *sequence == snapshot.next_matching_sequence)
+            .is_none()
+        {
+            return Err("core snapshot has inconsistent matching sequence state".to_string());
+        }
+
+        let core = Self {
+            order_manager,
+            matching_engine,
+            sequencer: Sequencer::new(snapshot.next_matching_sequence),
+        };
+        core.validate_snapshot()?;
+        Ok(core)
+    }
+
+    fn validate_snapshot(&self) -> Result<(), String> {
+        self.order_manager.validate_collateral()?;
+
+        let mut resting = std::collections::HashMap::new();
+        for order in self.matching_engine.resting_orders() {
+            if resting.insert(order.order_id.clone(), order).is_some() {
+                return Err("core snapshot contains a duplicated resting order".to_string());
+            }
+        }
+
+        for managed in self.order_manager.orders.values() {
+            let is_resting = matches!(
+                managed.state,
+                crate::types::order_manager::OrderState::New
+                    | crate::types::order_manager::OrderState::PartiallyFilled
+            );
+            let book_order = resting.remove(&managed.order.order_id);
+            if is_resting != book_order.is_some() {
+                return Err(format!(
+                    "core snapshot disagrees about whether order {} is resting",
+                    managed.order.order_id
+                ));
+            }
+            if let Some(book_order) = book_order
+                && (book_order.user_id != managed.order.user_id
+                    || book_order.symbol != managed.order.symbol
+                    || book_order.side != managed.order.side
+                    || book_order.price != managed.order.price
+                    || book_order.quantity != managed.order.quantity
+                    || book_order.leaves_qty != managed.remaining_quantity)
+            {
+                return Err(format!(
+                    "core snapshot has inconsistent resting order {}",
+                    managed.order.order_id
+                ));
+            }
+        }
+        if let Some(order_id) = resting.keys().next() {
+            return Err(format!(
+                "core snapshot has resting order {} missing from order management",
+                order_id
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -1112,5 +1202,61 @@ mod tests {
         assert_eq!(core.sequencer.peek(), 2);
         assert_eq!(core.order_manager.get_state("buy-1"), Some(OrderState::New));
         assert!(core.matching_engine.is_resting("buy-1"));
+    }
+
+    #[test]
+    fn normalized_snapshot_restores_fifo_books_ledgers_and_sequences() {
+        let mut core = ExchangeCore::new();
+        core.deposit("buyer".to_string(), 100).unwrap();
+        core.deposit_shares("seller-a", "AAPL", 5).unwrap();
+        core.deposit_shares("seller-b", "AAPL", 5).unwrap();
+        core.add_order(order("sell-a", "seller-a", "SELL", 10, 5))
+            .unwrap();
+        core.add_order(order("sell-b", "seller-b", "SELL", 10, 5))
+            .unwrap();
+        core.add_order(order("buy", "buyer", "BUY", 10, 7)).unwrap();
+
+        let snapshot = core.snapshot();
+        let mut restored = ExchangeCore::from_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(restored.snapshot(), snapshot);
+        assert_eq!(
+            restored.l2_snapshot("AAPL", 10).unwrap().asks,
+            vec![crate::types::types::L2Level {
+                price: 10,
+                quantity: 3,
+            }]
+        );
+        assert_eq!(
+            restored.order_view("sell-a", "seller-a").unwrap().status,
+            "filled"
+        );
+        assert_eq!(
+            restored
+                .order_view("sell-b", "seller-b")
+                .unwrap()
+                .remaining_quantity,
+            3
+        );
+        assert_eq!(
+            restored
+                .execution_views("buyer", None, None, None, None)
+                .len(),
+            2
+        );
+
+        // The new order must receive the sequence after the three accepted commands in the
+        // checkpoint. This also proves that the reconstructed index can continue matching.
+        let outcome = restored
+            .add_order(order("buyer-rest", "buyer", "BUY", 9, 1))
+            .unwrap();
+        assert_eq!(outcome.seq_num, 4);
+    }
+
+    #[test]
+    fn snapshot_rejects_inconsistent_matching_sequence() {
+        let core = ExchangeCore::new();
+        let mut snapshot = core.snapshot();
+        snapshot.next_matching_sequence = 2;
+        assert!(ExchangeCore::from_snapshot(snapshot).is_err());
     }
 }

@@ -157,7 +157,7 @@ pub struct PositionView {
 
 /// One fill, from the perspective of one party to it. `side` and `order_id` are that party's, so
 /// the two records a single match produces differ between buyer and seller.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionView {
     pub execution_id: String,
     pub order_id: String,

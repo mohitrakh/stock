@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 /// Why a share reservation or delivery was refused. Mirrors `WalletError`, because a position
 /// ledger is the same ledger shape as a cash ledger with shares as the unit.
 #[derive(Debug, PartialEq)]
@@ -17,6 +19,20 @@ pub enum PositionError {
 pub struct Positions {
     holdings: HashMap<(String, String), u64>,
     locked: HashMap<(String, String), u64>,
+}
+
+/// Normalized snapshot rows avoid relying on JSON object-key encoding for `(user, symbol)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PositionsSnapshot {
+    pub(crate) entries: Vec<PositionSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PositionSnapshotEntry {
+    pub(crate) user_id: String,
+    pub(crate) symbol: String,
+    pub(crate) holding: u64,
+    pub(crate) locked: u64,
 }
 
 impl Positions {
@@ -231,6 +247,53 @@ impl Positions {
         rows.sort_by(|left, right| left.0.cmp(&right.0));
 
         rows
+    }
+
+    pub(crate) fn snapshot(&self) -> PositionsSnapshot {
+        let mut keys: Vec<_> = self
+            .holdings
+            .keys()
+            .chain(self.locked.keys())
+            .cloned()
+            .collect();
+        keys.sort();
+        keys.dedup();
+
+        PositionsSnapshot {
+            entries: keys
+                .into_iter()
+                .map(|(user_id, symbol)| PositionSnapshotEntry {
+                    holding: self.holding(&user_id, &symbol),
+                    locked: self.locked(&user_id, &symbol),
+                    user_id,
+                    symbol,
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: PositionsSnapshot) -> Result<Self, String> {
+        let mut holdings = HashMap::new();
+        let mut locked = HashMap::new();
+
+        for entry in snapshot.entries {
+            if entry.locked > entry.holding {
+                return Err(format!(
+                    "position snapshot locks more shares than it holds for {} {}",
+                    entry.user_id, entry.symbol
+                ));
+            }
+            let key = (entry.user_id, entry.symbol);
+            if holdings.insert(key.clone(), entry.holding).is_some() {
+                return Err(format!(
+                    "position snapshot contains duplicate entry for {} {}",
+                    key.0, key.1
+                ));
+            }
+            locked.insert(key, entry.locked);
+        }
+
+        Ok(Self { holdings, locked })
     }
 }
 

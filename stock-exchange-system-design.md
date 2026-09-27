@@ -1,6 +1,6 @@
 # Chapter 29: Stock Exchange
 
-> Repository status, 2026-09-26: this document remains the target architecture. The implementation now has atomic prepare/commit processing, a durable journal, and an outbound committed mmap stream with independent readers and journal catch-up. Its mmap window uses cooperative file locks; it does not yet provide the lock-free latency, mmap ingress, market-data publisher, reporting, or hot-warm replication described below. See `SYSTEM_DOCUMENTATION.md` and `docs/tasks/06-mmap-committed-event-stream.md` for the implemented boundary and tested guarantees.
+> Repository status, 2026-09-27: this document remains the target architecture. The implementation now has atomic prepare/commit processing, a durable journal, journal-bound authoritative-core snapshots with deterministic suffix replay, an outbound committed mmap stream with independent readers and journal catch-up, an independent L2 market-data publisher, and an independent PostgreSQL reporter. Snapshots do not compact the journal. The mmap window uses cooperative file locks; it does not yet provide lock-free latency, mmap ingress, cross-host replication, or hot-warm matching described below. See `SYSTEM_DOCUMENTATION.md`, `docs/tasks/06-mmap-committed-event-stream.md`, and `docs/tasks/11-authoritative-core-snapshots.md` for the implemented boundary and tested guarantees.
 
 In this chapter, we design an electronic stock exchange system.
 

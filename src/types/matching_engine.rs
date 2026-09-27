@@ -1,12 +1,20 @@
 use std::collections::HashMap;
 
-use super::order_book::OrderBook;
+use serde::{Deserialize, Serialize};
+
+use super::order_book::{OrderBook, OrderBookSnapshot};
 use super::types::{Execution, L2Level, Order, OrderBookView, Price};
 
 #[derive(Debug)]
 pub struct MatchingEngine {
     order_books: HashMap<String, OrderBook>,
     order_location: HashMap<String, String>,
+    last_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct MatchingEngineSnapshot {
+    books: Vec<OrderBookSnapshot>,
     last_seq: u64,
 }
 
@@ -159,5 +167,61 @@ impl MatchingEngine {
 
     pub fn is_resting(&self, order_id: &str) -> bool {
         self.order_location.contains_key(order_id)
+    }
+
+    pub(crate) fn snapshot(&self) -> MatchingEngineSnapshot {
+        let mut books: Vec<_> = self.order_books.values().map(OrderBook::snapshot).collect();
+        books.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+        MatchingEngineSnapshot {
+            books,
+            last_seq: self.last_seq,
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: MatchingEngineSnapshot) -> Result<Self, String> {
+        let mut order_books = HashMap::new();
+        let mut order_location = HashMap::new();
+
+        for book_snapshot in snapshot.books {
+            let symbol = book_snapshot.symbol.clone();
+            let book = OrderBook::from_snapshot(book_snapshot)?;
+            if order_books.insert(symbol.clone(), book).is_some() {
+                return Err(format!(
+                    "matching snapshot contains duplicate book for {}",
+                    symbol
+                ));
+            }
+        }
+
+        for (symbol, book) in &order_books {
+            for order in book.resting_orders() {
+                if order_location
+                    .insert(order.order_id.clone(), symbol.clone())
+                    .is_some()
+                {
+                    return Err(format!(
+                        "matching snapshot contains duplicate resting order {}",
+                        order.order_id
+                    ));
+                }
+            }
+        }
+
+        Ok(Self {
+            order_books,
+            order_location,
+            last_seq: snapshot.last_seq,
+        })
+    }
+
+    pub(crate) fn last_sequence(&self) -> u64 {
+        self.last_seq
+    }
+
+    pub(crate) fn resting_orders(&self) -> Vec<Order> {
+        self.order_books
+            .values()
+            .flat_map(OrderBook::resting_orders)
+            .collect()
     }
 }
