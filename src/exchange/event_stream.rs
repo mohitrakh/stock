@@ -302,6 +302,20 @@ pub struct StreamReader {
 }
 
 impl StreamReader {
+    pub fn checkpoint_from_parts(
+        device: u64,
+        inode: u64,
+        next_sequence: u64,
+        byte_offset: u64,
+    ) -> ReaderCheckpoint {
+        ReaderCheckpoint {
+            device,
+            inode,
+            next_sequence,
+            byte_offset,
+        }
+    }
+
     pub fn open(
         journal_path: impl AsRef<Path>,
         stream_path: impl AsRef<Path>,

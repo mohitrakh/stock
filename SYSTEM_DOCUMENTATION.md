@@ -146,6 +146,20 @@ Missing state triggers replay from journal sequence 1. Present invalid JSON, uns
 
 ## HTTP read and write surface
 
+## Reporter v1
+
+Reporter is the second independent business subscriber. Start it only after applying the versioned PostgreSQL migrations:
+
+```sh
+cargo run -- --reporter exchange-events.log exchange-events.log.mmap [LISTEN_ADDR]
+```
+
+It defaults to `127.0.0.1:4002` and requires `DATABASE_URL`. It catches up before binding `GET /health`; a terminal stream, decoder, projection, or database error makes that route return 503 without affecting trading or MDP.
+
+`reporter_checkpoint` stores the journal identity and next complete-batch cursor. `reported_orders` preserves each submitted order's current lifecycle and outcome; `reported_trades` stores exactly one row for each adjacent two-sided execution pair. Exact unsigned journal identities and prices are stored as PostgreSQL `NUMERIC(20,0)`. Each batch performs projection writes and checkpoint advancement in one SQL transaction, so a pre-commit crash retries the whole batch and a post-commit restart resumes after it.
+
+The projection uses the shared committed-batch decoder with MDP, but owns its own order-state and database checks. Missing checkpoint with existing report rows, incompatible journal identity, malformed batches, duplicate trade/execution identities, missing resting rows, and impossible state changes fail closed. There is no reporting query API in v1.
+
 Private exchange queries use the same queue and single owner, returning through oneshot without adding journal or stream events. They do not use the mmap reader.
 
 | Method | Path | Access |
@@ -175,8 +189,8 @@ The previous `/exchange/orderbook/{symbol}` route and `ExchangeCommand::GetOrder
 
 ## Verification and remaining scope
 
-`cargo fmt -- --check` and `cargo test --locked --offline` pass: 108 unit tests plus 4 executable integration tests. Coverage includes overnight risk rollover and durable replay, independent fast/slow readers, window overwrite, oversize batches, checkpoint boundary/identity validation, cache/journal corruption, competing writers, durable-but-unpublished recovery, failed append with no publication, fatal publication failure, real cross-process reading, SIGKILL at publication boundaries, probe checkpoint resume, and MDP projection/recovery/HTTP behavior without PostgreSQL.
+`cargo fmt -- --check` and `cargo test --locked --offline` pass: 109 unit tests plus 4 executable integration tests. Coverage includes overnight risk rollover and durable replay, independent fast/slow readers, window overwrite, oversize batches, checkpoint boundary/identity validation, cache/journal corruption, competing writers, durable-but-unpublished recovery, failed append with no publication, fatal publication failure, real cross-process reading, SIGKILL at publication boundaries, probe checkpoint resume, and MDP projection/recovery/HTTP behavior without PostgreSQL. The ignored opt-in Reporter executable test is run with `REPORTER_TEST_DATABASE_URL` after migrations and proved catch-up, persisted lifecycle data, and checkpoint advancement against an isolated PostgreSQL instance.
 
 These tests include core/runtime and actual executable checks. MDP coverage includes oracle comparison, multi-fill and cancellation behavior, malformed batches, aggregation beyond `u32::MAX`, state replacement failures, journal catch-up, MDP and exchange-stream restarts, live following, and fail-closed 503 responses. A manual isolated-database run also exercised authenticated trading HTTP plus the separate MDP process through rest, partial fill, cancellation, MDP restart, and resumed live publication. This does not claim machine power-loss testing or performance benchmarking. Clippy still reports existing compatibility/dead-code and style warnings.
 
-The MDP rewrites and synchronizes its complete JSON open-order state after every command batch; this correctness-first design has not been throughput tested. Trade tape, candles, reporting projections, historical market-data storage, hot-warm replication, cross-host recovery, mmap ingress, lock-free queues, snapshots, group commit, and CPU pinning remain separate milestones.
+Both subscribers are correctness-first and have not been throughput tested. Candles, tax/customer statements, settlement, historical reporting APIs, hot-warm replication, cross-host recovery, mmap ingress, lock-free queues, snapshots, group commit, and CPU pinning remain separate milestones.

@@ -1,4 +1,4 @@
-# Project Direction - Market Data Publisher v1 Completed
+# Project Direction - Reporter v1 Completed
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -12,7 +12,7 @@ The repository is a learning stock exchange with an exchange-grade architecture 
 
 ## Current Status
 
-The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log with startup recovery, and a bounded mmap stream with independent readers and durable catch-up. It also has exact integer prices, deterministic replay, collateral on both sides of a trade, overnight-safe daily risk accounting, client-supplied order ids, and authenticated exchange reads for balances, positions, orders, executions, and risk limits. MDP v1 is now the first independent business subscriber: it reconstructs public L2 books from committed batches and serves them from a separate process without querying the exchange core.
+The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log with startup recovery, and a bounded mmap stream with independent readers and durable catch-up. MDP v1 reconstructs public L2 books independently. Reporter v1 is the second independent subscriber: it consumes the same complete committed batches and atomically projects durable order lifecycle and one-row-per-trade history into PostgreSQL. Neither subscriber is on the trading path.
 
 ```text
 Axum HTTP handler
@@ -346,7 +346,85 @@ The implementation and tests demonstrate the following:
 
 Do not expand this milestone into candlesticks, historical analytics storage, reporting, FIX/SBE, UDP or multicast distribution, paid depth tiers, hot-warm matching, cross-host replication, lock-free ring buffers, CPU pinning, group commit, snapshots of the authoritative exchange core, or per-symbol exchange workers. Those build on a proven subscriber boundary and need separate correctness and failure models.
 
-Candlesticks are specifically deferred because they introduce interval, timestamp, exchange-calendar, and retention policy. Reporting is deferred because database effects require their own idempotency and checkpoint transaction. Hot-warm failover is deferred because it additionally requires cross-host replication, leader/fencing rules, promotion behavior, and explicit RPO/RTO tests.
+Candlesticks were specifically deferred from MDP v1 because they introduce interval, timestamp, exchange-calendar, and retention policy. Reporting was deferred from MDP v1 because database effects require their own idempotency and checkpoint transaction; it is now the selected separate milestone below. Hot-warm failover remains deferred because it additionally requires cross-host replication, leader/fencing rules, promotion behavior, and explicit RPO/RTO tests.
+
+## Selected Next Milestone: Reporter v1
+
+**Status: completed on 2026-09-26.** Full write-up: `docs/tasks/09-reporter-v1.md`.
+
+Reporter v1 will be the second independent business subscriber to the committed event pipeline. MDP answers, "What does the public order book look like now?" Reporter answers, "What happened to each order and trade over time?" A fully filled or canceled order disappears from the live book, but its history must remain available for order history, trade confirmation, reconciliation, investigation, and later compliance/reporting work.
+
+```text
+authoritative journal + bounded mmap delivery cache
+  -> StreamReader
+       -> MDP v1
+            -> current open-order projection
+            -> current public L2 book
+       -> Reporter v1
+            -> durable order lifecycle rows
+            -> durable trade rows
+            -> reporter checkpoint
+```
+
+The reporter is not part of matching and must never be placed on the trading critical path. It does not query or mutate `ExchangeCore`, and matching does not wait for PostgreSQL. If the reporter or its database is stopped, trading and MDP continue. When the reporter returns, it resumes from its saved checkpoint or catches up from the authoritative journal through `StreamReader`, then follows current mmap publication.
+
+### Reporter v1 output
+
+The first reporting projection is intentionally narrow:
+
+- One durable order-lifecycle record per submitted order, including ownership, symbol, side, limit price, original quantity, filled quantity, remaining quantity, current status, and acceptance, rejection, or cancellation outcome.
+- One durable trade record per actual match, including symbol, price, quantity, both order ids, both execution ids, and the committed event identity used to make the row unique.
+- One durable reporter checkpoint tied to the journal identity and the next complete command batch to consume.
+
+The matching engine currently emits two adjacent `ExecutionCreated` events for one match, one for each party. The reporter must validate that pair and store one trade, not double the traded quantity. A stable committed envelope sequence can identify the trade while both execution ids remain available for audit. Exact table names and indexes belong in the task design, but the order, trade, and checkpoint responsibilities are required.
+
+Reporter v1 does not need a public reporting API. The database projection and a small health/readiness surface are sufficient for this milestone; integration tests can inspect PostgreSQL directly. Customer statements, tax documents, downloads, settlement, dashboards, candles, and historical market-data APIs are later work.
+
+### Shared committed-batch interpretation
+
+MDP currently contains the first strict interpretation of committed command batches: accepted versus rejected orders, successful versus rejected cancellations, and two-sided execution pairs. Reporter needs the same structural understanding. Before adding a second independent copy of those rules, extract a small shared decoder that converts a raw committed batch into a validated committed-command representation.
+
+The shared layer should validate batch structure and execution-pair agreement only. MDP keeps book-specific checks such as resting-order presence and price-level changes. Reporter keeps database and lifecycle-specific checks. This avoids two subscribers quietly disagreeing about what one committed batch means, without changing the durable `ExchangeEvent` schema or journal format.
+
+### Transaction and recovery rule
+
+The important new correctness problem is coordinating an external database effect with the stream checkpoint. For each complete command batch, Reporter v1 must use one PostgreSQL transaction:
+
+```text
+begin SQL transaction
+  -> validate and apply order/trade projection changes
+  -> save the reporter's new ReaderCheckpoint
+commit SQL transaction
+```
+
+If the process dies before the SQL commit, neither the reporting rows nor the checkpoint advances, so the complete batch is retried. If the commit succeeds, both advance together. Unique keys and lifecycle checks must make a duplicate or inconsistent replay visible rather than silently creating a second trade. This provides atomic application inside the reporter database; it is not a claim of universal exactly-once delivery to arbitrary external systems.
+
+A missing reporter checkpoint means an explicit rebuild from journal sequence 1 into an empty reporter projection. A present but invalid checkpoint, journal identity mismatch, incomplete command boundary, or inconsistent reporting state must refuse startup. Reporter database failures are terminal for that reporter process but must not affect exchange availability.
+
+### Why this follows MDP
+
+The completed mmap stream was built for multiple independent consumers, and MDP proved the first consumer can catch up, persist its state with its checkpoint, restart, and remain outside matching. Reporter v1 reuses that proven boundary while testing the next distinct failure model: a subscriber whose durable projection lives in PostgreSQL and whose projection writes and checkpoint must commit together.
+
+This should come before candles because candle work first needs interval, timestamp, exchange-calendar, late-event, and retention decisions. It should come before hot-warm failover because failover additionally needs cross-host replication, leader election, fencing, promotion behavior, and explicit RPO/RTO targets. Lock-free mmap and critical-path tuning should follow measured latency evidence rather than replace the current correctness-first transport speculatively.
+
+### Reporter v1 completion criteria
+
+Reporter v1 is complete only when all of the following are demonstrated:
+
+- It runs as a separate OS process and consumes complete committed batches through `StreamReader`.
+- Accepted, rejected, resting, partially filled, fully filled, multi-fill, successfully canceled, and rejected-cancel orders produce the expected lifecycle records.
+- Each valid two-sided execution pair produces exactly one trade record and updates both affected orders correctly.
+- Projection changes and the new `ReaderCheckpoint` commit in the same PostgreSQL transaction.
+- Injected failures before and after SQL commit prove that restart creates neither missing nor duplicate order/trade effects.
+- Missing state rebuilds from sequence 1; corrupt, structurally inconsistent, or journal-mismatched state refuses startup without silently clearing existing data.
+- A reporter can catch up from journal records outside the mmap window, return to live mmap delivery, survive reporter restart, and survive exchange stream restart with the same journal.
+- Reporter health becomes ready only after initial catch-up and becomes unavailable after a terminal stream or database failure.
+- Stopping the reporter or PostgreSQL does not stop order entry, matching, journal commits, mmap publication, or MDP service.
+- Integration tests use an isolated PostgreSQL database and compare representative report rows with the exchange core's known order and execution results.
+- The existing durable event schema, journal format, single-owner core, and trading critical path remain unchanged.
+- `cargo fmt -- --check`, `cargo test --locked --offline`, clippy, an executable exchange-plus-reporter recovery run, `docs/tasks/09-reporter-v1.md`, and the related documentation updates are complete.
+
+Before implementation begins, preserve the completed mmap and MDP working tree as a reviewed repository checkpoint so the new milestone is not mixed with uncommitted prior work.
 
 ## Known Prototype Limitations
 
@@ -379,7 +457,7 @@ Candlesticks are specifically deferred because they introduce interval, timestam
 
 ## What Not To Work On Yet
 
-No next milestone has been selected. Discuss and record the next architecture step before implementing it. Do not automatically expand MDP v1 into candles, reporting, snapshots, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, FIX/SBE, UDP, replication, or hot-warm engines. The committed mmap reader remains the MDP input; inbound commands remain on the existing bounded Tokio queue.
+No next milestone is selected. Do not expand completed Reporter v1 into candles, tax or customer statements, settlement, historical market-data APIs, snapshots, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, FIX/SBE, UDP, replication, or hot-warm engines. The committed mmap reader remains the input for both independent subscribers; inbound commands remain on the existing bounded Tokio queue.
 
 ## Rule For Future Sessions
 

@@ -40,6 +40,7 @@ const DEFAULT_EVENT_LOG_PATH: &str = "exchange-events.log";
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    dotenv().ok();
     if args.first().is_some_and(|arg| arg == "--event-probe") {
         if let Err(error) = exchange::event_probe::run(&args[1..]) {
             eprintln!("event probe: {error}");
@@ -54,13 +55,19 @@ async fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--reporter") {
+        if let Err(error) = exchange::reporter::run(&args[1..]).await {
+            eprintln!("reporter: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if !args.is_empty() {
         eprintln!(
-            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR]]"
+            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR]]"
         );
         std::process::exit(1);
     }
-    dotenv().ok();
     let db = db::connect_db().await;
     let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
 

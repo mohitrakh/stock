@@ -3,7 +3,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     error::Error,
     fs::{File, OpenOptions},
     io::{self, Write},
@@ -27,9 +27,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::event_stream::{ReaderCheckpoint, StreamReader};
+use super::{
+    committed_batch::{self, CancelOutcome, CommittedCommand, NewOrderOutcome},
+    event_stream::{ReaderCheckpoint, StreamReader},
+};
 use crate::types::{
-    exchange_event::{EventEnvelope, ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent},
+    exchange_event::EventEnvelope,
     types::{Execution, L2Level, Order, OrderBookView, Side},
 };
 
@@ -201,53 +204,20 @@ impl MarketDataProjection {
     }
 
     fn apply_batch(&mut self, batch: &[EventEnvelope]) -> Result<(), String> {
-        let first = batch.first().ok_or("empty committed batch")?;
-        let input = match &first.event {
-            ExchangeEvent::Input(input) => input,
-            ExchangeEvent::Output(_) => {
-                return Err("committed batch does not start with input".into());
+        match committed_batch::decode(batch)? {
+            CommittedCommand::NewOrder { order, outcome } => self.apply_new_order(&order, outcome),
+            CommittedCommand::Cancellation { order_id, outcome } => {
+                self.apply_cancellation(&order_id, outcome)
             }
-        };
-        let outputs = batch[1..]
-            .iter()
-            .map(|envelope| match &envelope.event {
-                ExchangeEvent::Output(output) => Ok(output),
-                ExchangeEvent::Input(_) => Err("committed batch contains a second input".into()),
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        if outputs.is_empty() {
-            return Err("committed batch has no output".into());
-        }
-
-        match input {
-            ExchangeInputEvent::NewOrderRequested { order } => {
-                self.apply_new_order(order, &outputs)
-            }
-            ExchangeInputEvent::CancelOrderRequested { order_id, .. } => {
-                self.apply_cancellation(order_id, &outputs)
-            }
-            ExchangeInputEvent::FundsDepositRequested { .. }
-            | ExchangeInputEvent::SharesDepositRequested { .. }
-            | ExchangeInputEvent::RiskLimitSetRequested { .. } => Ok(()),
+            CommittedCommand::Other => Ok(()),
         }
     }
 
-    fn apply_new_order(
-        &mut self,
-        order: &Order,
-        outputs: &[&ExchangeOutputEvent],
-    ) -> Result<(), String> {
-        match outputs[0] {
-            ExchangeOutputEvent::OrderRejected { order_id, .. } => {
-                if outputs.len() != 1 || order_id != &order.order_id {
-                    return Err("order rejection does not match its input".into());
-                }
-                return Ok(());
-            }
-            ExchangeOutputEvent::OrderAccepted { order_id, seq_num }
-                if order_id == &order.order_id && *seq_num > 0 => {}
-            _ => return Err("new-order batch has no matching acceptance or rejection".into()),
-        }
+    fn apply_new_order(&mut self, order: &Order, outcome: NewOrderOutcome) -> Result<(), String> {
+        let executions = match outcome {
+            NewOrderOutcome::Rejected { .. } => return Ok(()),
+            NewOrderOutcome::Accepted { executions, .. } => executions,
+        };
 
         if order.order_id.is_empty() || order.symbol.is_empty() || order.price.minor_units() == 0 {
             return Err("accepted order has an invalid id, symbol, or price".into());
@@ -261,29 +231,9 @@ impl MarketDataProjection {
         if order.leaves_qty == 0 || order.leaves_qty != order.quantity {
             return Err("accepted order has invalid initial remaining quantity".into());
         }
-        let execution_outputs = &outputs[1..];
-        if !execution_outputs.len().is_multiple_of(2) {
-            return Err("accepted order has an odd number of execution outputs".into());
-        }
-
         let mut incoming_remaining = order.leaves_qty as u64;
-        let mut execution_ids = HashSet::new();
-        for pair in execution_outputs.chunks_exact(2) {
-            let first = match pair[0] {
-                ExchangeOutputEvent::ExecutionCreated { execution } => execution,
-                _ => return Err("non-execution output follows order acceptance".into()),
-            };
-            let second = match pair[1] {
-                ExchangeOutputEvent::ExecutionCreated { execution } => execution,
-                _ => return Err("incomplete two-sided execution pair".into()),
-            };
-            if !execution_ids.insert(first.execution_id.as_str())
-                || !execution_ids.insert(second.execution_id.as_str())
-            {
-                return Err("accepted order contains a duplicate execution id".into());
-            }
-            validate_execution_pair(first, second)?;
-            self.apply_trade(order, first, &mut incoming_remaining)?;
+        for pair in executions {
+            self.apply_trade(order, &pair.first, &mut incoming_remaining)?;
         }
 
         if incoming_remaining > 0 {
@@ -357,23 +307,11 @@ impl MarketDataProjection {
     fn apply_cancellation(
         &mut self,
         requested_order_id: &str,
-        outputs: &[&ExchangeOutputEvent],
+        outcome: CancelOutcome,
     ) -> Result<(), String> {
-        if outputs.len() != 1 {
-            return Err("cancellation batch must contain exactly one output".into());
-        }
-        match outputs[0] {
-            ExchangeOutputEvent::OrderCanceled { order_id, seq_num }
-                if order_id == requested_order_id && *seq_num > 0 =>
-            {
-                self.cancel_order(order_id)
-            }
-            ExchangeOutputEvent::CancelRejected { order_id, .. }
-                if order_id == requested_order_id =>
-            {
-                Ok(())
-            }
-            _ => Err("cancellation output does not match its input".into()),
+        match outcome {
+            CancelOutcome::Canceled { .. } => self.cancel_order(requested_order_id),
+            CancelOutcome::Rejected { .. } => Ok(()),
         }
     }
 
@@ -403,19 +341,6 @@ impl MarketDataProjection {
             asks,
         })
     }
-}
-
-fn validate_execution_pair(first: &Execution, second: &Execution) -> Result<(), String> {
-    let same_trade = first.buy_order_id == second.buy_order_id
-        && first.sell_order_id == second.sell_order_id
-        && first.symbol == second.symbol
-        && first.price == second.price
-        && first.quantity == second.quantity
-        && first.timestamp.to_bits() == second.timestamp.to_bits();
-    if first.execution_id == second.execution_id || !same_trade {
-        return Err("two-sided execution pair is inconsistent".into());
-    }
-    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -666,6 +591,7 @@ mod tests {
         exchange::{
             core::ExchangeCore, event_stream::tests::Fixture, runtime::recover_runtime_with_stream,
         },
+        types::exchange_event::{ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent},
         types::types::{ExchangeCommand, Price},
     };
     use tokio::sync::{mpsc, oneshot};

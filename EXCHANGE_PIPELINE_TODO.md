@@ -275,6 +275,18 @@ Full write-up: `docs/tasks/08-market-data-publisher-v1.md`.
 
 Verified on 2026-09-26: `cargo fmt -- --check`; `cargo test --locked --offline` passes 108 unit tests and 4 executable integration tests. Clippy passes with existing repository warnings. A manual isolated-database run drove the real exchange and MDP through rest, partial fill, cancellation, MDP restart, and resumed live publication.
 
+## Completed Milestone - Reporter v1
+
+Full write-up: `docs/tasks/09-reporter-v1.md`.
+
+- [x] Extract a shared committed-batch decoder used by both MDP and Reporter.
+- [x] Run Reporter as a separate `StreamReader` process with a dedicated health endpoint.
+- [x] Project accepted/rejected orders, fills, cancellations, and one trade per execution pair into PostgreSQL.
+- [x] Commit each projection change and advanced reader checkpoint in one PostgreSQL transaction.
+- [x] Add a versioned migration, database-free regression coverage, and an opt-in isolated-PostgreSQL executable test.
+
+Verified on 2026-09-26: `cargo fmt -- --check`; `cargo test --locked --offline` passes 109 unit tests and 4 executable integration tests, plus one ignored opt-in Reporter test. The Reporter executable test passed against an isolated local PostgreSQL instance after applying migrations.
+
 ## Next Milestone
 
-No next milestone is selected. Discuss the next architecture step before implementation. Candles, reporting, snapshots, group commit, lock-free transport, UDP/multicast, CPU pinning, hot-warm replication, and per-symbol partitioning remain separate milestones.
+No next milestone is selected. Discuss the next architecture step before implementation. Candles, snapshots, group commit, lock-free transport, UDP/multicast, CPU pinning, hot-warm replication, and per-symbol partitioning remain separate milestones.
