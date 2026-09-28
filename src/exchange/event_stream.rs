@@ -40,6 +40,15 @@ pub struct ReaderCheckpoint {
     byte_offset: u64,
 }
 
+impl ReaderCheckpoint {
+    /// Checks that a writer-owned journal is still the file this checkpoint describes. A warm
+    /// replica uses this after it has acquired the writer lock, before allowing the hand-off to
+    /// a primary factory that will fully replay the authoritative journal.
+    pub(crate) fn matches_journal_identity(&self, device: u64, inode: u64) -> bool {
+        self.device == device && self.inode == inode
+    }
+}
+
 struct Unlock<'a>(&'a File);
 impl Drop for Unlock<'_> {
     fn drop(&mut self) {

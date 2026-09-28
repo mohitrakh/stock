@@ -131,6 +131,57 @@ pub enum ReplayError {
     InternalFault(String),
 }
 
+/// A read-only deterministic follower of committed command batches.
+///
+/// The warm replica owns only an `ExchangeCore` and its next journal sequence. It has no journal
+/// writer, mmap writer, command receiver, callbacks, or HTTP replies. Applying a batch uses the
+/// same prepare/compare/commit path as normal recovery, so a follower cannot silently accept an
+/// output the primary core would not have produced.
+pub(crate) struct ReplicaCore {
+    core: ExchangeCore,
+    next_event_seq: u64,
+}
+
+impl ReplicaCore {
+    pub(crate) fn new() -> Self {
+        Self {
+            core: ExchangeCore::new(),
+            next_event_seq: 1,
+        }
+    }
+
+    pub(crate) fn from_snapshot(
+        core: ExchangeCore,
+        next_event_seq: u64,
+    ) -> Result<Self, ReplayError> {
+        if next_event_seq == 0 {
+            return Err(ReplayError::InternalFault(
+                "replica snapshot has an invalid next event sequence".to_string(),
+            ));
+        }
+        Ok(Self {
+            core,
+            next_event_seq,
+        })
+    }
+
+    pub(crate) fn next_event_sequence(&self) -> u64 {
+        self.next_event_seq
+    }
+
+    /// Validates one complete journal record and commits it only after every recorded output
+    /// matches the deterministic prepared result. No local callback is published on this path.
+    pub(crate) fn apply_batch(&mut self, batch: &[EventEnvelope]) -> Result<(), ReplayError> {
+        self.next_event_seq = replay_committed_batch(&mut self.core, self.next_event_seq, batch)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> crate::exchange::core::CoreSnapshot {
+        self.core.snapshot()
+    }
+}
+
 impl InputEventResult {
     fn into_deposit_result(self) -> Result<(), String> {
         match self {
@@ -365,11 +416,49 @@ fn replay_event_log_from_core(
     first_sequence: u64,
     event_log: &[EventEnvelope],
 ) -> Result<ExchangeCore, ReplayError> {
-    for (index, envelope) in event_log.iter().enumerate() {
+    let mut index = 0;
+    while index < event_log.len() {
+        let end = event_log[index + 1..]
+            .iter()
+            .position(|envelope| matches!(envelope.event, ExchangeEvent::Input(_)))
+            .map(|offset| index + offset + 1)
+            .unwrap_or(event_log.len());
+        let expected_sequence = first_sequence
+            .checked_add(index as u64)
+            .ok_or_else(|| ReplayError::InternalFault("journal sequence overflow".to_string()))?;
+        let next_sequence =
+            replay_committed_batch(&mut core, expected_sequence, &event_log[index..end])?;
+        let expected_next = first_sequence
+            .checked_add(end as u64)
+            .ok_or_else(|| ReplayError::InternalFault("journal sequence overflow".to_string()))?;
+        if next_sequence != expected_next {
+            return Err(ReplayError::InternalFault(
+                "replay batch advanced to an unexpected sequence".to_string(),
+            ));
+        }
+        index = end;
+    }
+
+    Ok(core)
+}
+
+/// Replays exactly one complete command record into an existing core. A `StreamReader` already
+/// establishes physical record boundaries; this function establishes the business boundary and
+/// keeps the core unchanged whenever the recorded outcome is malformed or disagrees.
+pub(crate) fn replay_committed_batch(
+    core: &mut ExchangeCore,
+    first_sequence: u64,
+    batch: &[EventEnvelope],
+) -> Result<u64, ReplayError> {
+    if batch.is_empty() {
+        return Err(ReplayError::InternalFault(
+            "committed batch is empty".to_string(),
+        ));
+    }
+    for (index, envelope) in batch.iter().enumerate() {
         let expected = first_sequence
             .checked_add(index as u64)
             .ok_or_else(|| ReplayError::InternalFault("journal sequence overflow".to_string()))?;
-
         if envelope.seq_num != expected {
             return Err(ReplayError::EventSequenceMismatch {
                 expected,
@@ -378,65 +467,65 @@ fn replay_event_log_from_core(
         }
     }
 
-    let mut index = 0;
+    let input = match &batch[0].event {
+        ExchangeEvent::Input(input) => input.clone(),
+        ExchangeEvent::Output(actual) => {
+            return Err(ReplayError::UnexpectedOutput {
+                seq_num: batch[0].seq_num,
+                actual: actual.clone(),
+            });
+        }
+    };
+    let processed = prepare_input_event(core, input).map_err(|error| match error {
+        CoreError::Business(reason) => ReplayError::InternalFault(format!("{:?}", reason)),
+        CoreError::Internal(reason) => ReplayError::InternalFault(reason),
+    })?;
 
-    while index < event_log.len() {
-        let input_envelope = &event_log[index];
-
-        let input = match &input_envelope.event {
-            ExchangeEvent::Input(input) => input.clone(),
-
-            ExchangeEvent::Output(actual) => {
-                return Err(ReplayError::UnexpectedOutput {
-                    seq_num: input_envelope.seq_num,
-                    actual: actual.clone(),
+    for (offset, expected_output) in processed.output_events.iter().cloned().enumerate() {
+        let index = offset + 1;
+        let Some(output_envelope) = batch.get(index) else {
+            return Err(ReplayError::MissingOutput {
+                seq_num: first_sequence.checked_add(index as u64).ok_or_else(|| {
+                    ReplayError::InternalFault("journal sequence overflow".to_string())
+                })?,
+                expected: expected_output,
+            });
+        };
+        let actual_output = match &output_envelope.event {
+            ExchangeEvent::Output(actual) => actual,
+            ExchangeEvent::Input(_) => {
+                return Err(ReplayError::MissingOutput {
+                    seq_num: output_envelope.seq_num,
+                    expected: expected_output,
                 });
             }
         };
-
-        index += 1;
-
-        let processed = prepare_input_event(&core, input).map_err(|error| match error {
-            CoreError::Business(reason) => ReplayError::InternalFault(format!("{:?}", reason)),
-            CoreError::Internal(reason) => ReplayError::InternalFault(reason),
-        })?;
-
-        for expected_output in processed.output_events.iter().cloned() {
-            let Some(output_envelope) = event_log.get(index) else {
-                return Err(ReplayError::MissingOutput {
-                    seq_num: first_sequence.checked_add(index as u64).ok_or_else(|| {
-                        ReplayError::InternalFault("journal sequence overflow".to_string())
-                    })?,
-                    expected: expected_output,
-                });
-            };
-
-            let actual_output = match &output_envelope.event {
-                ExchangeEvent::Output(actual) => actual,
-
-                ExchangeEvent::Input(_) => {
-                    return Err(ReplayError::MissingOutput {
-                        seq_num: output_envelope.seq_num,
-                        expected: expected_output,
-                    });
-                }
-            };
-
-            if actual_output != &expected_output {
-                return Err(ReplayError::OutputMismatch {
-                    seq_num: output_envelope.seq_num,
-                    expected: expected_output,
-                    actual: actual_output.clone(),
-                });
-            }
-
-            index += 1;
+        if actual_output != &expected_output {
+            return Err(ReplayError::OutputMismatch {
+                seq_num: output_envelope.seq_num,
+                expected: expected_output,
+                actual: actual_output.clone(),
+            });
         }
-
-        let _ = processed.commit(&mut core);
     }
 
-    Ok(core)
+    let expected_len = 1 + processed.output_events.len();
+    if let Some(extra) = batch.get(expected_len) {
+        return match &extra.event {
+            ExchangeEvent::Output(actual) => Err(ReplayError::UnexpectedOutput {
+                seq_num: extra.seq_num,
+                actual: actual.clone(),
+            }),
+            ExchangeEvent::Input(_) => Err(ReplayError::InternalFault(
+                "committed batch contains a second input".to_string(),
+            )),
+        };
+    }
+
+    let _ = processed.commit(core);
+    first_sequence
+        .checked_add(batch.len() as u64)
+        .ok_or_else(|| ReplayError::InternalFault("journal sequence overflow".to_string()))
 }
 
 impl ExchangeRuntime {
@@ -577,6 +666,29 @@ impl ExchangeRuntime {
     #[cfg(test)]
     pub fn event_log(&self) -> &[EventEnvelope] {
         &self.event_log
+    }
+
+    #[cfg(test)]
+    pub(crate) fn core_snapshot_for_test(&self) -> crate::exchange::core::CoreSnapshot {
+        self.core.snapshot()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_input_for_test(
+        &mut self,
+        event: ExchangeInputEvent,
+    ) -> Result<(), String> {
+        self.record_and_process_input_event(event)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_stream_publication_for_test(&mut self) {
+        self.stream
+            .as_mut()
+            .expect("test runtime has a committed stream")
+            .fail_publication_for_test();
     }
 
     /// The sequence to assign to the next durable envelope. This is the durable journal's
@@ -873,6 +985,66 @@ pub fn recover_runtime_with_stream_and_snapshot(
             }
         };
 
+    attach_stream_and_snapshot(
+        &mut runtime,
+        stream_path,
+        snapshot_path,
+        snapshot_interval,
+        snapshot_is_safe_to_replace,
+    )?;
+    Ok(runtime)
+}
+
+/// Turns a read-only warm follower into the next primary after the caller has acquired the
+/// journal's exclusive writer lock and recovered the *entire* authoritative journal. The warm
+/// core is useful as a live follower health check, but mmap-delivered state never becomes primary
+/// authority: full durable recovery is repeated before this process can write or publish.
+pub(crate) fn promote_replica_with_stream_and_snapshot(
+    rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
+    store: EventStore,
+    recovered: Vec<EventEnvelope>,
+    journal_path: impl AsRef<Path>,
+    stream_path: impl AsRef<Path>,
+    snapshot_path: impl AsRef<Path>,
+    snapshot_interval: u64,
+) -> Result<ExchangeRuntime, StartupError> {
+    if snapshot_interval == 0 {
+        return Err(StartupError::Replay(ReplayError::InternalFault(
+            "snapshot interval must be at least one command".to_string(),
+        )));
+    }
+    let journal_path = journal_path.as_ref().to_path_buf();
+    let stream_path = stream_path.as_ref().to_path_buf();
+    let snapshot_path = snapshot_path.as_ref().to_path_buf();
+    let mut runtime =
+        ExchangeRuntime::from_store(rx, store, recovered).map_err(StartupError::Replay)?;
+
+    // Preserve a bad snapshot for diagnosis just as ordinary primary recovery does. A valid or
+    // absent checkpoint may be refreshed after promotion because the full journal is still held.
+    let snapshot_is_safe_to_replace = match snapshot::load(&snapshot_path, &journal_path) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("preserving invalid snapshot during warm promotion: {error}");
+            false
+        }
+    };
+    attach_stream_and_snapshot(
+        &mut runtime,
+        stream_path,
+        snapshot_path,
+        snapshot_interval,
+        snapshot_is_safe_to_replace,
+    )?;
+    Ok(runtime)
+}
+
+fn attach_stream_and_snapshot(
+    runtime: &mut ExchangeRuntime,
+    stream_path: PathBuf,
+    snapshot_path: PathBuf,
+    snapshot_interval: u64,
+    snapshot_is_safe_to_replace: bool,
+) -> Result<(), StartupError> {
     let stream = StreamWriter::open(
         &stream_path,
         runtime.store.as_ref().unwrap().file(),
@@ -896,7 +1068,7 @@ pub fn recover_runtime_with_stream_and_snapshot(
             eprintln!("snapshot checkpoint was not updated during startup: {error}");
         }
     }
-    Ok(runtime)
+    Ok(())
 }
 
 fn recover_snapshot_state(

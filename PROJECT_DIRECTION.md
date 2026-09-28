@@ -1,4 +1,4 @@
-# Project Direction - Core Snapshots and Suffix Replay Complete
+# Project Direction - Same-host Warm Replica v1 Complete
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -12,7 +12,7 @@ The repository is a learning stock exchange with an exchange-grade architecture 
 
 ## Current Status
 
-The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log, journal-bound core snapshots with suffix replay, and a bounded mmap stream with independent readers and durable catch-up. MDP v1 reconstructs public L2 books independently. Reporter v1 is the second independent subscriber: it consumes the same complete committed batches and atomically projects durable order lifecycle and one-row-per-trade history into PostgreSQL. Its database/checkpoint transaction and restart behavior are verified with an isolated PostgreSQL acceptance test. Neither subscriber is on the trading path.
+The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log, journal-bound core snapshots with suffix replay, and a bounded mmap stream with independent readers and durable catch-up. MDP v1 reconstructs public L2 books independently. Reporter v1 is the second independent subscriber: it consumes the same complete committed batches and atomically projects durable order lifecycle and one-row-per-trade history into PostgreSQL. Its database/checkpoint transaction and restart behavior are verified with an isolated PostgreSQL acceptance test. Same-host Warm Replica v1 independently follows committed batches into a read-only deterministic core and supports a manual, writer-fenced hand-off. Neither subscriber nor the warm follower is on the trading path.
 
 ```text
 Axum HTTP handler
@@ -56,13 +56,20 @@ independent MDP process
   -> atomically persist open-order projection plus reader checkpoint
   -> serve GET /marketdata/orderbook/{symbol} on 127.0.0.1:4001 by default
   -> return 503 after any terminal follower error; trading remains independent
+
+same-host warm replica process
+  -> StreamReader over the same journal and mmap stream
+  -> replay complete batches into a read-only ReplicaCore before binding 127.0.0.1:4003
+  -> GET /health and GET /status report follower availability only
+  -> POST /promote returns 409 while the primary owns the journal writer lock
+  -> after a successful local fence, fully recover and replay the journal before primary startup
 ```
 
 `ExchangeCommand` is live gateway plumbing and may contain `respond_to`. `ExchangeEvent` contains replayable business data and must remain free of HTTP response channels.
 
-`ExchangeRuntime` owns the command receiver, `EventStore`, `StreamWriter`, a journal-bound snapshot schedule, and the ordered in-memory event history. After snapshot recovery that vector contains only the replayed suffix; the complete history remains in the journal. `ExchangeCore` owns the deterministic trading components; it never touches the files. All core operations still run on one exchange-worker thread. Readers are separate consumers, not additional owners of exchange state.
+`ExchangeRuntime` owns the command receiver, `EventStore`, `StreamWriter`, a journal-bound snapshot schedule, and the ordered in-memory event history. After snapshot recovery that vector contains only the replayed suffix; the complete history remains in the journal. `ExchangeCore` owns the deterministic trading components; it never touches the files. All core operations still run on one exchange-worker thread. `ReplicaCore` is a separate read-only follower core: it has no writer, queue, callbacks, database, or customer routes. Readers and the warm follower are separate consumers, not additional owners of exchange state.
 
-`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. Production startup calls `recover_runtime_with_stream_and_snapshot` before binding the listener. A valid versioned, checksummed snapshot is tied to the journal device/inode and a complete-batch byte boundary; it restores the core and replays only the later suffix. A missing, corrupt, inconsistent, or journal-mismatched snapshot is preserved and falls back to full replay. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`; `EVENT_SNAPSHOT_PATH` defaults to that path plus `.snapshot`; and `EVENT_SNAPSHOT_INTERVAL` defaults to 10,000 commands. The journal is authoritative; the mmap file is a disposable delivery cache and the snapshot is only a recovery checkpoint.
+`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. `ReplicaCore` uses the same complete-batch comparison before it advances its applied checkpoint. Production startup calls `recover_runtime_with_stream_and_snapshot` before binding the listener. A valid versioned, checksummed snapshot is tied to the journal device/inode and a complete-batch byte boundary; it restores the core and replays only the later suffix. A missing, corrupt, inconsistent, or journal-mismatched snapshot is preserved and falls back to full replay. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`; `EVENT_SNAPSHOT_PATH` defaults to that path plus `.snapshot`; and `EVENT_SNAPSHOT_INTERVAL` defaults to 10,000 commands. The journal is authoritative; the mmap file is a disposable delivery cache and the snapshot is only a recovery checkpoint. Warm promotion intentionally takes the writer lock with `EventStore::open_existing` and fully replays the recovered journal rather than promoting mmap-derived state.
 
 Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
 

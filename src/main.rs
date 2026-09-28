@@ -33,7 +33,8 @@ mod state;
 use state::AppState;
 
 use crate::exchange::runtime::{
-    DEFAULT_SNAPSHOT_INTERVAL, recover_runtime_with_stream_and_snapshot,
+    DEFAULT_SNAPSHOT_INTERVAL, ExchangeRuntime, promote_replica_with_stream_and_snapshot,
+    recover_runtime_with_stream_and_snapshot,
 };
 
 const EXCHANGE_COMMAND_QUEUE_SIZE: usize = 10_000;
@@ -64,14 +65,52 @@ async fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--warm-replica") {
+        let promotion = exchange::warm_replica::run(&args[1..])
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("warm replica: {error}");
+                std::process::exit(1);
+            });
+        let exchange::warm_replica::WarmPromotion {
+            store,
+            recovered,
+            journal_path,
+            stream_path,
+            snapshot_path,
+        } = promotion;
+        let snapshot_interval = snapshot_interval_or_exit();
+        let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
+        let runtime = promote_replica_with_stream_and_snapshot(
+            rx,
+            store,
+            recovered,
+            &journal_path,
+            &stream_path,
+            &snapshot_path,
+            snapshot_interval,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("refusing to promote: {error}");
+            eprintln!("event log: {}", journal_path.display());
+            eprintln!("event stream: {}", stream_path.display());
+            eprintln!("event snapshot: {}", snapshot_path.display());
+            eprintln!("Preserve the durable history and resolve the reported error.");
+            std::process::exit(1);
+        });
+        println!(
+            "Warm replica promoted through event sequence {}",
+            runtime.next_event_sequence().saturating_sub(1)
+        );
+        serve_primary(runtime, tx).await;
+        return;
+    }
     if !args.is_empty() {
         eprintln!(
-            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR]]"
+            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR]]"
         );
         std::process::exit(1);
     }
-    let db = db::connect_db().await;
-    let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
 
     let event_log_path =
         std::env::var("EVENT_LOG_PATH").unwrap_or_else(|_| DEFAULT_EVENT_LOG_PATH.to_string());
@@ -79,19 +118,9 @@ async fn main() {
         std::env::var("EVENT_STREAM_PATH").unwrap_or_else(|_| format!("{event_log_path}.mmap"));
     let event_snapshot_path = std::env::var("EVENT_SNAPSHOT_PATH")
         .unwrap_or_else(|_| format!("{event_log_path}.snapshot"));
-    let snapshot_interval = std::env::var("EVENT_SNAPSHOT_INTERVAL")
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .ok()
-                .filter(|&value| value > 0)
-                .ok_or(())
-        })
-        .unwrap_or(Ok(DEFAULT_SNAPSHOT_INTERVAL))
-        .unwrap_or_else(|_| {
-            eprintln!("EVENT_SNAPSHOT_INTERVAL must be a positive integer");
-            std::process::exit(1);
-        });
+    let snapshot_interval = snapshot_interval_or_exit();
+
+    let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
 
     // Recovery happens before the listener binds, and on the main thread. History that cannot be
     // trusted must stop the process, not kill a worker thread and leave a server answering
@@ -117,6 +146,32 @@ async fn main() {
         event_log_path,
         runtime.next_event_sequence().saturating_sub(1)
     );
+    serve_primary(runtime, tx).await;
+}
+
+fn snapshot_interval_or_exit() -> u64 {
+    std::env::var("EVENT_SNAPSHOT_INTERVAL")
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|&value| value > 0)
+                .ok_or(())
+        })
+        .unwrap_or(Ok(DEFAULT_SNAPSHOT_INTERVAL))
+        .unwrap_or_else(|_| {
+            eprintln!("EVENT_SNAPSHOT_INTERVAL must be a positive integer");
+            std::process::exit(1);
+        })
+}
+
+async fn serve_primary(
+    runtime: ExchangeRuntime,
+    tx: tokio::sync::mpsc::Sender<crate::types::types::ExchangeCommand>,
+) {
+    // The runtime has already recovered and, in a promotion, fenced the old writer. Database
+    // availability must not decide whether untrusted durable history is accepted.
+    let db = db::connect_db().await;
 
     let exchange_available = Arc::new(AtomicBool::new(true));
     let worker_availability = Arc::clone(&exchange_available);

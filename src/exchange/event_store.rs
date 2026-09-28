@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
 };
 
@@ -27,6 +27,14 @@ pub enum EventStoreError {
     /// Damage that is not a torn tail: a bad checksum or unreadable payload with more records
     /// after it. Recovery refuses rather than guessing which part is trustworthy.
     Corrupt(String),
+    /// A warm process found a different journal at its configured path after it took the writer
+    /// lock. This is checked before recovery can truncate a torn tail in the wrong file.
+    JournalIdentityMismatch {
+        expected_device: u64,
+        expected_inode: u64,
+        actual_device: u64,
+        actual_inode: u64,
+    },
 }
 
 impl std::fmt::Display for EventStoreError {
@@ -39,6 +47,15 @@ impl std::fmt::Display for EventStoreError {
                 String::from_utf8_lossy(FILE_MAGIC)
             ),
             Self::Corrupt(detail) => write!(f, "event log is corrupt: {}", detail),
+            Self::JournalIdentityMismatch {
+                expected_device,
+                expected_inode,
+                actual_device,
+                actual_inode,
+            } => write!(
+                f,
+                "event log identity changed (expected {expected_device}:{expected_inode}, found {actual_device}:{actual_inode})"
+            ),
         }
     }
 }
@@ -100,19 +117,61 @@ impl EventStore {
     /// the truncation has to happen before anything is appended — handing out a store that has not
     /// been recovered yet would let a caller append after a torn tail.
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_inner(path, true, None)
+    }
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)?;
+    /// Opens and fully validates an already-existing journal under the exclusive writer lock.
+    /// This is for a warm promotion: it must never create a fresh file if the journal it followed
+    /// disappeared, because its mmap-delivered in-memory state is not the durability authority.
+    pub(crate) fn open_existing(
+        path: impl AsRef<Path>,
+    ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
+        Self::open_inner(path, false, None)
+    }
+
+    /// Opens an already-existing journal for warm promotion only when it is the exact file the
+    /// follower observed. The identity comparison happens after the exclusive lock and before
+    /// any recovery read or torn-tail truncation, so a swapped path cannot mutate another log.
+    pub(crate) fn open_existing_matching(
+        path: impl AsRef<Path>,
+        expected_device: u64,
+        expected_inode: u64,
+    ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
+        Self::open_inner(
+            path,
+            false,
+            Some((expected_device, expected_inode)),
+        )
+    }
+
+    fn open_inner(
+        path: impl AsRef<Path>,
+        allow_initialize_empty: bool,
+        expected_identity: Option<(u64, u64)>,
+    ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
+        let path = path.as_ref().to_path_buf();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).truncate(false).mode(0o600);
+        if allow_initialize_empty {
+            options.create(true);
+        }
+        let mut file = options.open(&path)?;
 
         // One writer owns recovery/truncation as well as appends. Independent stream readers
         // never take this lifetime lock; they read only the published, immutable prefix.
         file.try_lock().map_err(std::io::Error::from)?;
+
+        if let Some((expected_device, expected_inode)) = expected_identity {
+            let metadata = file.metadata()?;
+            if metadata.dev() != expected_device || metadata.ino() != expected_inode {
+                return Err(EventStoreError::JournalIdentityMismatch {
+                    expected_device,
+                    expected_inode,
+                    actual_device: metadata.dev(),
+                    actual_inode: metadata.ino(),
+                });
+            }
+        }
 
         // ponytail: reads the whole log into memory. Fine while history is small; stream it, or
         // add snapshots, when startup time actually starts to hurt.
@@ -120,6 +179,11 @@ impl EventStore {
         file.read_to_end(&mut bytes)?;
 
         if bytes.is_empty() {
+            if !allow_initialize_empty {
+                return Err(EventStoreError::Corrupt(
+                    "existing journal is empty".to_string(),
+                ));
+            }
             file.write_all(FILE_MAGIC)?;
             file.sync_all()?;
             let parent = path
@@ -223,6 +287,13 @@ impl EventStore {
     pub(super) fn file(&self) -> &File {
         &self.file
     }
+
+    /// Identity of the writer-locked journal. Consumers use this only after taking the writer
+    /// lock, to prove that their in-memory checkpoint still describes this exact file.
+    pub(crate) fn journal_identity(&self) -> Result<(u64, u64), EventStoreError> {
+        let metadata = self.file.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
 }
 
 pub(super) fn encode_record(envelopes: &[EventEnvelope]) -> Result<Vec<u8>, EventStoreError> {
@@ -318,7 +389,7 @@ fn decode_records(
 mod tests {
     use super::*;
     use crate::types::exchange_event::{ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent};
-    use std::path::PathBuf;
+    use std::{os::unix::fs::MetadataExt, path::PathBuf};
 
     fn deposit_batch(seq: u64, amount: u64) -> Vec<EventEnvelope> {
         vec![
@@ -391,6 +462,72 @@ mod tests {
         );
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn promotion_open_existing_never_creates_or_initializes_a_missing_or_empty_journal() {
+        let missing = temp_path("promotion-missing");
+        assert!(matches!(
+            EventStore::open_existing(&missing),
+            Err(EventStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+        assert!(!missing.exists());
+
+        let empty = temp_path("promotion-empty");
+        std::fs::File::create(&empty).unwrap();
+        assert!(matches!(
+            EventStore::open_existing(&empty),
+            Err(EventStoreError::Corrupt(detail)) if detail == "existing journal is empty"
+        ));
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
+        std::fs::remove_file(empty).unwrap();
+    }
+
+    #[test]
+    fn promotion_checks_identity_before_it_repairs_a_foreign_torn_tail() {
+        let expected = temp_path("promotion-expected-identity");
+        let foreign = temp_path("promotion-foreign-identity");
+        {
+            let (mut store, _) = EventStore::open(&expected).unwrap();
+            store.append(&deposit_batch(1, 10)).unwrap();
+        }
+        let expected_metadata = std::fs::metadata(&expected).unwrap();
+
+        {
+            let (mut store, _) = EventStore::open(&foreign).unwrap();
+            store.append(&deposit_batch(1, 20)).unwrap();
+        }
+        let foreign_metadata = std::fs::metadata(&foreign).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&foreign)
+            .unwrap()
+            .set_len(foreign_metadata.len() - 4)
+            .unwrap();
+        let foreign_before = std::fs::read(&foreign).unwrap();
+
+        assert!(matches!(
+            EventStore::open_existing_matching(
+                &foreign,
+                expected_metadata.dev(),
+                expected_metadata.ino(),
+            ),
+            Err(EventStoreError::JournalIdentityMismatch { .. })
+        ));
+        assert_eq!(std::fs::read(&foreign).unwrap(), foreign_before);
+
+        let (store, recovered) = EventStore::open_existing_matching(
+            &foreign,
+            foreign_metadata.dev(),
+            foreign_metadata.ino(),
+        )
+        .unwrap();
+        assert!(recovered.is_empty());
+        drop(store);
+        assert_eq!(std::fs::metadata(&foreign).unwrap().len(), FILE_MAGIC.len() as u64);
+
+        std::fs::remove_file(expected).unwrap();
+        std::fs::remove_file(foreign).unwrap();
     }
 
     #[test]
