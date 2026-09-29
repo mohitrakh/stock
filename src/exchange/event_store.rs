@@ -137,7 +137,7 @@ impl EventStore {
     }
 
     /// Opens an already-existing journal for warm promotion, and only if it is the exact file the
-    /// follower read. It never creates or initializes a journal: a follower's mmap-delivered state
+    /// follower read. It never creates or initializes a journal: a follower's in-memory state
     /// is not a durability authority, so a missing or empty journal is an error, not a fresh start.
     ///
     /// Identity is compared as soon as the exclusive lock is held and before any recovery read or

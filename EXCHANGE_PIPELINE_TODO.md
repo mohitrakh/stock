@@ -376,6 +376,24 @@ Full write-up: `docs/tasks/14-critical-path-performance-v1.md`; one file per opt
 - In memory the exchange meets the design's average of 43,000 orders/s; with production snapshots it reaches about 8,300 (next bottleneck, recorded).
 - `cargo fmt -- --check` clean; `cargo test --locked` passes 136 unit tests and the integration tests; release warnings unchanged at 13.
 
+## Completed Milestone - Snapshots Written by the Warm Replica
+
+Full write-up: `docs/tasks/15-snapshots-by-the-warm-replica.md`; measurements in `docs/performance/04-snapshots-off-the-trading-thread.md`.
+
+- [x] Remove the periodic snapshot schedule from the primary runtime; keep one snapshot at startup.
+- [x] Give the warm replica a snapshot writer: every `EVENT_SNAPSHOT_INTERVAL` commands, write the journal-bound snapshot at exactly its applied checkpoint.
+- [x] Make the warm replica read every batch from the journal (`StreamReader::journal_only`).
+- [x] Preserve an invalid snapshot found at warm start and write none.
+- [x] Remove the benchmark's `--snapshot-every` switch; measure snapshot cost with a warm replica beside the benchmark.
+- [x] Measure before and after, and write the task and optimization documents.
+
+### Acceptance Criteria - Verified
+
+- The primary writes no snapshot while trading (test: the snapshot file is unchanged after five commands).
+- A restart loads the warm replica's snapshot and replays only the suffix, matching the live core.
+- Throughput with snapshots every 10,000 commands: about 8,300 -> about 21,900 orders/s; at 5,000 orders/s the worst latency went from 0.7-1.04 s to 170-442 ms.
+- `cargo test --locked` passes 138 unit tests and the integration tests; release warnings unchanged at 13.
+
 ## Next Milestone
 
-No next milestone is selected. Measured candidates: subscriber throughput (MDP rewrites and syncs its whole state per command), the core snapshot cost (whole-state serialization on the worker every 10,000 commands), a pipelined journal sync with per-group mmap publication, and cross-machine replication. Two Reporter correctness defects are recorded in `DEFERRED_ITEMS.md`.
+No next milestone is selected. Planned order: a trading-day boundary that bounds ever-growing state (and so snapshot size), subscriber throughput (MDP rewrites and syncs its whole state per command), then journal replication to a second machine. Smaller follow-ups: a pipelined journal sync with per-group mmap publication, and promotion from the warm replica's own snapshot. Two Reporter correctness defects are recorded in `DEFERRED_ITEMS.md`.

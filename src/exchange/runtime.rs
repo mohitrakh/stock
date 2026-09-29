@@ -26,18 +26,11 @@ pub struct ExchangeRuntime {
     /// `ExchangeRuntime::new` want. The server always supplies a store.
     store: Option<EventStore>,
     stream: Option<StreamWriter>,
-    snapshot: Option<SnapshotSchedule>,
 }
 
-/// Snapshotting is intentionally periodic: writing a whole authoritative-state checkpoint for
-/// every order would turn a recovery optimization into a new trading-path bottleneck.
-struct SnapshotSchedule {
-    path: PathBuf,
-    stream_path: PathBuf,
-    every_commands: u64,
-    commands_since_snapshot: u64,
-}
-
+/// Commands between core snapshots. Since milestone 20 the warm replica writes them, not this
+/// runtime: a snapshot serializes the whole core, and doing that on the trading thread froze
+/// trading for seconds. See `docs/performance/04-snapshots-off-the-trading-thread.md`.
 pub const DEFAULT_SNAPSHOT_INTERVAL: u64 = 10_000;
 
 /// Most commands that may share one journal sync. Below this cap a group is simply whatever was
@@ -184,7 +177,7 @@ impl ReplicaCore {
         Ok(())
     }
 
-    #[cfg(test)]
+    /// The normalized core state, as the warm replica writes it to a snapshot.
     pub(crate) fn snapshot(&self) -> crate::exchange::core::CoreSnapshot {
         self.core.snapshot()
     }
@@ -546,7 +539,6 @@ impl ExchangeRuntime {
             next_event_seq: 1,
             store: None,
             stream: None,
-            snapshot: None,
         }
     }
 
@@ -586,7 +578,6 @@ impl ExchangeRuntime {
             next_event_seq,
             store,
             stream: None,
-            snapshot: None,
         })
     }
 
@@ -606,7 +597,6 @@ impl ExchangeRuntime {
             next_event_seq,
             store: Some(store),
             stream: None,
-            snapshot: None,
         }
     }
 
@@ -638,27 +628,6 @@ impl ExchangeRuntime {
             boundary,
             self.core.snapshot(),
         )
-    }
-
-    /// Counts a durable group of `commands` toward the schedule and writes at most one snapshot
-    /// for it: every command in the group is already in the core, so one checkpoint covers them.
-    fn maybe_write_snapshot(&mut self, commands: u64) {
-        let Some((path, stream_path)) = self.snapshot.as_mut().and_then(|schedule| {
-            schedule.commands_since_snapshot =
-                schedule.commands_since_snapshot.saturating_add(commands);
-            if schedule.commands_since_snapshot < schedule.every_commands {
-                return None;
-            }
-            // A failed write cannot invalidate the journal or the previous snapshot. Retry after
-            // another full interval rather than making a disk failure stall every later command.
-            schedule.commands_since_snapshot = 0;
-            Some((schedule.path.clone(), schedule.stream_path.clone()))
-        }) else {
-            return;
-        };
-        if let Err(error) = self.write_snapshot(&path, &stream_path) {
-            eprintln!("snapshot checkpoint was not updated: {error}");
-        }
     }
 
     pub fn run(mut self) {
@@ -945,14 +914,12 @@ impl ExchangeRuntime {
                 }
             }
         }
-        let commands = staged.len();
         let flushed = self.flush(staged);
         let failure = flushed.as_ref().err().map(halted_message);
         for reply in replies {
             reply(failure.as_deref());
         }
         flushed?;
-        self.maybe_write_snapshot(commands as u64);
         fault.map_or(Ok(()), Err)
     }
 
@@ -970,7 +937,6 @@ impl ExchangeRuntime {
         let mut staged = Vec::new();
         let result = self.stage_input_event(event, &mut staged)?;
         self.flush(staged)?;
-        self.maybe_write_snapshot(1);
         Ok(result)
     }
 }
@@ -1054,13 +1020,7 @@ pub fn recover_runtime_with_stream_and_snapshot(
     journal_path: impl AsRef<Path>,
     stream_path: impl AsRef<Path>,
     snapshot_path: impl AsRef<Path>,
-    snapshot_interval: u64,
 ) -> Result<ExchangeRuntime, StartupError> {
-    if snapshot_interval == 0 {
-        return Err(StartupError::Replay(ReplayError::InternalFault(
-            "snapshot interval must be at least one command".to_string(),
-        )));
-    }
     let journal_path = journal_path.as_ref().to_path_buf();
     let stream_path = stream_path.as_ref().to_path_buf();
     let snapshot_path = snapshot_path.as_ref().to_path_buf();
@@ -1090,7 +1050,6 @@ pub fn recover_runtime_with_stream_and_snapshot(
         &mut runtime,
         stream_path,
         snapshot_path,
-        snapshot_interval,
         snapshot_is_safe_to_replace,
     )?;
     Ok(runtime)
@@ -1098,8 +1057,8 @@ pub fn recover_runtime_with_stream_and_snapshot(
 
 /// Turns a read-only warm follower into the next primary after the caller has acquired the
 /// journal's exclusive writer lock and recovered the *entire* authoritative journal. The warm
-/// core is useful as a live follower health check, but mmap-delivered state never becomes primary
-/// authority: full durable recovery is repeated before this process can write or publish.
+/// core is not reused: full durable recovery is repeated before this process can write or
+/// publish, so promotion never depends on how the follower got its state.
 pub(crate) fn promote_replica_with_stream_and_snapshot(
     rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
     store: EventStore,
@@ -1107,13 +1066,7 @@ pub(crate) fn promote_replica_with_stream_and_snapshot(
     journal_path: impl AsRef<Path>,
     stream_path: impl AsRef<Path>,
     snapshot_path: impl AsRef<Path>,
-    snapshot_interval: u64,
 ) -> Result<ExchangeRuntime, StartupError> {
-    if snapshot_interval == 0 {
-        return Err(StartupError::Replay(ReplayError::InternalFault(
-            "snapshot interval must be at least one command".to_string(),
-        )));
-    }
     let journal_path = journal_path.as_ref().to_path_buf();
     let stream_path = stream_path.as_ref().to_path_buf();
     let snapshot_path = snapshot_path.as_ref().to_path_buf();
@@ -1133,17 +1086,18 @@ pub(crate) fn promote_replica_with_stream_and_snapshot(
         &mut runtime,
         stream_path,
         snapshot_path,
-        snapshot_interval,
         snapshot_is_safe_to_replace,
     )?;
     Ok(runtime)
 }
 
+/// Opens the mmap stream and, when it is safe to replace, writes ONE fresh snapshot of the
+/// recovered core before the exchange accepts any command. From then on the trading thread writes
+/// no snapshots; the warm replica keeps the checkpoint current.
 fn attach_stream_and_snapshot(
     runtime: &mut ExchangeRuntime,
     stream_path: PathBuf,
     snapshot_path: PathBuf,
-    snapshot_interval: u64,
     snapshot_is_safe_to_replace: bool,
 ) -> Result<(), StartupError> {
     let stream = StreamWriter::open(
@@ -1154,20 +1108,11 @@ fn attach_stream_and_snapshot(
     )
     .map_err(StartupError::Stream)?;
     runtime.stream = Some(stream);
-    if snapshot_is_safe_to_replace {
-        runtime.snapshot = Some(SnapshotSchedule {
-            path: snapshot_path,
-            stream_path,
-            every_commands: snapshot_interval,
-            commands_since_snapshot: 0,
-        });
-        if let Some(schedule) = &runtime.snapshot
-            && let Err(error) = runtime.write_snapshot(&schedule.path, &schedule.stream_path)
-        {
-            // This does not affect a durable, replayable exchange. Retain an older snapshot if
-            // one exists and retry after the configured number of later commits.
-            eprintln!("snapshot checkpoint was not updated during startup: {error}");
-        }
+    if snapshot_is_safe_to_replace
+        && let Err(error) = runtime.write_snapshot(&snapshot_path, &stream_path)
+    {
+        // This does not affect a durable, replayable exchange. An older snapshot, if any, stays.
+        eprintln!("snapshot checkpoint was not updated during startup: {error}");
     }
     Ok(())
 }
@@ -2125,8 +2070,7 @@ mod tests {
         {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
             let mut runtime =
-                recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot, u64::MAX)
-                    .unwrap();
+                recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot).unwrap();
             for input in [
                 ExchangeInputEvent::FundsDepositRequested {
                     user_id: "buyer".into(),
@@ -2157,8 +2101,7 @@ mod tests {
 
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut restarted =
-            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot, u64::MAX)
-                .unwrap();
+            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot).unwrap();
 
         // The checkpoint already owns the first six commands; only the cancellation is held and
         // replayed as the suffix. The full history remains in the journal for subscribers.
@@ -2231,7 +2174,7 @@ mod tests {
 
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let restarted =
-            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot, 1).unwrap();
+            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot).unwrap();
         assert_eq!(restarted.event_log().len(), 2);
         assert_eq!(restarted.core.balance_view("buyer").balance, 10);
         assert_eq!(std::fs::read(&snapshot).unwrap(), corrupt);
@@ -2251,7 +2194,7 @@ mod tests {
         let _ = std::fs::remove_file(&snapshot);
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut runtime =
-            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot, 1).unwrap();
+            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot).unwrap();
         let before = std::fs::read(&snapshot).unwrap();
         runtime.store = Some(EventStore::open_read_only_for_test(&path).unwrap());
 

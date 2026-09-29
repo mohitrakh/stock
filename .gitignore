@@ -12,3 +12,4 @@ exchange-events.log
 !docs/tasks/13-warm-replica-v1.md
 !docs/tasks/14-critical-path-performance-v1.md
 !docs/performance/*.md
+!docs/tasks/15-snapshots-by-the-warm-replica.md

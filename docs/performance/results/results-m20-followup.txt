@@ -1,0 +1,14 @@
+### after-rate-no-warm: --orders 100000 --rate 5000 (primary alone)
+  throughput : 4996 orders/s over 20.015 s
+  latency us : p50 13927  p90 35551  p99 94719  p99.9 190335  max 210303
+### after-rate-no-warm: --orders 100000 --rate 5000 (primary alone)
+  throughput : 4999 orders/s over 20.006 s
+  latency us : p50 16319  p90 89279  p99 257407  p99.9 297215  max 317183
+### warm lag: --orders 200000 at max rate, warm replica beside it
+  throughput : 22052 orders/s over 9.069 s
+  warm       : next sequence 396467 when the benchmark finished; caught up to 706637 14506 ms later
+  snapshots  : 21 written; ms each: min 52, median 869, max 1592; total 17.6 s
+warm replica wrote a snapshot through event sequence 706282 in 1592 ms
+  restart    : a new follower starting from the warm's snapshot was ready in 3926 ms
+  restart    : the same follower with no snapshot (full replay) was ready in 25242 ms
+### done

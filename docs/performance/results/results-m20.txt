@@ -1,0 +1,68 @@
+# Milestone 20 before/after. before = milestone 19 binary (primary snapshots every 10,000 commands
+# on its trading thread); after = milestone 20 binary with a warm replica beside it writing them.
+# Note: the 'settled' warm figures in the max-rate runs are wrong. The check waited only 0.5 s,
+# shorter than one snapshot write, so it stopped while the warm was mid-snapshot. The real lag
+# is measured in results-m20-followup.txt.
+### before-max: --orders 200000 (warm replica beside it: no)
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snapshots every 10000
+  throughput : 8244 orders/s over 24.259 s
+  latency us : p50 1345535  p90 1883135  p99 2134015  p99.9 3102719  max 3104767  (queue-bound at max rate)
+  syncs      : 196 (1020.4 orders per sync)
+  memory     : VmHWM: 538396 kB, VmRSS: 379780 kB
+### after-max: --orders 200000 (warm replica beside it: yes)
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 20954 orders/s over 9.545 s
+  latency us : p50 516607  p90 674303  p99 753663  p99.9 764927  max 764927  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  memory     : VmHWM: 251776 kB, VmRSS: 250788 kB
+  warm       : at bench end {"role":"warm-replica","next_event_sequence":430869}; settled at {"role":"warm-replica","next_event_sequence":430869} about 534 ms later
+  snapshots  : 13 written by the warm replica; ms each: min 41, median 587, max 997
+### before-max: --orders 200000 (warm replica beside it: no)
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snapshots every 10000
+  throughput : 8385 orders/s over 23.852 s
+  latency us : p50 1258495  p90 1979391  p99 2148351  p99.9 3096575  max 3096575  (queue-bound at max rate)
+  syncs      : 196 (1020.4 orders per sync)
+  memory     : VmHWM: 538684 kB, VmRSS: 379892 kB
+### after-max: --orders 200000 (warm replica beside it: yes)
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 22633 orders/s over 8.837 s
+  latency us : p50 464383  p90 560639  p99 679935  p99.9 705535  max 705535  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  memory     : VmHWM: 251836 kB, VmRSS: 251020 kB
+  warm       : at bench end {"role":"warm-replica","next_event_sequence":396467}; settled at {"role":"warm-replica","next_event_sequence":430869} about 1567 ms later
+  snapshots  : 12 written by the warm replica; ms each: min 52, median 432, max 821
+### after-max-no-warm: --orders 200000 (warm replica beside it: no)
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 26084 orders/s over 7.667 s
+  latency us : p50 408319  p90 483327  p99 712191  p99.9 737791  max 737791  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  memory     : VmHWM: 251732 kB, VmRSS: 250668 kB
+### before-rate: --orders 100000 --rate 5000 (warm replica beside it: no)
+bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, depth 0 per symbol, snapshots every 10000
+  throughput : 4756 orders/s over 21.028 s
+  latency us : p50 18863  p90 290559  p99 655359  p99.9 744959  max 1040383
+  syncs      : 2268 (44.1 orders per sync)
+  memory     : VmHWM: 304636 kB, VmRSS: 221108 kB
+### after-rate: --orders 100000 --rate 5000 (warm replica beside it: yes)
+bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4938 orders/s over 20.249 s
+  latency us : p50 13127  p90 34271  p99 251647  p99.9 422143  max 442111
+  syncs      : 3738 (26.8 orders per sync)
+  memory     : VmHWM: 134680 kB, VmRSS: 134556 kB
+  warm       : at bench end {"role":"warm-replica","next_event_sequence":361787}; settled at {"role":"warm-replica","next_event_sequence":362143} about 1067 ms later
+  snapshots  : 11 written by the warm replica; ms each: min 37, median 447, max 880
+### before-rate: --orders 100000 --rate 5000 (warm replica beside it: no)
+bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, depth 0 per symbol, snapshots every 10000
+  throughput : 4835 orders/s over 20.683 s
+  latency us : p50 16191  p90 220671  p99 546815  p99.9 641023  max 701951
+  syncs      : 2982 (33.5 orders per sync)
+  memory     : VmHWM: 304972 kB, VmRSS: 221204 kB
+### after-rate: --orders 100000 --rate 5000 (warm replica beside it: yes)
+bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4999 orders/s over 20.003 s
+  latency us : p50 14847  p90 44415  p99 117567  p99.9 151423  max 169983
+  syncs      : 3208 (31.2 orders per sync)
+  memory     : VmHWM: 132520 kB, VmRSS: 132520 kB
+  warm       : at bench end {"role":"warm-replica","next_event_sequence":361787}; settled at {"role":"warm-replica","next_event_sequence":362143} about 1037 ms later
+  snapshots  : 11 written by the warm replica; ms each: min 23, median 350, max 753
+### done

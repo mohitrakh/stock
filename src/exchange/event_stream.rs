@@ -47,6 +47,11 @@ impl ReaderCheckpoint {
     pub(crate) fn journal_identity(&self) -> (u64, u64) {
         (self.device, self.inode)
     }
+
+    /// The journal byte where the next unread command record starts.
+    pub(crate) fn byte_offset(&self) -> u64 {
+        self.byte_offset
+    }
 }
 
 struct Unlock<'a>(&'a File);
@@ -308,6 +313,7 @@ pub struct StreamReader {
     journal: File,
     cursor: ReaderCheckpoint,
     last_watermark: u64,
+    journal_only: bool,
 }
 
 impl StreamReader {
@@ -390,6 +396,7 @@ impl StreamReader {
             journal,
             cursor,
             last_watermark: snapshot.end,
+            journal_only: false,
         };
         reader.validate_snapshot(&snapshot)?;
         Ok(reader)
@@ -397,6 +404,15 @@ impl StreamReader {
 
     pub fn checkpoint(&self) -> ReaderCheckpoint {
         self.cursor.clone()
+    }
+
+    /// Reads every batch from the durable journal and uses the mmap stream only for its committed
+    /// watermark. The cache copy is faster, but a structurally valid cache can still disagree with
+    /// the journal, and a consumer whose state must be as trustworthy as journal recovery — the
+    /// snapshot-writing warm replica — must never build it from the cache.
+    pub(crate) fn journal_only(mut self) -> Self {
+        self.journal_only = true;
+        self
     }
 
     fn validate_snapshot(&self, snapshot: &Snapshot) -> io::Result<()> {
@@ -423,7 +439,8 @@ impl StreamReader {
     }
 
     pub fn next_batch(&mut self) -> io::Result<Option<Vec<EventEnvelope>>> {
-        let snapshot = self.mapping.snapshot(Some(self.cursor.byte_offset))?;
+        let cached = (!self.journal_only).then_some(self.cursor.byte_offset);
+        let snapshot = self.mapping.snapshot(cached)?;
         self.validate_snapshot(&snapshot)?;
         self.last_watermark = snapshot.end;
         if self.cursor.byte_offset == snapshot.end {

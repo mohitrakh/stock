@@ -73,7 +73,7 @@ async fn main() {
         return;
     }
     if args.first().is_some_and(|arg| arg == "--warm-replica") {
-        let promotion = exchange::warm_replica::run(&args[1..])
+        let promotion = exchange::warm_replica::run(&args[1..], snapshot_interval_or_exit())
             .await
             .unwrap_or_else(|error| {
                 eprintln!("warm replica: {error}");
@@ -86,7 +86,6 @@ async fn main() {
             stream_path,
             snapshot_path,
         } = promotion;
-        let snapshot_interval = snapshot_interval_or_exit();
         let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
         let runtime = promote_replica_with_stream_and_snapshot(
             rx,
@@ -95,7 +94,6 @@ async fn main() {
             &journal_path,
             &stream_path,
             &snapshot_path,
-            snapshot_interval,
         )
         .unwrap_or_else(|error| {
             eprintln!("refusing to promote: {error}");
@@ -125,8 +123,6 @@ async fn main() {
         std::env::var("EVENT_STREAM_PATH").unwrap_or_else(|_| format!("{event_log_path}.mmap"));
     let event_snapshot_path = std::env::var("EVENT_SNAPSHOT_PATH")
         .unwrap_or_else(|_| format!("{event_log_path}.snapshot"));
-    let snapshot_interval = snapshot_interval_or_exit();
-
     let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
 
     // Recovery happens before the listener binds, and on the main thread. History that cannot be
@@ -137,7 +133,6 @@ async fn main() {
         &event_log_path,
         &event_stream_path,
         &event_snapshot_path,
-        snapshot_interval,
     )
     .unwrap_or_else(|err| {
         eprintln!("refusing to start: {}", err);
@@ -156,6 +151,8 @@ async fn main() {
     serve_primary(runtime, tx).await;
 }
 
+/// Commands between the snapshots the warm replica writes. The primary no longer snapshots while
+/// trading; it writes one snapshot at startup.
 fn snapshot_interval_or_exit() -> u64 {
     std::env::var("EVENT_SNAPSHOT_INTERVAL")
         .map(|value| {

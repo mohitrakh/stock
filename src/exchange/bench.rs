@@ -1,8 +1,9 @@
 //! `--bench`: an in-process load generator for the real exchange worker.
 //!
 //! It drives the production path — the same bounded command queue, worker thread, durable
-//! journal, mmap stream, and snapshot schedule that `main` builds — but skips HTTP and login so
-//! the numbers describe the exchange rather than the web framework.
+//! journal, and mmap stream that `main` builds — but skips HTTP and login so the numbers describe
+//! the exchange rather than the web framework. Periodic core snapshots are the warm replica's job
+//! (a separate process), so to measure them run `--warm-replica` beside the benchmark.
 //!
 //! Latency is measured from each order's *intended* send time, not from when it was actually
 //! sent. When the exchange stalls, the generator does not politely wait before "starting the
@@ -22,15 +23,11 @@ use hdrhistogram::Histogram;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    exchange::{
-        event_store::JOURNAL_SYNCS,
-        runtime::{DEFAULT_SNAPSHOT_INTERVAL, recover_runtime_with_stream_and_snapshot},
-    },
+    exchange::{event_store::JOURNAL_SYNCS, runtime::recover_runtime_with_stream_and_snapshot},
     types::types::{ExchangeCommand, Order},
 };
 
-const USAGE: &str = "usage: stock --bench EMPTY_DIR [--orders N] [--rate ORDERS_PER_SEC|0] \
-                     [--symbols N] [--users N] [--depth RESTING_ORDERS_PER_SYMBOL]                      [--snapshot-every COMMANDS|0]";
+const USAGE: &str = "usage: stock --bench EMPTY_DIR [--orders N] [--rate ORDERS_PER_SEC|0] [--symbols N] [--users N] [--depth RESTING_ORDERS_PER_SYMBOL]";
 
 /// Every measured order is priced inside this band, so roughly half of them cross.
 const BAND_LOW: u64 = 1_000;
@@ -46,8 +43,6 @@ struct Config {
     symbols: u64,
     users: u64,
     depth: u64,
-    /// Core snapshot interval, as in production; 0 turns snapshots off to isolate other costs.
-    snapshot_every: u64,
 }
 
 fn parse(args: &[String]) -> Result<Config, String> {
@@ -60,7 +55,6 @@ fn parse(args: &[String]) -> Result<Config, String> {
         symbols: 100,
         users: 100,
         depth: 0,
-        snapshot_every: DEFAULT_SNAPSHOT_INTERVAL,
     };
     while let Some(flag) = args.next() {
         let value: u64 = args
@@ -73,7 +67,6 @@ fn parse(args: &[String]) -> Result<Config, String> {
             "--symbols" => config.symbols = value.max(1),
             "--users" => config.users = value.max(2),
             "--depth" => config.depth = value,
-            "--snapshot-every" => config.snapshot_every = value,
             _ => return Err(USAGE.to_string()),
         }
     }
@@ -168,10 +161,6 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         &journal,
         config.dir.join("bench-events.log.mmap"),
         config.dir.join("bench-events.log.snapshot"),
-        match config.snapshot_every {
-            0 => u64::MAX,
-            every => every,
-        },
     )
     .map_err(|error| error.to_string())?;
     let worker = thread::spawn(move || runtime.run());
@@ -292,12 +281,8 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         0 => "max".to_string(),
         rate => format!("{rate}/s"),
     };
-    let snapshots = match config.snapshot_every {
-        0 => "off".to_string(),
-        every => format!("every {every}"),
-    };
     println!(
-        "bench: {} orders, rate {rate}, {} symbols, {} users, depth {} per symbol, snapshots {snapshots}",
+        "bench: {} orders, rate {rate}, {} symbols, {} users, depth {} per symbol",
         config.orders, config.symbols, config.users, config.depth
     );
     println!(

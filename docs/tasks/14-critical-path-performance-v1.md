@@ -176,7 +176,8 @@ cargo build --release
 ./target/release/stock --bench /tmp/b5 --orders 200000                              # production snapshots
 ```
 
-Each run needs its own empty directory.
+Each run needs its own empty directory. `--snapshot-every` belongs to this milestone's binary; milestone 20
+removed it (the primary no longer snapshots while trading), so drop it when running newer code.
 
 ## Deliberately not done
 

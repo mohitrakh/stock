@@ -21,8 +21,10 @@ an after, and the next thing to fix is whatever the numbers say is slowest.
 cargo run --release -- --bench EMPTY_DIR [--orders N] [--rate ORDERS_PER_SEC|0]
                                          [--symbols N] [--users N]
                                          [--depth RESTING_ORDERS_PER_SYMBOL]
-                                         [--snapshot-every COMMANDS|0]
 ```
+
+(`--snapshot-every` existed during milestone 19 and was removed in milestone 20, when the primary
+stopped writing periodic snapshots. See "The snapshot switch" below.)
 
 `src/exchange/bench.rs` builds the real production pipeline in one process:
 
@@ -32,7 +34,7 @@ load generator (Tokio task)
   -> the same dedicated exchange worker thread
        -> ExchangeRuntime: per command, prepare + encode + commit in memory;
                            per group, one journal write + sync, then mmap publish,
-                           callbacks, replies, snapshot schedule
+                           callbacks, replies
   -> oneshot reply per order back to the generator
 ```
 
@@ -136,6 +138,11 @@ snapshots off, so each optimization can be measured on its own. With snapshots o
 at the end of setup can run just after the first measured orders are sent, which slightly lowers
 the first measured seconds. Every comparison in `01` to `03`
 uses snapshots off. The production schedule is measured separately and reported as its own row.
+
+**Since milestone 20** the primary writes no periodic snapshots (only one at startup), so the switch
+is gone. Snapshots are written by the warm replica, a separate process. To measure the cost of
+snapshotting now, start `--warm-replica` on the benchmark's directory once its `.mmap` file appears,
+as `04-snapshots-off-the-trading-thread.md` describes.
 
 ## Where it ran, and how far to trust it
 
