@@ -10,12 +10,9 @@ use std::{
     net::SocketAddr,
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{
-        Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, RwLock},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -42,6 +39,9 @@ const DEFAULT_ADDR: &str = "127.0.0.1:4001";
 const DEFAULT_DEPTH: usize = 10;
 const MAX_DEPTH: usize = 50;
 const IDLE_POLL: Duration = Duration::from_millis(10);
+/// Longest the saved state may trail the served view while batches keep arriving. After a crash
+/// the process replays at most about this much history; a shorter interval means more saves.
+const SAVE_INTERVAL: Duration = Duration::from_secs(1);
 
 type MdResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -204,10 +204,14 @@ impl MarketDataProjection {
         Ok(())
     }
 
+    /// Applies one committed batch in place. An error can leave the projection partly updated;
+    /// the follower then withdraws the whole view (`Follower::step`), so it is never served or saved.
     fn apply_batch(&mut self, batch: &[EventEnvelope]) -> Result<(), String> {
         match committed_batch::decode(batch)? {
             CommittedCommand::NewOrder { order, outcome } => self.apply_new_order(&order, outcome),
-            CommittedCommand::Cancellation { order_id, outcome } => {
+            CommittedCommand::Cancellation {
+                order_id, outcome, ..
+            } => {
                 self.apply_cancellation(&order_id, outcome)
             }
             CommittedCommand::Other => Ok(()),
@@ -358,7 +362,6 @@ fn load_state(
     MarketDataProjection,
     CandleProjection,
     Option<ReaderCheckpoint>,
-    bool,
 )> {
     match std::fs::read(path) {
         Ok(bytes) => {
@@ -372,36 +375,36 @@ fn load_state(
             }
             let projection = MarketDataProjection::from_orders(saved.orders).map_err(invalid)?;
             let candles = CandleProjection::from_candles(saved.candles).map_err(invalid)?;
-            Ok((projection, candles, Some(saved.checkpoint), true))
+            Ok((projection, candles, Some(saved.checkpoint)))
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok((
             MarketDataProjection::default(),
             CandleProjection::default(),
             None,
-            false,
         )),
         Err(error) => Err(error.into()),
     }
 }
 
-fn save_state(
-    path: &Path,
-    projection: &MarketDataProjection,
+fn projection_file(
+    orders: &MarketDataProjection,
     candles: &CandleProjection,
     checkpoint: &ReaderCheckpoint,
-) -> MdResult<()> {
-    save_state_with_rename(path, projection, candles, checkpoint, |from, to| {
-        std::fs::rename(from, to)
-    })
+) -> ProjectionFile {
+    ProjectionFile {
+        version: STATE_VERSION,
+        checkpoint: checkpoint.clone(),
+        orders: orders.persisted_orders(),
+        candles: candles.persisted_candles(),
+    }
 }
 
-fn save_state_with_rename<F>(
-    path: &Path,
-    projection: &MarketDataProjection,
-    candles: &CandleProjection,
-    checkpoint: &ReaderCheckpoint,
-    rename: F,
-) -> MdResult<()>
+/// Returns the number of bytes written.
+fn save_state(path: &Path, file: &ProjectionFile) -> MdResult<usize> {
+    save_state_with_rename(path, file, |from, to| std::fs::rename(from, to))
+}
+
+fn save_state_with_rename<F>(path: &Path, file: &ProjectionFile, rename: F) -> MdResult<usize>
 where
     F: FnOnce(&Path, &Path) -> io::Result<()>,
 {
@@ -414,21 +417,16 @@ where
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid("invalid market-data state path"))?;
     let temp = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
-    let saved = ProjectionFile {
-        version: STATE_VERSION,
-        checkpoint: checkpoint.clone(),
-        orders: projection.persisted_orders(),
-        candles: candles.persisted_candles(),
-    };
+    // One buffer, one write: serializing straight into the file was thousands of tiny writes.
+    let bytes = serde_json::to_vec(file)?;
     let result: MdResult<()> = (|| {
-        let mut file = OpenOptions::new()
+        let mut out = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&temp)?;
-        serde_json::to_writer(&mut file, &saved)?;
-        file.flush()?;
-        file.sync_all()?;
+        out.write_all(&bytes)?;
+        out.sync_all()?;
         rename(&temp, path)?;
         File::open(parent)?.sync_all()?;
         Ok(())
@@ -436,7 +434,7 @@ where
     if result.is_err() {
         let _ = std::fs::remove_file(temp);
     }
-    result
+    result.map(|()| bytes.len())
 }
 
 fn ensure_safe_state_path(journal: &Path, stream: &Path, state: &Path) -> MdResult<()> {
@@ -472,26 +470,149 @@ fn ensure_safe_state_path(journal: &Path, stream: &Path, state: &Path) -> MdResu
     Ok(())
 }
 
-fn apply_and_save(
-    current: &MarketDataProjection,
-    current_candles: &CandleProjection,
-    batch: &[EventEnvelope],
-    checkpoint: &ReaderCheckpoint,
-    state_path: &Path,
-) -> MdResult<(MarketDataProjection, CandleProjection)> {
-    let mut candidate = current.clone();
-    candidate.apply_batch(batch).map_err(invalid)?;
-    let mut candle_candidate = current_candles.clone();
-    candle_candidate.apply_batch(batch).map_err(invalid)?;
-    save_state(state_path, &candidate, &candle_candidate, checkpoint)?;
-    Ok((candidate, candle_candidate))
+/// What the market-data process serves: the L2 book, the candles, and the reader position just
+/// after the last batch applied to them, which is the checkpoint saved with them.
+struct View {
+    orders: MarketDataProjection,
+    candles: CandleProjection,
+    applied: ReaderCheckpoint,
+}
+
+impl View {
+    fn apply_batch(
+        &mut self,
+        batch: &[EventEnvelope],
+        after: ReaderCheckpoint,
+    ) -> Result<(), String> {
+        self.orders.apply_batch(batch)?;
+        self.candles.apply_batch(batch)?;
+        self.applied = after;
+        Ok(())
+    }
+}
+
+/// `None` means unavailable. Every route reads this one lock, so a view that a failed batch left
+/// half-updated can never be served: the follower replaces it with `None` before letting go.
+type Served = Arc<RwLock<Option<View>>>;
+
+/// Applies committed batches to the served view in place and saves the view with its checkpoint
+/// at most once per `save_interval`. See `docs/performance/05-market-data-keeps-up.md`.
+struct Follower {
+    reader: StreamReader,
+    served: Served,
+    state_path: PathBuf,
+    save_interval: Duration,
+    unsaved: u64,
+    last_save: Instant,
+}
+
+impl Follower {
+    fn new(
+        reader: StreamReader,
+        served: Served,
+        state_path: PathBuf,
+        save_interval: Duration,
+    ) -> Self {
+        Self {
+            reader,
+            served,
+            state_path,
+            save_interval,
+            unsaved: 0,
+            last_save: Instant::now(),
+        }
+    }
+
+    /// Applies the next committed batch, if there is one; `false` means caught up. The batch is
+    /// read outside the lock and applied in place under it — no copy of the state. If it fails,
+    /// the view is withdrawn before the lock is released, and the error is terminal: the process
+    /// then serves 503 and never saves that state; a restart rebuilds from the last saved one.
+    fn step(&mut self) -> MdResult<bool> {
+        let Some(batch) = self.reader.next_batch()? else {
+            return Ok(false);
+        };
+        let after = self.reader.checkpoint();
+        let mut served = self
+            .served
+            .write()
+            .map_err(|_| invalid("market-data view lock poisoned"))?;
+        let view = served
+            .as_mut()
+            .ok_or_else(|| invalid("market data is unavailable"))?;
+        if let Err(error) = view.apply_batch(&batch, after) {
+            *served = None;
+            return Err(invalid(error).into());
+        }
+        drop(served);
+        self.unsaved += 1;
+        Ok(true)
+    }
+
+    /// Saves if batches are unsaved and `save_interval` has passed since the previous save
+    /// *finished*, so a slow save can never make every batch trigger another one.
+    fn maybe_save(&mut self) -> MdResult<()> {
+        if self.unsaved > 0 && self.last_save.elapsed() >= self.save_interval {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Copies the view and its checkpoint under one read lock, then writes them outside it. The
+    /// pair always matches: both come from the same moment, after a successfully applied batch.
+    fn save(&mut self) -> MdResult<()> {
+        let started = Instant::now();
+        let file = {
+            let served = self
+                .served
+                .read()
+                .map_err(|_| invalid("market-data view lock poisoned"))?;
+            let view = served
+                .as_ref()
+                .ok_or_else(|| invalid("market data is unavailable"))?;
+            projection_file(&view.orders, &view.candles, &view.applied)
+        };
+        let bytes = save_state(&self.state_path, &file)?;
+        println!(
+            "market-data state saved through event sequence {} ({} batches, {} bytes) in {} ms",
+            file.checkpoint.next_sequence - 1,
+            self.unsaved,
+            bytes,
+            started.elapsed().as_millis()
+        );
+        self.unsaved = 0;
+        self.last_save = Instant::now();
+        Ok(())
+    }
+
+    fn follow(mut self) -> MdResult<()> {
+        loop {
+            if !self.step()? {
+                self.maybe_save()?;
+                thread::sleep(IDLE_POLL);
+                continue;
+            }
+            self.maybe_save()?;
+        }
+    }
+}
+
+/// Withdraws the view when the follower thread ends for any reason, including a panic, so the
+/// process never keeps serving a view that has stopped moving.
+struct WithdrawOnExit(Served);
+
+impl Drop for WithdrawOnExit {
+    fn drop(&mut self) {
+        let mut served = self
+            .0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *served = None;
+    }
 }
 
 #[derive(Clone)]
 struct MarketDataState {
-    projection: Arc<RwLock<MarketDataProjection>>,
-    candles: Arc<RwLock<CandleProjection>>,
-    available: Arc<AtomicBool>,
+    served: Served,
 }
 
 #[derive(Deserialize)]
@@ -512,11 +633,13 @@ struct CandleView {
     candles: Vec<Candle>,
 }
 
+const UNAVAILABLE: (StatusCode, &str) =
+    (StatusCode::SERVICE_UNAVAILABLE, "market data unavailable");
+
 async fn health(State(state): State<MarketDataState>) -> impl IntoResponse {
-    if state.available.load(Ordering::Acquire) {
-        (StatusCode::OK, "OK")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "market data unavailable")
+    match state.served.read() {
+        Ok(served) if served.is_some() => (StatusCode::OK, "OK"),
+        _ => UNAVAILABLE,
     }
 }
 
@@ -525,14 +648,9 @@ async fn order_book(
     AxumPath(symbol): AxumPath<String>,
     Query(query): Query<BookQuery>,
 ) -> Result<Json<OrderBookView>, (StatusCode, &'static str)> {
-    if !state.available.load(Ordering::Acquire) {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "market data unavailable"));
-    }
-    let projection = state
-        .projection
-        .read()
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "market data unavailable"))?;
-    projection
+    let served = state.served.read().map_err(|_| UNAVAILABLE)?;
+    let view = served.as_ref().ok_or(UNAVAILABLE)?;
+    view.orders
         .view(
             &symbol,
             query.depth.unwrap_or(DEFAULT_DEPTH).clamp(1, MAX_DEPTH),
@@ -545,9 +663,8 @@ async fn candle_history(
     State(state): State<MarketDataState>,
     Query(query): Query<CandleQuery>,
 ) -> Result<Json<CandleView>, (StatusCode, &'static str)> {
-    if !state.available.load(Ordering::Acquire) {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "market data unavailable"));
-    }
+    let served = state.served.read().map_err(|_| UNAVAILABLE)?;
+    let view = served.as_ref().ok_or(UNAVAILABLE)?;
     let start_time = query
         .start_time
         .ok_or((StatusCode::BAD_REQUEST, "start_time is required"))?;
@@ -564,50 +681,10 @@ async fn candle_history(
         .symbol
         .filter(|symbol| !symbol.trim().is_empty())
         .ok_or((StatusCode::BAD_REQUEST, "symbol is required"))?;
-    let projection = state
-        .candles
-        .read()
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "market data unavailable"))?;
     Ok(Json(CandleView {
-        candles: projection.candles_in_range(&symbol, start_time, end_time),
+        candles: view.candles.candles_in_range(&symbol, start_time, end_time),
         symbol,
     }))
-}
-
-fn follow(
-    mut reader: StreamReader,
-    state_path: PathBuf,
-    projection: Arc<RwLock<MarketDataProjection>>,
-    candles: Arc<RwLock<CandleProjection>>,
-) -> MdResult<()> {
-    loop {
-        match reader.next_batch()? {
-            Some(batch) => {
-                let current = projection
-                    .read()
-                    .map_err(|_| invalid("market-data projection lock poisoned"))?
-                    .clone();
-                let current_candles = candles
-                    .read()
-                    .map_err(|_| invalid("market-data candle lock poisoned"))?
-                    .clone();
-                let (candidate, candle_candidate) = apply_and_save(
-                    &current,
-                    &current_candles,
-                    &batch,
-                    &reader.checkpoint(),
-                    &state_path,
-                )?;
-                *projection
-                    .write()
-                    .map_err(|_| invalid("market-data projection lock poisoned"))? = candidate;
-                *candles
-                    .write()
-                    .map_err(|_| invalid("market-data candle lock poisoned"))? = candle_candidate;
-            }
-            None => thread::sleep(IDLE_POLL),
-        }
-    }
 }
 
 pub async fn run(args: &[String]) -> MdResult<()> {
@@ -626,47 +703,37 @@ pub async fn run(args: &[String]) -> MdResult<()> {
         .parse()?;
 
     ensure_safe_state_path(&journal_path, &stream_path, &state_path)?;
-    let (mut projection, mut candles, checkpoint, state_existed) = load_state(&state_path)?;
-    let mut reader = StreamReader::open(&journal_path, &stream_path, checkpoint)?;
-    let mut advanced = false;
-    while let Some(batch) = reader.next_batch()? {
-        (projection, candles) = apply_and_save(
-            &projection,
-            &candles,
-            &batch,
-            &reader.checkpoint(),
-            &state_path,
-        )?;
-        advanced = true;
+    let (orders, candles, checkpoint) = load_state(&state_path)?;
+    let reader = StreamReader::open(&journal_path, &stream_path, checkpoint)?;
+    let applied = reader.checkpoint();
+    let served: Served = Arc::new(RwLock::new(Some(View {
+        orders,
+        candles,
+        applied,
+    })));
+    let mut follower = Follower::new(reader, Arc::clone(&served), state_path, SAVE_INTERVAL);
+    // Catch up before binding, saving on the usual cadence, then save once more so the state on
+    // disk matches what the listener is about to serve.
+    while follower.step()? {
+        follower.maybe_save()?;
     }
-    if !state_existed && !advanced {
-        save_state(&state_path, &projection, &candles, &reader.checkpoint())?;
-    }
+    follower.save()?;
 
-    let projection = Arc::new(RwLock::new(projection));
-    let candles = Arc::new(RwLock::new(candles));
-    let available = Arc::new(AtomicBool::new(true));
-    let follower_projection = Arc::clone(&projection);
-    let follower_candles = Arc::clone(&candles);
-    let follower_available = Arc::clone(&available);
+    let withdraw = WithdrawOnExit(Arc::clone(&served));
     thread::Builder::new()
         .name("market-data-follower".into())
         .spawn(move || {
-            if let Err(error) = follow(reader, state_path, follower_projection, follower_candles) {
+            let _withdraw = withdraw;
+            if let Err(error) = follower.follow() {
                 eprintln!("market-data follower halted: {error}");
             }
-            follower_available.store(false, Ordering::Release);
         })?;
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/marketdata/orderbook/{symbol}", get(order_book))
         .route("/marketdata/candles", get(candle_history))
-        .with_state(MarketDataState {
-            projection,
-            candles,
-            available,
-        });
+        .with_state(MarketDataState { served });
     let listener = tokio::net::TcpListener::bind(address).await?;
     println!("Market data is listening on {}", listener.local_addr()?);
     axum::serve(listener, app).await?;
@@ -1101,10 +1168,13 @@ mod tests {
             trade_count: 2,
         }])
         .unwrap();
-        save_state(&state_path, &projection, &candles, &checkpoint).unwrap();
+        save_state(
+            &state_path,
+            &projection_file(&projection, &candles, &checkpoint),
+        )
+        .unwrap();
 
-        let (loaded, loaded_candles, loaded_checkpoint, existed) = load_state(&state_path).unwrap();
-        assert!(existed);
+        let (loaded, loaded_candles, loaded_checkpoint) = load_state(&state_path).unwrap();
         assert_eq!(loaded.persisted_orders(), projection.persisted_orders());
         assert_eq!(
             loaded_candles.persisted_candles(),
@@ -1145,7 +1215,11 @@ mod tests {
         }])
         .unwrap();
         let candles = CandleProjection::default();
-        save_state(&state_path, &original, &candles, &checkpoint).unwrap();
+        save_state(
+            &state_path,
+            &projection_file(&original, &candles, &checkpoint),
+        )
+        .unwrap();
         let original_bytes = std::fs::read(&state_path).unwrap();
 
         let replacement = MarketDataProjection::from_orders(vec![ProjectedOrder {
@@ -1158,9 +1232,7 @@ mod tests {
         .unwrap();
         let result = save_state_with_rename(
             &state_path,
-            &replacement,
-            &candles,
-            &checkpoint,
+            &projection_file(&replacement, &candles, &checkpoint),
             |_temporary, _destination| Err(io::Error::other("injected rename failure")),
         );
 
@@ -1176,39 +1248,226 @@ mod tests {
         );
     }
 
-    #[test]
-    fn malformed_batch_exposes_neither_partial_projection_nor_partial_state() {
-        let fixture = Fixture::new();
-        let (_store, _writer) = fixture.start(4096);
-        let checkpoint = fixture.reader().checkpoint();
-        let state_path = fixture.dir.join("market-data.json");
-        let mut current = MarketDataProjection::default();
-        current
-            .apply_batch(&accepted(
-                order("sell-1", "seller-1", "SELL", 100, 1),
-                vec![],
-            ))
-            .unwrap();
-        current
-            .apply_batch(&accepted(
-                order("sell-2", "seller-2", "SELL", 100, 1),
-                vec![],
-            ))
-            .unwrap();
-        let candles = CandleProjection::default();
-        save_state(&state_path, &current, &candles, &checkpoint).unwrap();
-        let original_view = current.view("AAPL", 10);
-        let original_state = std::fs::read(&state_path).unwrap();
+    /// Gives a test batch the journal sequence numbers that follow `next`, as the exchange would.
+    fn numbered(mut batch: Vec<EventEnvelope>, next: &mut u64) -> Vec<EventEnvelope> {
+        for envelope in &mut batch {
+            envelope.seq_num = *next;
+            *next += 1;
+        }
+        batch
+    }
 
+    fn publish(
+        store: &mut crate::exchange::event_store::EventStore,
+        writer: &mut crate::exchange::event_stream::StreamWriter,
+        batch: &[EventEnvelope],
+    ) {
+        let record = crate::exchange::event_store::encode_record(batch).unwrap();
+        store.append_record(&record).unwrap();
+        writer
+            .append(&record, batch.last().unwrap().seq_num)
+            .unwrap();
+    }
+
+    fn send(tx: &mpsc::Sender<ExchangeCommand>, command: ExchangeCommand) {
+        tx.blocking_send(command).unwrap();
+    }
+
+    fn empty_view(reader: &StreamReader) -> Served {
+        Arc::new(RwLock::new(Some(View {
+            orders: MarketDataProjection::default(),
+            candles: CandleProjection::default(),
+            applied: reader.checkpoint(),
+        })))
+    }
+
+    #[test]
+    fn a_failed_batch_is_never_served_or_saved() {
+        let fixture = Fixture::new();
+        let (mut store, mut writer) = fixture.start(4096);
+        let mut next = 1;
+        for batch in [
+            accepted(order("sell-1", "seller-1", "SELL", 100, 1), vec![]),
+            accepted(order("sell-2", "seller-2", "SELL", 100, 1), vec![]),
+        ] {
+            publish(&mut store, &mut writer, &numbered(batch, &mut next));
+        }
         let mut executions = pair("first", "buy", "sell-1", 100, 1);
         let mut second_pair = pair("second", "buy", "sell-2", 100, 1);
         second_pair[0].execution_id = executions[0].execution_id.clone();
         executions.extend(second_pair);
         let malformed = accepted(order("buy", "buyer", "BUY", 100, 2), executions);
+        publish(&mut store, &mut writer, &numbered(malformed, &mut next));
 
-        assert!(apply_and_save(&current, &candles, &malformed, &checkpoint, &state_path).is_err());
-        assert_eq!(current.view("AAPL", 10), original_view);
-        assert_eq!(std::fs::read(&state_path).unwrap(), original_state);
+        let state_path = fixture.dir.join("market-data.json");
+        let reader = fixture.reader();
+        let served = empty_view(&reader);
+        // A zero interval saves after every good batch, so any save of the bad one would show.
+        let mut follower = Follower::new(
+            reader,
+            Arc::clone(&served),
+            state_path.clone(),
+            Duration::ZERO,
+        );
+        for _ in 0..2 {
+            assert!(follower.step().unwrap());
+            follower.maybe_save().unwrap();
+        }
+        let saved = std::fs::read(&state_path).unwrap();
+
+        assert!(follower.step().is_err());
+        // The view is withdrawn, so there is nothing left that could be saved.
+        assert!(follower.save().is_err());
+        assert!(served.read().unwrap().is_none());
+        assert_eq!(std::fs::read(&state_path).unwrap(), saved);
+    }
+
+    #[test]
+    fn unsaved_batches_wait_for_the_interval_and_the_final_save_catches_up() {
+        let fixture = Fixture::new();
+        let (mut store, mut writer) = fixture.start(4096);
+        let mut next = 1;
+        for batch in [
+            accepted(order("sell-1", "seller", "SELL", 100, 3), vec![]),
+            accepted(order("sell-2", "seller", "SELL", 101, 4), vec![]),
+        ] {
+            publish(&mut store, &mut writer, &numbered(batch, &mut next));
+        }
+        let state_path = fixture.dir.join("market-data.json");
+        let reader = fixture.reader();
+        let served = empty_view(&reader);
+        let mut follower = Follower::new(
+            reader,
+            Arc::clone(&served),
+            state_path.clone(),
+            Duration::from_secs(3600),
+        );
+        while follower.step().unwrap() {
+            follower.maybe_save().unwrap();
+        }
+        // Both batches are served at once, but not yet saved.
+        assert_eq!(
+            served
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .orders
+                .view("AAPL", 10)
+                .unwrap()
+                .asks
+                .len(),
+            2
+        );
+        assert!(!state_path.exists());
+
+        follower.save().unwrap();
+        let (orders, _, checkpoint) = load_state(&state_path).unwrap();
+        assert_eq!(checkpoint.unwrap().next_sequence, next);
+        assert_eq!(orders.view("AAPL", 10).unwrap().asks.len(), 2);
+    }
+
+    #[test]
+    fn restarting_from_an_older_save_replays_to_the_same_view() {
+        let fixture = Fixture::new();
+        let (tx, rx) = mpsc::channel(16);
+        let runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let worker = thread::spawn(move || runtime.run());
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::DepositShares {
+                user_id: "seller".into(),
+                symbol: "AAPL".into(),
+                quantity: 10,
+                respond_to,
+            },
+        );
+        reply.blocking_recv().unwrap().unwrap();
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::Deposit {
+                user_id: "buyer".into(),
+                amount: 10_000,
+                respond_to,
+            },
+        );
+        reply.blocking_recv().unwrap().unwrap();
+        for (id, user, side, price, quantity) in [
+            ("sell-1", "seller", "SELL", 100, 5),
+            ("sell-2", "seller", "SELL", 102, 5),
+            ("buy-1", "buyer", "BUY", 101, 7),
+        ] {
+            let (respond_to, reply) = oneshot::channel();
+            send(
+                &tx,
+                ExchangeCommand::PlaceOrder {
+                    order: order(id, user, side, price, quantity),
+                    respond_to,
+                },
+            );
+            reply.blocking_recv().unwrap().unwrap();
+        }
+        drop(tx);
+        worker.join().unwrap();
+
+        // First run: save after the first batch only, then apply the rest without saving,
+        // as a crash between two saves would leave it.
+        let state_path = fixture.dir.join("market-data.json");
+        let reader = fixture.reader();
+        let served = empty_view(&reader);
+        let mut first = Follower::new(
+            reader,
+            Arc::clone(&served),
+            state_path.clone(),
+            Duration::from_secs(3600),
+        );
+        assert!(first.step().unwrap());
+        first.save().unwrap();
+        while first.step().unwrap() {}
+        let expected = {
+            let served = served.read().unwrap();
+            let view = served.as_ref().unwrap();
+            (
+                view.orders.view("AAPL", 10),
+                view.candles.persisted_candles(),
+            )
+        };
+        drop(first);
+
+        // Restart from the older save and catch up.
+        let (orders, candles, checkpoint) = load_state(&state_path).unwrap();
+        let reader = StreamReader::open(&fixture.log, &fixture.bus, checkpoint).unwrap();
+        let applied = reader.checkpoint();
+        let served = Arc::new(RwLock::new(Some(View {
+            orders,
+            candles,
+            applied,
+        })));
+        let mut second = Follower::new(
+            reader,
+            Arc::clone(&served),
+            state_path,
+            Duration::from_secs(3600),
+        );
+        while second.step().unwrap() {}
+
+        let served = served.read().unwrap();
+        let view = served.as_ref().unwrap();
+        assert_eq!(
+            (
+                view.orders.view("AAPL", 10),
+                view.candles.persisted_candles()
+            ),
+            expected
+        );
+        // One trade (5 at 100) made one candle; sell-2 still rests, and buy-1's remainder bids.
+        let book = expected.0.unwrap();
+        assert_eq!(
+            (book.asks.len(), book.bids.len(), expected.1.len()),
+            (1, 1, 1)
+        );
     }
 
     #[test]

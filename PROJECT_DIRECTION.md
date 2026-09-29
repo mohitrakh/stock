@@ -1,4 +1,4 @@
-# Project Direction - Snapshots by the Warm Replica Complete
+# Project Direction - Milestone 21 (Subscribers Keep Up) In Progress
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -534,6 +534,14 @@ Measured on disk with snapshots every 10,000 commands: 200,000 orders went from 
 
 Verified on 2026-09-29: `cargo fmt` is clean, `cargo test --locked` passes 138 unit tests and the integration tests, and release warnings are unchanged at 13.
 
+## 21. Subscribers Keep Up (in progress)
+
+Goal: make the two subscribers follow the exchange at its own speed, and fix the reporter's recorded bugs. Parts: (1) market data applies in place and saves once a second — **complete**; (2) the reporter commits many batches per PostgreSQL transaction — **complete**; (3) reporter bug fixes: a reused order id halting it, a rejected cancellation overwriting the owner's row, and (found by this milestone's benchmark) execution ids that repeat across symbols breaking its unique constraint — pending.
+
+**Part 1, complete (2026-09-29).** Write-up: `docs/performance/05-market-data-keeps-up.md`. The MDP used to copy both projections, serialize its whole state, and fsync twice for every command: about 39 commands/s. It now applies each batch in place under one lock holding `Option<View>` (`None` = unavailable, set before the lock is released if a batch fails, so a half-applied view is never served), and saves the view with the checkpoint of its last applied batch at most once a second (counted from the end of the previous save), plus once at the end of catch-up. A crash replays at most about a second of journal onto the last saved pair. A guard withdraws the view if the follower thread ends for any reason. Measured on a 200,000-order journal: catch-up from 39 to about 56,000 commands/s (3.6 s instead of about 86 minutes); live, it stayed within a second of the exchange at 5,000 orders/s and at the exchange's maximum (about 34,500 orders/s). `cargo test` passes 140 unit tests and the market-data executable tests.
+
+**Part 2, complete (2026-09-29).** Write-up: `docs/performance/06-reporter-batched-transactions.md`. The reporter used one PostgreSQL transaction (and so one WAL fsync) per command, and three statements per trade: about 365 commands/s. `apply_available`, used for both catch-up and live following, now applies up to 1,000 batches per transaction and commits them with the checkpoint just after the last applied batch; a group also ends when the reporter is caught up, and any error rolls back the whole group and stops the reporter. Each trade is now one statement: a data-modifying CTE fills both orders and inserts the trade only if both fills applied. Measured on a 200,000-order journal: 365 → 1,050 commands/s with group commit, → 1,578 with one round trip per trade (4.3×). Live, it keeps up at 1,000 orders/s; at 5,000 orders/s it falls behind and drains a 10-second burst in about 21 s. Per-row PostgreSQL work (indexes, foreign keys, row versions) now dominates, so set-based multi-row writes or `COPY` are the next lever. The PostgreSQL acceptance test passes.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -559,7 +567,7 @@ Verified on 2026-09-29: `cargo fmt` is clean, `cargo test --locked` passes 138 u
 - snapshots rely on the journal file identity and committed boundary; an invalid snapshot falls back to full replay and is retained for diagnosis
 - event-log sequencing and matching-input sequencing remain distinct concepts
 - live HTTP replies still use `oneshot`
-- MDP state rewrites and synchronizes the complete JSON open-order and candle projection after every command; this is correctness-first and not a high-throughput persistence design
+- MDP saves its complete JSON open-order and candle state at most once a second; a crash replays up to about a second of journal, and each save still grows with candle history
 - candle state retains every one-minute bucket without a retention limit, rollups, or external historical store
 - there is no public reporting API or trade-tape service
 - mmap is a same-host Unix transport using cooperative file locks, JSON, and a bounded window; it is not lock-free, cross-server replication, or an ingress transport

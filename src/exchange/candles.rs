@@ -62,22 +62,21 @@ impl CandleProjection {
         Ok(projection)
     }
 
-    /// Applies only validated, committed trades. A two-sided execution pair is one trade, so this
-    /// reads its first execution record only after the shared batch decoder has checked the pair.
-    /// A malformed batch leaves this projection unchanged.
+    /// Applies only validated, committed trades, in place. A two-sided execution pair is one
+    /// trade, so this reads its first execution record only after the shared batch decoder has
+    /// checked the pair. An error can leave the projection partly updated; the market-data
+    /// process then withdraws its whole view, so that state is never served or saved.
     pub(crate) fn apply_batch(&mut self, batch: &[EventEnvelope]) -> Result<(), String> {
         let command = committed_batch::decode(batch)?;
-        let mut candidate = self.clone();
         if let CommittedCommand::NewOrder {
             outcome: NewOrderOutcome::Accepted { executions, .. },
             ..
         } = command
         {
             for pair in executions {
-                candidate.apply_execution_pair(&pair)?;
+                self.apply_execution_pair(&pair)?;
             }
         }
-        *self = candidate;
         Ok(())
     }
 
@@ -265,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_trade_timestamp_does_not_partially_update_a_batch() {
+    fn invalid_trade_timestamp_fails_the_batch() {
         let mut projection = CandleProjection::default();
         let batch = accepted(vec![
             execution("valid-buy", 100, 2, 60.0),
@@ -274,7 +273,8 @@ mod tests {
             execution("bad-sell", 101, 1, -1.0),
         ]);
 
+        // The batch fails. It may have updated the first trade's candle already: the market-data
+        // process withdraws the whole view on any error, so that state is never served or saved.
         assert!(projection.apply_batch(&batch).is_err());
-        assert!(projection.candles_for_symbol("AAPL").is_empty());
     }
 }

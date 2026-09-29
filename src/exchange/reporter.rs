@@ -25,6 +25,9 @@ use crate::types::types::{Order, Side};
 const DEFAULT_ADDR: &str = "127.0.0.1:4002";
 const IDLE_POLL: Duration = Duration::from_millis(10);
 const CHECKPOINT_ID: bool = true;
+/// Most committed batches applied in one PostgreSQL transaction. A group also ends whenever the
+/// reporter has caught up, so on a quiet exchange each batch still commits at once.
+const MAX_GROUP: u64 = 1_000;
 
 type ReporterResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -85,12 +88,15 @@ async fn ensure_consistent_saved_state(
     pool: &PgPool,
     checkpoint: Option<&ReaderCheckpoint>,
 ) -> ReporterResult<()> {
-    let (orders, trades): (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM reported_orders), (SELECT count(*) FROM reported_trades)",
+    // Naming every table also fails startup, before anything is written, when the milestone 21
+    // migration is missing.
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM reported_orders) + (SELECT count(*) FROM reported_trades) \
+         + (SELECT count(*) FROM rejected_orders) + (SELECT count(*) FROM rejected_cancellations)",
     )
     .fetch_one(pool)
     .await?;
-    if checkpoint.is_none() && (orders != 0 || trades != 0) {
+    if checkpoint.is_none() && rows != 0 {
         return Err(invalid("reporter rows exist without a reporter checkpoint").into());
     }
     Ok(())
@@ -122,54 +128,88 @@ async fn save_checkpoint(
     Ok(())
 }
 
-async fn insert_order(
+/// Accepted orders only: the engine never accepts an order id twice, so it can be the key.
+async fn insert_accepted_order(
     tx: &mut Transaction<'_, Postgres>,
     order: &Order,
-    status: &str,
-    acceptance_sequence: Option<u64>,
-    rejection_reason: Option<&str>,
+    acceptance_sequence: u64,
 ) -> ReporterResult<()> {
     let original = quantity(order.quantity)?;
     sqlx::query(
-        "INSERT INTO reported_orders (order_id, user_id, symbol, side, limit_price, original_quantity, filled_quantity, remaining_quantity, status, creation_time, acceptance_sequence, rejection_reason) \
-         VALUES ($1, $2, $3, $4, $5::numeric, $6, 0, $6, $7, $8, $9::numeric, $10)",
+        "INSERT INTO reported_orders (order_id, user_id, symbol, side, limit_price, original_quantity, filled_quantity, remaining_quantity, status, creation_time, acceptance_sequence) \
+         VALUES ($1, $2, $3, $4, $5::numeric, $6, 0, $6, 'new', $7, $8::numeric)",
     ).bind(&order.order_id).bind(&order.user_id).bind(&order.symbol).bind(side(&order.side))
-        .bind(number(order.price.minor_units())).bind(original).bind(status).bind(order.timestamp)
-        .bind(acceptance_sequence.map(number)).bind(rejection_reason).execute(&mut **tx).await?;
+        .bind(number(order.price.minor_units())).bind(original).bind(order.timestamp)
+        .bind(number(acceptance_sequence)).execute(&mut **tx).await?;
     Ok(())
 }
 
+/// A rejected submission is keyed by the journal sequence of its input, because its order id need
+/// not be unique: a client retry of an existing id, a reused rejected id, or another user's id.
+async fn insert_rejected_order(
+    tx: &mut Transaction<'_, Postgres>,
+    input_sequence: u64,
+    order: &Order,
+    reason: &str,
+) -> ReporterResult<()> {
+    sqlx::query(
+        "INSERT INTO rejected_orders (input_sequence, order_id, user_id, symbol, side, limit_price, quantity, creation_time, reason) \
+         VALUES ($1::numeric, $2, $3, $4, $5, $6::numeric, $7, $8, $9)",
+    ).bind(number(input_sequence)).bind(&order.order_id).bind(&order.user_id).bind(&order.symbol)
+        .bind(side(&order.side)).bind(number(order.price.minor_units()))
+        .bind(quantity(order.quantity)?).bind(order.timestamp).bind(reason)
+        .execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Records one trade in ONE round trip: a data-modifying CTE fills both orders, and the trade row
+/// is inserted only if both fills applied (each order was resting with enough quantity left).
+/// Three statements per trade became one; round trips, not commits, now limit the reporter.
 async fn apply_trade(
     tx: &mut Transaction<'_, Postgres>,
     pair: &ExecutionPair,
 ) -> ReporterResult<()> {
     let execution = &pair.first;
     let quantity = quantity(execution.quantity)?;
-    for order_id in [&execution.buy_order_id, &execution.sell_order_id] {
-        let updated = sqlx::query(
-            "UPDATE reported_orders SET filled_quantity = filled_quantity + $1, remaining_quantity = remaining_quantity - $1, \
-             status = CASE WHEN remaining_quantity - $1 = 0 THEN 'filled' ELSE 'partially_filled' END \
-             WHERE order_id = $2 AND status IN ('new', 'partially_filled') AND remaining_quantity >= $1",
-        ).bind(quantity).bind(order_id).execute(&mut **tx).await?;
-        if updated.rows_affected() != 1 {
-            return Err(invalid(format!(
-                "trade references a missing or non-resting order {order_id}"
-            ))
-            .into());
-        }
+    let inserted = sqlx::query(concat!(
+        "WITH filled AS (",
+        " UPDATE reported_orders SET filled_quantity = filled_quantity + $4,",
+        " remaining_quantity = remaining_quantity - $4,",
+        " status = CASE WHEN remaining_quantity - $4 = 0 THEN 'filled' ELSE 'partially_filled' END",
+        " WHERE order_id IN ($5, $6) AND status IN ('new', 'partially_filled')",
+        " AND remaining_quantity >= $4",
+        " RETURNING order_id)",
+        " INSERT INTO reported_trades (trade_sequence, symbol, price, quantity, buy_order_id,",
+        " sell_order_id, first_execution_id, second_execution_id, trade_time)",
+        " SELECT $1::numeric, $2, $3::numeric, $4, $5, $6, $7, $8, $9",
+        " WHERE (SELECT count(*) FROM filled) = 2",
+    ))
+    .bind(number(pair.first_sequence))
+    .bind(&execution.symbol)
+    .bind(number(execution.price.minor_units()))
+    .bind(quantity)
+    .bind(&execution.buy_order_id)
+    .bind(&execution.sell_order_id)
+    .bind(&pair.first.execution_id)
+    .bind(&pair.second.execution_id)
+    .bind(execution.timestamp)
+    .execute(&mut **tx)
+    .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(invalid(format!(
+            "trade references a missing or non-resting order ({} / {})",
+            execution.buy_order_id, execution.sell_order_id
+        ))
+        .into());
     }
-    sqlx::query(
-        "INSERT INTO reported_trades (trade_sequence, symbol, price, quantity, buy_order_id, sell_order_id, first_execution_id, second_execution_id, trade_time) \
-         VALUES ($1::numeric, $2, $3::numeric, $4, $5, $6, $7, $8, $9)",
-    ).bind(number(pair.first_sequence)).bind(&execution.symbol).bind(number(execution.price.minor_units()))
-        .bind(quantity).bind(&execution.buy_order_id).bind(&execution.sell_order_id)
-        .bind(&pair.first.execution_id).bind(&pair.second.execution_id).bind(execution.timestamp)
-        .execute(&mut **tx).await?;
     Ok(())
 }
 
+/// `input_sequence` is the journal sequence of the command's input: the identity of anything the
+/// report records per command rather than per order.
 async fn apply_command(
     tx: &mut Transaction<'_, Postgres>,
+    input_sequence: u64,
     command: CommittedCommand,
 ) -> ReporterResult<()> {
     match command {
@@ -177,7 +217,7 @@ async fn apply_command(
         CommittedCommand::NewOrder {
             order,
             outcome: NewOrderOutcome::Rejected { reason },
-        } => insert_order(tx, &order, "rejected", None, Some(&reason)).await,
+        } => insert_rejected_order(tx, input_sequence, &order, &reason).await,
         CommittedCommand::NewOrder {
             order,
             outcome:
@@ -186,7 +226,7 @@ async fn apply_command(
                     executions,
                 },
         } => {
-            insert_order(tx, &order, "new", Some(matching_sequence), None).await?;
+            insert_accepted_order(tx, &order, matching_sequence).await?;
             for pair in &executions {
                 apply_trade(tx, pair).await?;
             }
@@ -194,12 +234,15 @@ async fn apply_command(
         }
         CommittedCommand::Cancellation {
             order_id,
+            user_id,
             outcome: CancelOutcome::Canceled { matching_sequence },
         } => {
+            // The engine lets only the owner cancel, so checking the owner costs nothing and stops
+            // the reporter if the journal and this projection ever disagree.
             let updated = sqlx::query(
                 "UPDATE reported_orders SET status = 'canceled', cancellation_sequence = $1::numeric, cancellation_outcome = 'canceled', cancellation_reason = NULL \
-                 WHERE order_id = $2 AND status IN ('new', 'partially_filled')",
-            ).bind(number(matching_sequence)).bind(order_id).execute(&mut **tx).await?;
+                 WHERE order_id = $2 AND user_id = $3 AND status IN ('new', 'partially_filled')",
+            ).bind(number(matching_sequence)).bind(order_id).bind(user_id).execute(&mut **tx).await?;
             if updated.rows_affected() != 1 {
                 return Err(
                     invalid("cancellation references a missing or non-resting order").into(),
@@ -209,27 +252,56 @@ async fn apply_command(
         }
         CommittedCommand::Cancellation {
             order_id,
+            user_id,
             outcome: CancelOutcome::Rejected { reason },
         } => {
+            // A refused attempt is a fact about the attempt, not the order: it gets its own row
+            // with who asked, and the order's row stays exactly as it was.
             sqlx::query(
-                "UPDATE reported_orders SET cancellation_outcome = 'rejected', cancellation_reason = $1 WHERE order_id = $2",
-            ).bind(reason).bind(order_id).execute(&mut **tx).await?;
+                "INSERT INTO rejected_cancellations (input_sequence, order_id, requested_by, reason) \
+                 VALUES ($1::numeric, $2, $3, $4)",
+            ).bind(number(input_sequence)).bind(order_id).bind(user_id).bind(reason)
+                .execute(&mut **tx).await?;
             Ok(())
         }
     }
 }
 
-async fn apply_batch(
-    pool: &PgPool,
-    batch: &[crate::types::exchange_event::EventEnvelope],
-    checkpoint: &ReaderCheckpoint,
-) -> ReporterResult<()> {
-    let command = committed_batch::decode(batch).map_err(invalid)?;
-    let mut tx = pool.begin().await?;
-    apply_command(&mut tx, command).await?;
-    save_checkpoint(&mut tx, checkpoint).await?;
-    tx.commit().await?;
-    Ok(())
+/// Applies every batch the reader has, up to `MAX_GROUP` per transaction. Each group commits
+/// together with the checkpoint just after its last applied batch, so the rows and the position
+/// they represent always move together; returns how many batches were applied. Any error drops
+/// the open transaction, rolling back the whole group, and is terminal: the reader's cursor may
+/// be ahead of the database then, which is harmless only because the reporter stops.
+/// See `docs/performance/06-reporter-batched-transactions.md`.
+async fn apply_available(reader: &mut StreamReader, pool: &PgPool) -> ReporterResult<u64> {
+    let mut applied = 0;
+    while let Some(first) = reader.next_batch()? {
+        let mut tx = pool.begin().await?;
+        let mut batch = first;
+        let mut in_group = 0;
+        loop {
+            let command = committed_batch::decode(&batch).map_err(invalid)?;
+            apply_command(&mut tx, batch[0].seq_num, command).await?;
+            in_group += 1;
+            // Decide after applying, and take the position before reading any further batch.
+            let after = reader.checkpoint();
+            let next = if in_group < MAX_GROUP {
+                reader.next_batch()?
+            } else {
+                None
+            };
+            match next {
+                Some(following) => batch = following,
+                None => {
+                    save_checkpoint(&mut tx, &after).await?;
+                    tx.commit().await?;
+                    break;
+                }
+            }
+        }
+        applied += in_group;
+    }
+    Ok(applied)
 }
 
 async fn persist_initial_checkpoint(
@@ -244,9 +316,8 @@ async fn persist_initial_checkpoint(
 
 async fn follow(mut reader: StreamReader, pool: PgPool) -> ReporterResult<()> {
     loop {
-        match reader.next_batch()? {
-            Some(batch) => apply_batch(&pool, &batch, &reader.checkpoint()).await?,
-            None => tokio::time::sleep(IDLE_POLL).await,
+        if apply_available(&mut reader, &pool).await? == 0 {
+            tokio::time::sleep(IDLE_POLL).await;
         }
     }
 }
@@ -277,11 +348,8 @@ pub async fn run(args: &[String]) -> ReporterResult<()> {
     let checkpoint = load_checkpoint(&pool).await?;
     ensure_consistent_saved_state(&pool, checkpoint.as_ref()).await?;
     let mut reader = StreamReader::open(&args[0], &args[1], checkpoint)?;
-    let mut advanced = false;
-    while let Some(batch) = reader.next_batch()? {
-        apply_batch(&pool, &batch, &reader.checkpoint()).await?;
-        advanced = true;
-    }
+    // Catch-up uses the same grouping, so its last group commits before the listener binds.
+    let advanced = apply_available(&mut reader, &pool).await? > 0;
     if !advanced && load_checkpoint(&pool).await?.is_none() {
         persist_initial_checkpoint(&pool, &reader.checkpoint()).await?;
     }

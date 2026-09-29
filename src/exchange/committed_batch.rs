@@ -41,6 +41,8 @@ pub enum CommittedCommand {
     },
     Cancellation {
         order_id: String,
+        /// Who asked. A rejected cancellation may come from someone other than the owner.
+        user_id: String,
         outcome: CancelOutcome,
     },
     Other,
@@ -65,8 +67,8 @@ pub fn decode(batch: &[EventEnvelope]) -> Result<CommittedCommand, String> {
 
     match input {
         ExchangeInputEvent::NewOrderRequested { order } => decode_new_order(order, &outputs),
-        ExchangeInputEvent::CancelOrderRequested { order_id, .. } => {
-            decode_cancellation(order_id, &outputs)
+        ExchangeInputEvent::CancelOrderRequested { order_id, user_id } => {
+            decode_cancellation(order_id, user_id, &outputs)
         }
         ExchangeInputEvent::FundsDepositRequested { .. }
         | ExchangeInputEvent::SharesDepositRequested { .. }
@@ -140,6 +142,7 @@ fn decode_execution_pairs(
 
 fn decode_cancellation(
     requested_order_id: &str,
+    user_id: &str,
     outputs: &[(u64, &ExchangeOutputEvent)],
 ) -> Result<CommittedCommand, String> {
     if outputs.len() != 1 {
@@ -164,6 +167,7 @@ fn decode_cancellation(
     };
     Ok(CommittedCommand::Cancellation {
         order_id: requested_order_id.to_string(),
+        user_id: user_id.to_string(),
         outcome,
     })
 }
@@ -238,5 +242,35 @@ mod tests {
             }),
         ));
         assert!(decode(&malformed).is_err());
+    }
+
+    #[test]
+    fn a_cancellation_carries_who_asked() {
+        let batch = vec![
+            envelope(
+                1,
+                ExchangeEvent::Input(ExchangeInputEvent::CancelOrderRequested {
+                    order_id: "order-1".into(),
+                    user_id: "intruder".into(),
+                }),
+            ),
+            envelope(
+                2,
+                ExchangeEvent::Output(ExchangeOutputEvent::CancelRejected {
+                    order_id: "order-1".into(),
+                    reason: "Unauthorized".into(),
+                }),
+            ),
+        ];
+        assert_eq!(
+            decode(&batch).unwrap(),
+            CommittedCommand::Cancellation {
+                order_id: "order-1".into(),
+                user_id: "intruder".into(),
+                outcome: CancelOutcome::Rejected {
+                    reason: "Unauthorized".into()
+                },
+            }
+        );
     }
 }

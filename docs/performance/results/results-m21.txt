@@ -1,0 +1,43 @@
+# Milestone 21, part 1 (market data). Journal: --bench --orders 200000 --symbols 10 --users 10 (200,110 commands).
+# before = HEAD b829007 binary, 60 s from empty state
+MDP before: state checkpoint next_sequence 7739 after 60 s = 2,328 commands = ~39 commands/s
+reporter before (one-symbol journal, 200,020 commands): 60 s -> next_sequence 75,399, 21,864 orders, 15,815 trades = ~365 commands/s
+reporter before on the 10-symbol journal: halted at sequence 255: duplicate key value violates unique constraint reported_trades_first_execution_id_key
+
+# after (part 1): catch-up
+=== catch-up: 200,110 commands (10 symbols), empty state
+caught up in 3573 ms = 56006 commands/s
+saves during catch-up: 4
+save ms: min 36 median 49 max 70
+market-data state saved through event sequence 630326 (59681 batches, 2924611 bytes) in 58 ms
+{"symbol":"S000","bids":[{"price":1013,"quantity":7},{"price":1012,"quantity":13}],"asks":[{"price":1014,"quantity":3},{"price":1015,"quantity":707}]}
+(the "saved through event sequence 630326" line is the second-to-last save, not the final one)
+
+# after (part 1): live following
+=== live: exchange at rate 5000 for 100000 orders, MDP following
+  throughput : 4997 orders/s over 20.012 s
+  latency us : p50 11551  p90 25439  p99 41151  p99.9 52511  max 64287
+MDP last save at the benchmark's end: event 344328; final save: event 344328, 10 ms after the benchmark finished (saves run at most once a second)
+saves while live: 20
+=== live: exchange at rate 0 for 200000 orders, MDP following
+  throughput : 34543 orders/s over 5.790 s
+  latency us : p50 284927  p90 404479  p99 461823  p99.9 478975  max 478975  (queue-bound at max rate)
+MDP last save at the benchmark's end: event 689042; final save: event 689042, 26 ms after the benchmark finished (saves run at most once a second)
+saves while live: 6
+
+# part 2 (reporter): catch-up from empty tables, one-symbol journal (200,020 commands)
+before: ~365 commands/s (60 s sample, see top)
+group commit (1,000 batches per transaction): caught up in 190,323 ms = 1,050 commands/s; 200,000 orders, 144,670 trades, next_sequence 689,381
++ one round trip per trade (data-modifying CTE): caught up in 126,696 ms = 1,578 commands/s; same rows and checkpoint
+raw PostgreSQL round trip (pgbench select 1): 0.109 ms over the Docker network, 0.084 ms over the unix socket
+
+# part 2 (reporter): live following
+=== reporter m21rep2 live: exchange at 1000 orders/s for 30000 orders (1 symbol, 10 users)
+  throughput : 1000 orders/s over 30.009 s
+journal's last command starts at "seq_num":103441; reporter checkpoint when the benchmark finished: 103443
+reporter reached 103443 2418 ms after the benchmark finished
+=== reporter m21rep2 live: exchange at 5000 orders/s for 50000 orders (1 symbol, 10 users)
+  throughput : 4999 orders/s over 10.002 s
+journal's last command starts at "seq_num":172155; reporter checkpoint when the benchmark finished: 51691
+reporter reached 172157 21412 ms after the benchmark finished
+(the drain time includes about 2.4 s of measurement overhead before the first poll; at 1,000/s the checkpoint already equalled the journal end when the benchmark finished)
