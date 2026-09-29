@@ -211,16 +211,14 @@ impl WarmReplica {
             ));
         }
 
+        // Fence, prove identity, then recover — strictly in that order. Recovery can repair a torn
+        // tail, which truncates the file; if the path now names a different journal, that repair
+        // would destroy history this follower never read. `open_existing_matching` refuses a
+        // mismatched file while holding the lock and before its first read, leaving it untouched.
+        let (device, inode) = checkpoint.journal_identity();
         let (store, recovered) =
-            EventStore::open_existing(&self.journal_path).map_err(PromotionFailure::from_store)?;
-        let (device, inode) = store
-            .journal_identity()
-            .map_err(|error| PromotionFailure::Fatal(error.to_string()))?;
-        if !checkpoint.matches_journal_identity(device, inode) {
-            return Err(PromotionFailure::Fatal(
-                "writer-locked journal is not the journal the warm replica followed".into(),
-            ));
-        }
+            EventStore::open_existing_matching(&self.journal_path, device, inode)
+                .map_err(PromotionFailure::from_store)?;
         // The lock is held and the full journal has been physically recovered. Drop the reader and
         // warm core: `ExchangeRuntime` will rebuild solely from `recovered` before it writes.
         self.reader.take();
@@ -490,7 +488,12 @@ pub async fn run(args: &[String]) -> WarmResult<WarmPromotion> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::OpenOptions, net::TcpListener, os::unix::fs::FileExt, time::Duration};
+    use std::{
+        fs::OpenOptions,
+        net::TcpListener,
+        os::unix::fs::{FileExt, MetadataExt},
+        time::Duration,
+    };
 
     use super::*;
     use crate::{
@@ -852,8 +855,9 @@ mod tests {
             stream_path,
             snapshot_path,
         } = handoff.await.unwrap().unwrap();
+        let journal = std::fs::metadata(&fixture.log).unwrap();
         assert!(matches!(
-            EventStore::open_existing(&fixture.log),
+            EventStore::open_existing_matching(&fixture.log, journal.dev(), journal.ino()),
             Err(EventStoreError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
 
@@ -941,6 +945,65 @@ mod tests {
             warm.replica.as_ref().unwrap().snapshot(),
             primary.core_snapshot_for_test()
         );
+    }
+
+    #[test]
+    fn promotion_refuses_a_swapped_journal_without_repairing_the_replacement() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.dir.join("events.snapshot");
+        let mut primary = runtime_for(&fixture);
+        primary
+            .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 10,
+            })
+            .unwrap();
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot).unwrap();
+        warm.catch_up().unwrap();
+        drop(primary);
+
+        // An operator moves the followed journal aside, and a different journal — torn in the
+        // middle of its only record — appears at the same path. The follower still holds the
+        // original file open by inode, so only its checkpoint identity can tell the two apart.
+        std::fs::rename(&fixture.log, fixture.dir.join("events.moved")).unwrap();
+        {
+            let (mut replacement, _) = EventStore::open(&fixture.log).unwrap();
+            replacement
+                .append(&[
+                    EventEnvelope {
+                        seq_num: 1,
+                        event: ExchangeEvent::Input(ExchangeInputEvent::FundsDepositRequested {
+                            user_id: "someone-else".into(),
+                            amount: 99,
+                        }),
+                    },
+                    EventEnvelope {
+                        seq_num: 2,
+                        event: ExchangeEvent::Output(ExchangeOutputEvent::FundsDeposited {
+                            user_id: "someone-else".into(),
+                            amount: 99,
+                        }),
+                    },
+                ])
+                .unwrap();
+        }
+        let torn_len = std::fs::metadata(&fixture.log).unwrap().len() - 4;
+        OpenOptions::new()
+            .write(true)
+            .open(&fixture.log)
+            .unwrap()
+            .set_len(torn_len)
+            .unwrap();
+        let replacement_before = std::fs::read(&fixture.log).unwrap();
+
+        assert!(matches!(
+            warm.try_promote(),
+            Err(PromotionFailure::Fatal(_))
+        ));
+
+        // The refusal must come before any recovery read or torn-tail repair. A journal that is
+        // not the one this follower read is left byte-for-byte as the operator left it.
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), replacement_before);
     }
 
     #[test]

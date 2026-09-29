@@ -41,11 +41,11 @@ pub struct ReaderCheckpoint {
 }
 
 impl ReaderCheckpoint {
-    /// Checks that a writer-owned journal is still the file this checkpoint describes. A warm
-    /// replica uses this after it has acquired the writer lock, before allowing the hand-off to
-    /// a primary factory that will fully replay the authoritative journal.
-    pub(crate) fn matches_journal_identity(&self, device: u64, inode: u64) -> bool {
-        self.device == device && self.inode == inode
+    /// The device and inode of the journal this checkpoint was taken against. A warm promotion
+    /// passes them to `EventStore::open_existing_matching`, which compares them the moment it
+    /// holds the writer lock — before it reads or repairs anything in the file.
+    pub(crate) fn journal_identity(&self) -> (u64, u64) {
+        (self.device, self.inode)
     }
 }
 

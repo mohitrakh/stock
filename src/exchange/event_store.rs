@@ -120,28 +120,20 @@ impl EventStore {
         Self::open_inner(path, true, None)
     }
 
-    /// Opens and fully validates an already-existing journal under the exclusive writer lock.
-    /// This is for a warm promotion: it must never create a fresh file if the journal it followed
-    /// disappeared, because its mmap-delivered in-memory state is not the durability authority.
-    pub(crate) fn open_existing(
-        path: impl AsRef<Path>,
-    ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
-        Self::open_inner(path, false, None)
-    }
-
-    /// Opens an already-existing journal for warm promotion only when it is the exact file the
-    /// follower observed. The identity comparison happens after the exclusive lock and before
-    /// any recovery read or torn-tail truncation, so a swapped path cannot mutate another log.
+    /// Opens an already-existing journal for warm promotion, and only if it is the exact file the
+    /// follower read. It never creates or initializes a journal: a follower's mmap-delivered state
+    /// is not a durability authority, so a missing or empty journal is an error, not a fresh start.
+    ///
+    /// Identity is compared as soon as the exclusive lock is held and before any recovery read or
+    /// torn-tail truncation. Recovery can shorten the file, so a path that now names a different
+    /// journal must be refused before recovery can touch it — this is the only way promotion
+    /// opens a journal, deliberately, so there is no unchecked variant left to call by mistake.
     pub(crate) fn open_existing_matching(
         path: impl AsRef<Path>,
         expected_device: u64,
         expected_inode: u64,
     ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
-        Self::open_inner(
-            path,
-            false,
-            Some((expected_device, expected_inode)),
-        )
+        Self::open_inner(path, false, Some((expected_device, expected_inode)))
     }
 
     fn open_inner(
@@ -286,13 +278,6 @@ impl EventStore {
 
     pub(super) fn file(&self) -> &File {
         &self.file
-    }
-
-    /// Identity of the writer-locked journal. Consumers use this only after taking the writer
-    /// lock, to prove that their in-memory checkpoint still describes this exact file.
-    pub(crate) fn journal_identity(&self) -> Result<(u64, u64), EventStoreError> {
-        let metadata = self.file.metadata()?;
-        Ok((metadata.dev(), metadata.ino()))
     }
 }
 
@@ -465,18 +450,21 @@ mod tests {
     }
 
     #[test]
-    fn promotion_open_existing_never_creates_or_initializes_a_missing_or_empty_journal() {
+    fn promotion_open_never_creates_or_initializes_a_missing_or_empty_journal() {
         let missing = temp_path("promotion-missing");
         assert!(matches!(
-            EventStore::open_existing(&missing),
+            EventStore::open_existing_matching(&missing, 0, 0),
             Err(EventStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
         ));
         assert!(!missing.exists());
 
+        // Requesting the empty file's own identity gets past the identity comparison, so this
+        // proves the emptiness check itself refuses to initialize it.
         let empty = temp_path("promotion-empty");
         std::fs::File::create(&empty).unwrap();
+        let metadata = std::fs::metadata(&empty).unwrap();
         assert!(matches!(
-            EventStore::open_existing(&empty),
+            EventStore::open_existing_matching(&empty, metadata.dev(), metadata.ino()),
             Err(EventStoreError::Corrupt(detail)) if detail == "existing journal is empty"
         ));
         assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
@@ -524,7 +512,10 @@ mod tests {
         .unwrap();
         assert!(recovered.is_empty());
         drop(store);
-        assert_eq!(std::fs::metadata(&foreign).unwrap().len(), FILE_MAGIC.len() as u64);
+        assert_eq!(
+            std::fs::metadata(&foreign).unwrap().len(),
+            FILE_MAGIC.len() as u64
+        );
 
         std::fs::remove_file(expected).unwrap();
         std::fs::remove_file(foreign).unwrap();

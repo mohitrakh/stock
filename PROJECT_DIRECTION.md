@@ -62,24 +62,28 @@ same-host warm replica process
   -> replay complete batches into a read-only ReplicaCore before binding 127.0.0.1:4003
   -> GET /health and GET /status report follower availability only
   -> POST /promote returns 409 while the primary owns the journal writer lock
-  -> after a successful local fence, fully recover and replay the journal before primary startup
+  -> after the fence, verify journal identity before any read or repair,
+     then fully recover and replay the journal before primary startup
 ```
 
 `ExchangeCommand` is live gateway plumbing and may contain `respond_to`. `ExchangeEvent` contains replayable business data and must remain free of HTTP response channels.
 
 `ExchangeRuntime` owns the command receiver, `EventStore`, `StreamWriter`, a journal-bound snapshot schedule, and the ordered in-memory event history. After snapshot recovery that vector contains only the replayed suffix; the complete history remains in the journal. `ExchangeCore` owns the deterministic trading components; it never touches the files. All core operations still run on one exchange-worker thread. `ReplicaCore` is a separate read-only follower core: it has no writer, queue, callbacks, database, or customer routes. Readers and the warm follower are separate consumers, not additional owners of exchange state.
 
-`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. `ReplicaCore` uses the same complete-batch comparison before it advances its applied checkpoint. Production startup calls `recover_runtime_with_stream_and_snapshot` before binding the listener. A valid versioned, checksummed snapshot is tied to the journal device/inode and a complete-batch byte boundary; it restores the core and replays only the later suffix. A missing, corrupt, inconsistent, or journal-mismatched snapshot is preserved and falls back to full replay. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`; `EVENT_SNAPSHOT_PATH` defaults to that path plus `.snapshot`; and `EVENT_SNAPSHOT_INTERVAL` defaults to 10,000 commands. The journal is authoritative; the mmap file is a disposable delivery cache and the snapshot is only a recovery checkpoint. Warm promotion intentionally takes the writer lock with `EventStore::open_existing` and fully replays the recovered journal rather than promoting mmap-derived state.
+`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. `ReplicaCore` uses the same complete-batch comparison before it advances its applied checkpoint. Production startup calls `recover_runtime_with_stream_and_snapshot` before binding the listener. A valid versioned, checksummed snapshot is tied to the journal device/inode and a complete-batch byte boundary; it restores the core and replays only the later suffix. A missing, corrupt, inconsistent, or journal-mismatched snapshot is preserved and falls back to full replay. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`; `EVENT_SNAPSHOT_PATH` defaults to that path plus `.snapshot`; and `EVENT_SNAPSHOT_INTERVAL` defaults to 10,000 commands. The journal is authoritative; the mmap file is a disposable delivery cache and the snapshot is only a recovery checkpoint. Warm promotion takes the writer lock with `EventStore::open_existing_matching`, which proves the locked file is the journal the warm followed before reading or repairing it, then fully replays the recovered journal rather than promoting mmap-derived state.
 
 Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
 
-Latest verified status on 2026-09-27:
+Latest verified status on 2026-09-29, on Linux (the crate uses Unix-only APIs and does not build on Windows):
 
 ```text
 cargo fmt -- --check
-cargo test --locked --offline
-118 unit tests + 4 executable integration tests passed; 0 failed
+cargo test --locked
+131 unit tests + 6 executable integration tests passed; 0 failed
+1 opt-in Reporter acceptance test ignored (needs REPORTER_TEST_DATABASE_URL)
 ```
+
+Warm Replica v1 was additionally verified by a live run of the real primary and warm executables against PostgreSQL: a refused promotion while the primary ran, live following, a `SIGKILL` of the primary, a successful promotion, identical balances, positions, and order state on the promoted primary, a new trade there, and one contiguous journal across the hand-off.
 
 Verification includes separate OS-process readers, forced writer kills after append and during publication, reader checkpoint resume, the probe executable without a database, and the MDP executable catching up from the journal, serving HTTP, restarting from state, following live publication, and failing closed after a follower error. A manual run with isolated PostgreSQL also drove the real exchange and MDP through rest, partial fill, cancellation, MDP restart, and resumed live publication. Reporter qualification injects a failing checkpoint write after lifecycle/trade writes have begun and proves the whole transaction rolls back; it then proves journal-to-mmap catch-up, multi-fill/cancel/reject projection, and a post-commit Reporter restart without duplicate rows. Snapshot tests prove FIFO core restoration, suffix replay and both sequence continuations, corrupt-snapshot fallback without deleting the artifact, snapshot replacement atomicity, journal identity binding, torn suffix repair, and no snapshot advance after a failed append. These are local correctness tests, not throughput measurements or a machine-power-loss test. Existing compatibility APIs and repository-wide clippy warnings remain.
 
@@ -480,6 +484,20 @@ an inclusive epoch-second range. All three parameters are required, `start_time`
 `end_time`, and a valid range with no trades returns an empty array. The endpoint shares MDP's
 availability behavior: a terminal stream, projection, or persistence error returns 503.
 
+## 18. Same-host Warm Replica v1
+
+Full write-up: `docs/tasks/13-warm-replica-v1.md`.
+
+A second process can now follow the exchange and take over from it. Started with `--warm-replica`, it owns no database connection, customer routes, journal writer, or mmap writer. It replays every complete committed batch into a read-only `ReplicaCore` through `replay_committed_batch`, the same prepare/compare/commit path recovery uses, so it cannot accept an output the primary would not have produced. It keeps an *applied* checkpoint separate from its reader's physical cursor and advances it only after a batch has been compared and committed; a replay failure therefore stops the follower at the last good batch and can never become a promotion boundary. A valid primary snapshot is an optional starting point. The loopback-only management listener, `127.0.0.1:4003` by default, serves `GET /health`, `GET /status`, and `POST /promote`.
+
+Promotion is manual and writer-fenced. `POST /promote` returns `409` while the primary still holds the journal's exclusive writer lock, and the warm keeps following with nothing changed. Once the lock is free, `EventStore::open_existing_matching` takes it, compares the file's device/inode with the followed journal before reading or repairing anything, and recovers the journal. `promote_replica_with_stream_and_snapshot` then discards the warm core and rebuilds from the entire writer-locked journal — mmap-derived state is never promoted. The new primary republishes the stream watermark, attaches the snapshot schedule, connects PostgreSQL, and binds the customer listener. `202` means the old writer is fenced, not that port 4000 is ready.
+
+The milestone was finished in two sessions. The first built and tested the follower, fencing, and promotion, but its hand-off compared journal identity only *after* recovery, and recovery truncates a torn tail. A stricter opener existed with a passing test, but was never called, never formatted, and never documented — a passing test on unreachable code again. Completing the milestone exposed the checkpoint's identity, switched promotion to the stricter opener, and deleted the unchecked one. A regression test written first failed on the old code: a journal swapped in at the followed path, with a torn record, was cut back to its bare 8-byte header before promotion noticed it was the wrong file. It now passes with the file untouched.
+
+Verified on 2026-09-29 on Linux: `cargo fmt -- --check` is clean and `cargo test --locked` passes 131 unit tests and 6 executable integration tests. A live run of the real executables against PostgreSQL proved the whole hand-off: `409` while the primary ran, the warm following new commands without writing, a `SIGKILL` of the primary, `202`, the promoted process serving port 4000 with identical balances, positions, and order state, a new trade on the promoted primary, and journal sequences 1–18 contiguous across the hand-off.
+
+This is v1 of the target design's hot-warm engine, not the whole of it. There is no heartbeat, automatic failover, leader election, second host, reliable-UDP or Raft replication, network-partition handling, or RTO/RPO measurement. Promotion replays the whole journal rather than reusing the caught-up warm core, so its duration grows with history.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -509,14 +527,21 @@ availability behavior: a terminal stream, projection, or persistence error retur
 - mmap is not the durable recovery source; never modify, truncate, replace, or unlink mapped files while processes use them
 - consumer crashes require checkpoint/state coordination; arbitrary downstream effects are not exactly-once
 - internal matching and settlement failures are rejected before commit and halt the worker if they cannot be represented as a business rejection
+- warm promotion is manual and same-host: no heartbeat, automatic failover, leader election, second machine, or measured RTO/RPO
+- promotion replays the entire journal instead of reusing the caught-up warm core, so its duration grows with history
+- the warm replica's management API is unauthenticated and loopback-only; `202` from `/promote` means the old writer is fenced, not that the customer listener is ready
+- the crate uses Unix-only APIs (advisory file locks, device/inode journal identity, mmap) and builds and tests on Linux only
+- Reporter has two recorded correctness defects — a reused client order id halts it permanently, and a rejected cancellation overwrites the owner's order row; see `DEFERRED_ITEMS.md`
 
 ## What Not To Work On Yet
 
-No next milestone is selected. Do not expand the completed candle work into tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, FIX/SBE, UDP, replication, or hot-warm engines. The committed mmap reader remains the input for all independent subscribers; inbound commands remain on the existing bounded Tokio queue.
+No next milestone is selected. Do not grow the completed warm replica into automatic failover, heartbeats, leader election, cross-host replication, reliable UDP, or Raft except as a milestone selected for that purpose: each needs its own failure model, fencing rules, and RTO/RPO targets. The same applies to tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, and FIX/SBE. The reporter defects in `DEFERRED_ITEMS.md` are known and should be selected deliberately rather than fixed in passing. The committed mmap reader remains the input for all independent subscribers and for the warm follower; inbound commands remain on the existing bounded Tokio queue.
 
 ## Rule For Future Sessions
 
 Start by reading this file and `EXCHANGE_PIPELINE_TODO.md`. Verify the code and test result before trusting old milestone notes.
+
+The crate uses Unix-only APIs and does not compile on Windows. Build and test on Linux — the Ubuntu machine, or a `rust` container with the repository mounted (from Git Bash, set `MSYS_NO_PATHCONV=1` so container paths are not rewritten). The customer and warm-replica listeners bind loopback only, so a live failover run needs the primary, the warm replica, and the HTTP client in one network namespace.
 
 Discuss architecture before implementation. If a suggestion conflicts with the target design or changes the command/event boundary, stop and explain the tradeoff. Update this journal whenever a milestone is completed so the next session does not repeat old work.
 

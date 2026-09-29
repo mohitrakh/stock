@@ -325,6 +325,36 @@ Full write-up: `docs/tasks/12-candlestick-publisher-v1.md`.
 
 The bucket timestamp is the recorded execution timestamp floored to a UTC minute. Candles are retained without a limit in v1; resolution rollups, retention, and external historical storage remain separate architecture decisions.
 
+## Completed Milestone - Same-host Warm Replica v1
+
+Full write-up: `docs/tasks/13-warm-replica-v1.md`.
+
+A manual, writer-fenced warm standby: a separate process follows committed batches into a read-only core and, once the primary has stopped, takes the journal writer lock and becomes the primary.
+
+- [x] Add `ReplicaCore`, a read-only follower core with no journal writer, stream writer, command queue, callbacks, database, or customer routes.
+- [x] Share one `replay_committed_batch` path between full recovery, snapshot-suffix replay, and the follower.
+- [x] Start the warm from a valid primary snapshot when present, otherwise from sequence 1, and catch up before binding.
+- [x] Keep an applied checkpoint separate from the reader's cursor, advancing it only after a batch is compared and committed.
+- [x] Serve loopback-only `GET /health`, `GET /status`, and `POST /promote`, on `127.0.0.1:4003` by default.
+- [x] Refuse promotion with `409` while the primary holds the journal writer lock, leaving the follower intact.
+- [x] Compare journal identity under the lock and before any read or torn-tail repair (`open_existing_matching`), and delete the unchecked opener.
+- [x] Rebuild the promoted primary from the entire writer-locked journal, never from mmap-derived state.
+- [x] Wire `--warm-replica` in `main` through `promote_replica_with_stream_and_snapshot` into the normal primary startup.
+- [x] Run formatting, the full suite, and a live failover of the real executables against PostgreSQL.
+- [x] Update `PROJECT_DIRECTION.md`, `SYSTEM_DOCUMENTATION.md`, `DEFERRED_ITEMS.md`, and the task write-up.
+
+### Acceptance Criteria - Verified
+
+- A warm caught up from the journal matches the primary core exactly and writes neither the journal nor the stream.
+- A batch whose recorded output disagrees with replay leaves the core and the applied checkpoint at the last good batch.
+- A valid but different mmap cache cannot become primary state; promotion rebuilds from the journal.
+- A durable batch hidden from mmap by a publication failure is recovered by promotion, and both sequences continue.
+- Promotion while another process holds the journal returns `409`, keeps the warm healthy, and changes no journal or stream bytes.
+- A journal swapped in at the followed path is refused with its torn tail unrepaired. This regression test failed on the pre-fix code, which truncated the replacement to its header.
+- Live: `409` while the primary ran, following, `SIGKILL` of the primary, `202`, identical balances, positions, and order state on the promoted primary, a new trade there, and journal sequences 1–18 contiguous across the hand-off.
+
+Verified on 2026-09-29 on Linux: `cargo fmt -- --check` is clean; `cargo test --locked` passes 131 unit tests and 6 executable integration tests, with the opt-in Reporter acceptance test ignored. This is manual same-host fencing, not automatic failover, cross-host replication, or a measured RTO/RPO.
+
 ## Next Milestone
 
-No next milestone is selected. Discuss the next architecture step before implementation. Journal compaction, group commit, lock-free transport, UDP/multicast, CPU pinning, hot-warm replication, and per-symbol partitioning remain separate milestones.
+No next milestone is selected. Discuss the next architecture step before implementation. Automatic hot-warm failover, cross-host replication, journal compaction, group commit, lock-free transport, UDP/multicast, CPU pinning, and per-symbol partitioning remain separate milestones. Two Reporter correctness defects are recorded in `DEFERRED_ITEMS.md`.
