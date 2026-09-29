@@ -72,6 +72,21 @@ impl PriceLevel {
 
         Some(order)
     }
+    /// Resting orders head to tail, read in place. Unlinked (removed) nodes are never reached.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Order> {
+        let mut current = self.head_idx;
+        std::iter::from_fn(move || {
+            let node = &self.nodes[current?];
+            current = node.next_idx;
+            node.order.as_ref()
+        })
+    }
+
+    pub(crate) fn get_mut(&mut self, order_id: &str) -> Option<&mut Order> {
+        let &idx = self.order_map.get(order_id)?;
+        self.nodes[idx].order.as_mut()
+    }
+
     pub fn peek_front(&self) -> Option<&Order> {
         self.head_idx.and_then(|idx| self.nodes[idx].order.as_ref())
     }
@@ -114,6 +129,7 @@ impl PriceLevel {
     ///
     /// Self-trade prevention walks past the aggressor's own orders instead of stopping at them,
     /// so a resting self-order can never hide a valid counterparty queued behind it.
+    #[cfg(test)]
     pub fn first_matchable_mut(&mut self, exclude_user: &str) -> Option<&mut Order> {
         let mut current = self.head_idx;
 

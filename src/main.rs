@@ -65,6 +65,13 @@ async fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--bench") {
+        if let Err(error) = exchange::bench::run(&args[1..]).await {
+            eprintln!("bench: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--warm-replica") {
         let promotion = exchange::warm_replica::run(&args[1..])
             .await
@@ -107,7 +114,7 @@ async fn main() {
     }
     if !args.is_empty() {
         eprintln!(
-            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR]]"
+            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR] | --bench EMPTY_DIR [OPTIONS]]"
         );
         std::process::exit(1);
     }

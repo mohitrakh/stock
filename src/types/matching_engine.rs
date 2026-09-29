@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::order_book::{OrderBook, OrderBookSnapshot};
-use super::types::{Execution, L2Level, Order, OrderBookView, Price};
+use super::order_book::{MatchPlan, OrderBook, OrderBookSnapshot};
+use super::types::{L2Level, Order, OrderBookView, Price};
 
 #[derive(Debug)]
 pub struct MatchingEngine {
@@ -18,21 +18,16 @@ pub(crate) struct MatchingEngineSnapshot {
     last_seq: u64,
 }
 
+/// A new order's matching, worked out against the live book but not yet applied to it.
 pub(crate) struct PreparedOrder {
-    pub(crate) symbol: String,
-    pub(crate) order_id: String,
-    pub(crate) seq_num: u64,
-    pub(crate) book: OrderBook,
-    pub(crate) executions: Vec<Execution>,
-    pub(crate) incoming_resting: bool,
-    pub(crate) removed_order_ids: Vec<String>,
+    pub(crate) order: Order,
+    pub(crate) plan: MatchPlan,
 }
 
 pub(crate) struct PreparedCancel {
     pub(crate) symbol: String,
     pub(crate) order_id: String,
     pub(crate) seq_num: u64,
-    pub(crate) book: OrderBook,
 }
 
 impl MatchingEngine {
@@ -52,53 +47,28 @@ impl MatchingEngine {
             ));
         }
 
-        let symbol = order.symbol.clone();
-        let order_id = order.order_id.clone();
-        let seq_num = order.seq_num;
-        let mut book = self
-            .order_books
-            .get(&symbol)
-            .cloned()
-            .unwrap_or_else(|| OrderBook::new(symbol.clone()));
-
-        let executions = book.place_order(order);
-        let incoming_resting = book.is_resting(&order_id);
-        let mut removed_order_ids = Vec::new();
-
-        for execution in &executions {
-            for filled_order_id in [&execution.buy_order_id, &execution.sell_order_id] {
-                if !book.is_resting(filled_order_id)
-                    && !removed_order_ids.iter().any(|id| id == filled_order_id)
-                {
-                    removed_order_ids.push(filled_order_id.clone());
-                }
-            }
-        }
-
-        Ok(PreparedOrder {
-            symbol,
-            order_id,
-            seq_num,
-            book,
-            executions,
-            incoming_resting,
-            removed_order_ids,
-        })
+        // Read the live book; never copy it. A symbol with no book yet has nothing to match.
+        let plan = match self.order_books.get(&order.symbol) {
+            Some(book) => book.plan_order(&order),
+            None => OrderBook::new(order.symbol.clone()).plan_order(&order),
+        };
+        Ok(PreparedOrder { order, plan })
     }
 
     pub(crate) fn commit_order(&mut self, prepared: PreparedOrder) {
-        self.order_books
-            .insert(prepared.symbol.clone(), prepared.book);
-        self.last_seq = prepared.seq_num;
-
-        for filled_order_id in prepared.removed_order_ids {
-            self.order_location.remove(&filled_order_id);
+        let PreparedOrder { order, plan } = prepared;
+        for filled_order_id in plan.filled_resting_orders() {
+            self.order_location.remove(filled_order_id);
         }
-
-        if prepared.incoming_resting {
+        self.last_seq = order.seq_num;
+        if plan.remaining > 0 {
             self.order_location
-                .insert(prepared.order_id, prepared.symbol);
+                .insert(order.order_id.clone(), order.symbol.clone());
         }
+        self.order_books
+            .entry(order.symbol.clone())
+            .or_insert_with(|| OrderBook::new(order.symbol.clone()))
+            .apply_plan(order, &plan);
     }
 
     pub(crate) fn prepare_cancel(
@@ -118,24 +88,25 @@ impl MatchingEngine {
             .get(order_id)
             .ok_or_else(|| format!("Order {} not found for cancellation", order_id))?
             .clone();
-        let mut book = self
+        let book = self
             .order_books
             .get(&symbol)
-            .cloned()
             .ok_or_else(|| format!("Order book for symbol {} not found", symbol))?;
-        book.cancel_order(order_id)
-            .ok_or_else(|| format!("Order {} not found in its order book", order_id))?;
+        if !book.is_resting(order_id) {
+            return Err(format!("Order {} not found in its order book", order_id));
+        }
 
         Ok(PreparedCancel {
             symbol,
             order_id: order_id.to_string(),
             seq_num: cancel_seq,
-            book,
         })
     }
 
     pub(crate) fn commit_cancel(&mut self, prepared: PreparedCancel) {
-        self.order_books.insert(prepared.symbol, prepared.book);
+        if let Some(book) = self.order_books.get_mut(&prepared.symbol) {
+            book.cancel_order(&prepared.order_id);
+        }
         self.order_location.remove(&prepared.order_id);
         self.last_seq = prepared.seq_num;
     }

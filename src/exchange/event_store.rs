@@ -3,6 +3,7 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::Path,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crate::types::exchange_event::EventEnvelope;
@@ -11,6 +12,10 @@ use crate::types::exchange_event::EventEnvelope;
 /// trailing digit, so an old file is rejected with a clear message instead of failing somewhere
 /// deep in a JSON parse.
 pub(super) const FILE_MAGIC: &[u8; 8] = b"EXCHLOG1";
+
+/// Journal syncs since the process started. `--bench` divides orders by this to show how many
+/// commands shared one sync.
+pub(crate) static JOURNAL_SYNCS: AtomicU64 = AtomicU64::new(0);
 
 /// `[len: u32 LE][crc: u32 LE]` ahead of every payload.
 pub(super) const RECORD_HEADER_LEN: usize = 8;
@@ -92,6 +97,9 @@ pub(super) fn crc32(data: &[u8]) -> u32 {
 /// file: it can never find an input whose outputs went missing.
 pub struct EventStore {
     file: File,
+    /// Syncs through this handle, so a test can prove that a group shares one.
+    #[cfg(test)]
+    pub(crate) syncs: u64,
 }
 
 impl Drop for EventStore {
@@ -104,10 +112,18 @@ impl Drop for EventStore {
 }
 
 impl EventStore {
+    fn from_file(file: File) -> Self {
+        Self {
+            file,
+            #[cfg(test)]
+            syncs: 0,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn open_read_only_for_test(path: impl AsRef<Path>) -> Result<Self, EventStoreError> {
         let file = OpenOptions::new().read(true).open(path)?;
-        Ok(Self { file })
+        Ok(Self::from_file(file))
     }
 
     /// Opens (or creates) the log at `path`, recovers the events already in it, and truncates any
@@ -184,7 +200,7 @@ impl EventStore {
                 .unwrap_or(Path::new("."));
             File::open(parent)?.sync_all()?;
 
-            return Ok((Self { file }, Vec::new()));
+            return Ok((Self::from_file(file), Vec::new()));
         }
 
         if bytes.len() < FILE_MAGIC.len() || &bytes[..FILE_MAGIC.len()] != FILE_MAGIC {
@@ -202,7 +218,7 @@ impl EventStore {
 
         file.seek(SeekFrom::End(0))?;
 
-        Ok((Self { file }, events))
+        Ok((Self::from_file(file), events))
     }
 
     /// Opens the writer-owned journal at an already committed command boundary and recovers only
@@ -247,7 +263,7 @@ impl EventStore {
             file.sync_all()?;
         }
         file.seek(SeekFrom::End(0))?;
-        Ok((Self { file }, events))
+        Ok((Self::from_file(file), events))
     }
 
     /// Writes one command's envelopes as a single framed record and synchronizes it to disk.
@@ -265,13 +281,21 @@ impl EventStore {
         self.append_record(&record)
     }
 
-    pub(super) fn append_record(&mut self, record: &[u8]) -> Result<(), EventStoreError> {
-        // One write_all, so a partial write can only ever truncate the tail of this record —
-        // never interleave with the next one.
-        self.file.write_all(record)?;
-        // ponytail: one fsync per command. Group-commit several records behind one sync when the
-        // worker ever has a batch to commit; today it processes one command at a time.
+    /// Appends one or more complete framed records — a whole group-commit group — with ONE write
+    /// and ONE sync. The runtime publishes the group and releases its replies only after this
+    /// returns. Any error is fatal; recovery decides which complete records survived.
+    pub(super) fn append_record(&mut self, records: &[u8]) -> Result<(), EventStoreError> {
+        // One write_all of back-to-back records, so a process crash can only cut the tail of the
+        // group: every record before the cut is complete, and recovery drops the torn one. After a
+        // power loss, unsynced bytes can survive out of order; a complete record with a bad
+        // checksum still refuses startup, exactly as a torn single record always could.
+        self.file.write_all(records)?;
         self.file.sync_all()?;
+        JOURNAL_SYNCS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            self.syncs += 1;
+        }
 
         Ok(())
     }
@@ -603,7 +627,7 @@ mod tests {
 
         // A real write failure: a handle that cannot write. The runtime treats this as fatal.
         let read_only = OpenOptions::new().read(true).open(&path).unwrap();
-        let mut store = EventStore { file: read_only };
+        let mut store = EventStore::from_file(read_only);
 
         assert!(store.append(&deposit_batch(3, 250)).is_err());
 

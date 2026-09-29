@@ -355,6 +355,27 @@ A manual, writer-fenced warm standby: a separate process follows committed batch
 
 Verified on 2026-09-29 on Linux: `cargo fmt -- --check` is clean; `cargo test --locked` passes 131 unit tests and 6 executable integration tests, with the opt-in Reporter acceptance test ignored. This is manual same-host fencing, not automatic failover, cross-host replication, or a measured RTO/RPO.
 
+## Completed Milestone - Critical-Path Performance v1
+
+Full write-up: `docs/tasks/14-critical-path-performance-v1.md`; one file per optimization in `docs/performance/`.
+
+- [x] Add `--bench`: an in-process, deterministic, open-loop load generator over the production worker, journal, mmap stream and snapshot schedule, with HdrHistogram latency from each order's intended send time.
+- [x] Record the baseline before changing anything: 384 orders/s on disk, 2,796 in memory, 90 at 10,000 resting orders.
+- [x] Group commit: stage every queued command in memory, one journal write and one sync per group, then publish, run callbacks and release replies (reads included).
+- [x] Keep durable-before-visible; replace "a failed append leaves the core unchanged" with "after a failed sync the core is never used again" and rewrite the four affected tests (three now check recovery from the journal; the callback test checks that nothing reached history or callbacks).
+- [x] Plan matching read-only against the live book (`plan_order`) and apply the plan at commit (`apply_plan`); stop cloning the book on order and cancel.
+- [x] Prove the planned matcher identical to the old one with a 20,000-step differential test.
+- [x] Make the never-read in-memory event history test-only.
+- [x] Measure each optimization separately and write one document per optimization plus the task write-up.
+
+### Acceptance Criteria - Verified
+
+- Disk throughput 384 -> about 37,000-39,000 orders/s; at a fixed 1,000/s, p99 5.1 s -> 22-33 ms.
+- Per-order cost independent of book depth: about 49,000-55,000 orders/s at 0, 1,000 and 10,000 resting orders (was 3,510 / 869 / 90).
+- Memory no longer grows by 600-700 bytes per order from retained history; 1M orders peak 1.92 GB -> 1.32 GB.
+- In memory the exchange meets the design's average of 43,000 orders/s; with production snapshots it reaches about 8,300 (next bottleneck, recorded).
+- `cargo fmt -- --check` clean; `cargo test --locked` passes 136 unit tests and the integration tests; release warnings unchanged at 13.
+
 ## Next Milestone
 
-No next milestone is selected. Discuss the next architecture step before implementation. Automatic hot-warm failover, cross-host replication, journal compaction, group commit, lock-free transport, UDP/multicast, CPU pinning, and per-symbol partitioning remain separate milestones. Two Reporter correctness defects are recorded in `DEFERRED_ITEMS.md`.
+No next milestone is selected. Measured candidates: subscriber throughput (MDP rewrites and syncs its whole state per command), the core snapshot cost (whole-state serialization on the worker every 10,000 commands), a pipelined journal sync with per-group mmap publication, and cross-machine replication. Two Reporter correctness defects are recorded in `DEFERRED_ITEMS.md`.

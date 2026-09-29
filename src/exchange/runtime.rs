@@ -16,6 +16,10 @@ use crate::{
 pub struct ExchangeRuntime {
     rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
     core: ExchangeCore,
+    /// Every durable envelope this runtime has seen, kept for tests to inspect. Production never
+    /// read it, and it grew with every command for the life of the process; the journal already
+    /// holds the complete history. See `docs/performance/03-no-history-in-ram.md`.
+    #[cfg(test)]
     event_log: Vec<EventEnvelope>,
     next_event_seq: u64,
     /// `None` runs the exchange in memory only, which is what the unit tests and
@@ -35,6 +39,10 @@ struct SnapshotSchedule {
 }
 
 pub const DEFAULT_SNAPSHOT_INTERVAL: u64 = 10_000;
+
+/// Most commands that may share one journal sync. Below this cap a group is simply whatever was
+/// already queued; the cap bounds how long the first command waits for the last to be prepared.
+const MAX_GROUP: usize = 1_024;
 
 /// Startup refuses untrustworthy history or an unusable committed-event stream.
 #[derive(Debug)]
@@ -533,6 +541,7 @@ impl ExchangeRuntime {
         Self {
             rx,
             core: ExchangeCore::new(),
+            #[cfg(test)]
             event_log: Vec::new(),
             next_event_seq: 1,
             store: None,
@@ -572,6 +581,7 @@ impl ExchangeRuntime {
         Ok(Self {
             rx,
             core,
+            #[cfg(test)]
             event_log,
             next_event_seq,
             store,
@@ -584,15 +594,14 @@ impl ExchangeRuntime {
         rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
         store: EventStore,
         core: ExchangeCore,
-        suffix: Vec<EventEnvelope>,
+        #[cfg_attr(not(test), allow(unused_variables))] suffix: Vec<EventEnvelope>,
         next_event_seq: u64,
     ) -> Self {
         Self {
             rx,
             core,
-            // History before the snapshot is still available in the authoritative journal. Keep
-            // only the replayed suffix in process memory so snapshot recovery actually bounds the
-            // runtime's retained event vector.
+            // History before the snapshot is still available in the authoritative journal.
+            #[cfg(test)]
             event_log: suffix,
             next_event_seq,
             store: Some(store),
@@ -631,9 +640,12 @@ impl ExchangeRuntime {
         )
     }
 
-    fn maybe_write_snapshot(&mut self) {
+    /// Counts a durable group of `commands` toward the schedule and writes at most one snapshot
+    /// for it: every command in the group is already in the core, so one checkpoint covers them.
+    fn maybe_write_snapshot(&mut self, commands: u64) {
         let Some((path, stream_path)) = self.snapshot.as_mut().and_then(|schedule| {
-            schedule.commands_since_snapshot = schedule.commands_since_snapshot.saturating_add(1);
+            schedule.commands_since_snapshot =
+                schedule.commands_since_snapshot.saturating_add(commands);
             if schedule.commands_since_snapshot < schedule.every_commands {
                 return None;
             }
@@ -650,10 +662,21 @@ impl ExchangeRuntime {
     }
 
     pub fn run(mut self) {
-        while let Some(command) = self.rx.blocking_recv() {
-            if let Err(err) = self.handle_command(command) {
-                // Fail closed. Store/preparation errors occur before commit. A publication error
-                // occurs AFTER durable commit: recovery must publish that command on restart.
+        let mut group = Vec::with_capacity(MAX_GROUP);
+        while let Some(first) = self.rx.blocking_recv() {
+            // Natural batching: whatever queued up while the previous group was syncing becomes
+            // the next group. A quiet exchange gets groups of one; a busy one shares each sync.
+            group.push(first);
+            while group.len() < MAX_GROUP {
+                match self.rx.try_recv() {
+                    Ok(command) => group.push(command),
+                    Err(_) => break,
+                }
+            }
+            if let Err(err) = self.handle_group(group.drain(..)) {
+                // Fail closed. A store or preparation error stops the worker before anything in
+                // the group is visible. A publication error happens AFTER the sync: recovery
+                // publishes that group on restart.
                 eprintln!(
                     "exchange worker halted: {}. No further commands accepted.",
                     err
@@ -697,125 +720,83 @@ impl ExchangeRuntime {
         self.next_event_seq
     }
 
-    fn handle_command(&mut self, command: ExchangeCommand) -> Result<(), RuntimeFailure> {
+    /// Stages one command: a write is prepared, encoded, and committed in memory; a read is
+    /// answered from the core at its place in the queue. Either way the reply is held until the
+    /// group is durable, so a read can never show state that has not been synced. A command that
+    /// cannot be staged is answered with the halt message at once and stops the group.
+    fn stage_command(
+        &mut self,
+        command: ExchangeCommand,
+        staged: &mut Vec<Staged>,
+    ) -> Result<HeldReply, RuntimeFailure> {
         match command {
             ExchangeCommand::Deposit {
                 user_id,
                 amount,
                 respond_to,
-            } => {
-                match self.record_and_process_input_event(
-                    ExchangeInputEvent::FundsDepositRequested { user_id, amount },
-                ) {
-                    Ok(result) => {
-                        let _ = respond_to.send(result.into_deposit_result());
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let _ = respond_to.send(Err(halted_message(&err)));
-                        Err(err)
-                    }
-                }
-            }
+            } => self.stage_write(
+                ExchangeInputEvent::FundsDepositRequested { user_id, amount },
+                staged,
+                respond_to,
+                InputEventResult::into_deposit_result,
+            ),
             ExchangeCommand::DepositShares {
                 user_id,
                 symbol,
                 quantity,
                 respond_to,
-            } => {
-                match self.record_and_process_input_event(
-                    ExchangeInputEvent::SharesDepositRequested {
-                        user_id,
-                        symbol,
-                        quantity,
-                    },
-                ) {
-                    Ok(result) => {
-                        let _ = respond_to.send(result.into_deposit_shares_result());
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let _ = respond_to.send(Err(halted_message(&err)));
-                        Err(err)
-                    }
-                }
-            }
+            } => self.stage_write(
+                ExchangeInputEvent::SharesDepositRequested {
+                    user_id,
+                    symbol,
+                    quantity,
+                },
+                staged,
+                respond_to,
+                InputEventResult::into_deposit_shares_result,
+            ),
             ExchangeCommand::SetRiskLimit {
                 user_id,
                 symbol,
                 max_daily_quantity,
                 respond_to,
-            } => {
-                match self.record_and_process_input_event(
-                    ExchangeInputEvent::RiskLimitSetRequested {
-                        user_id,
-                        symbol,
-                        max_daily_quantity,
-                    },
-                ) {
-                    Ok(result) => {
-                        let _ = respond_to.send(result.into_set_risk_limit_result());
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let _ = respond_to.send(Err(halted_message(&err)));
-                        Err(err)
-                    }
-                }
-            }
-            ExchangeCommand::PlaceOrder { order, respond_to } => {
-                match self
-                    .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested { order })
-                {
-                    Ok(result) => {
-                        let _ = respond_to.send(result.into_place_order_result());
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let _ = respond_to.send(Err(halted_message(&err)));
-                        Err(err)
-                    }
-                }
-            }
+            } => self.stage_write(
+                ExchangeInputEvent::RiskLimitSetRequested {
+                    user_id,
+                    symbol,
+                    max_daily_quantity,
+                },
+                staged,
+                respond_to,
+                InputEventResult::into_set_risk_limit_result,
+            ),
+            ExchangeCommand::PlaceOrder { order, respond_to } => self.stage_write(
+                ExchangeInputEvent::NewOrderRequested { order },
+                staged,
+                respond_to,
+                InputEventResult::into_place_order_result,
+            ),
             ExchangeCommand::CancelOrder {
                 order_id,
                 user_id,
                 respond_to,
-            } => {
-                match self.record_and_process_input_event(
-                    ExchangeInputEvent::CancelOrderRequested { order_id, user_id },
-                ) {
-                    Ok(result) => {
-                        let _ = respond_to.send(result.into_cancel_order_result());
-                        Ok(())
-                    }
-                    Err(err) => {
-                        let _ = respond_to.send(Err(halted_message(&err)));
-                        Err(err)
-                    }
-                }
-            }
+            } => self.stage_write(
+                ExchangeInputEvent::CancelOrderRequested { order_id, user_id },
+                staged,
+                respond_to,
+                InputEventResult::into_cancel_order_result,
+            ),
 
-            // Reads are answered straight from the core. They never call
-            // `record_and_process_input_event`, so they never reach the event log: they mutate
-            // nothing, and logging them would make every future replay longer for no change in
-            // outcome.
+            // Reads never reach the event log: they mutate nothing, and logging them would make
+            // every future replay longer for no change in outcome.
             ExchangeCommand::GetBalance {
                 user_id,
                 respond_to,
-            } => {
-                let _ = respond_to.send(self.core.balance_view(&user_id));
-                Ok(())
-            }
-
+            } => Ok(hold_read(respond_to, self.core.balance_view(&user_id))),
             ExchangeCommand::GetPositions {
                 user_id,
                 respond_to,
-            } => {
-                let _ = respond_to.send(self.core.position_views(&user_id));
-                Ok(())
-            }
-
+            } => Ok(hold_read(respond_to, self.core.position_views(&user_id))),
             ExchangeCommand::GetExecutions {
                 user_id,
                 symbol,
@@ -823,43 +804,58 @@ impl ExchangeRuntime {
                 start_time,
                 end_time,
                 respond_to,
-            } => {
-                let _ = respond_to.send(self.core.execution_views(
+            } => Ok(hold_read(
+                respond_to,
+                self.core.execution_views(
                     &user_id,
                     symbol.as_deref(),
                     order_id.as_deref(),
                     start_time,
                     end_time,
-                ));
-                Ok(())
-            }
-
+                ),
+            )),
             ExchangeCommand::GetRiskLimit {
                 user_id,
                 symbol,
                 respond_to,
-            } => {
-                let _ = respond_to.send(self.core.risk_limit_view(&user_id, &symbol));
-                Ok(())
-            }
-
+            } => Ok(hold_read(
+                respond_to,
+                self.core.risk_limit_view(&user_id, &symbol),
+            )),
             ExchangeCommand::GetOrder {
                 order_id,
                 user_id,
                 respond_to,
-            } => {
-                let _ = respond_to.send(self.core.order_view(&order_id, &user_id));
-                Ok(())
+            } => Ok(hold_read(
+                respond_to,
+                self.core.order_view(&order_id, &user_id),
+            )),
+        }
+    }
+
+    fn stage_write<T: 'static>(
+        &mut self,
+        event: ExchangeInputEvent,
+        staged: &mut Vec<Staged>,
+        respond_to: tokio::sync::oneshot::Sender<Result<T, String>>,
+        into_result: fn(InputEventResult) -> Result<T, String>,
+    ) -> Result<HeldReply, RuntimeFailure> {
+        match self.stage_input_event(event, staged) {
+            Ok(result) => Ok(hold(respond_to, into_result(result))),
+            Err(err) => {
+                let _ = respond_to.send(Err(halted_message(&err)));
+                Err(err)
             }
         }
     }
 
-    /// Prepares one input without mutating the live core, makes its complete batch durable, and
-    /// commits it only after the append succeeds. A failed append therefore leaves the live core at
-    /// the last durable state.
-    fn record_and_process_input_event(
+    /// Prepares one input without mutating the live core, encodes its complete batch, and commits
+    /// it in memory, so the next command in the group sees it. The record becomes durable later,
+    /// in `flush`, together with the rest of its group.
+    fn stage_input_event(
         &mut self,
         event: ExchangeInputEvent,
+        staged: &mut Vec<Staged>,
     ) -> Result<InputEventResult, RuntimeFailure> {
         let prepared =
             prepare_input_event(&self.core, event.clone()).map_err(|error| match error {
@@ -884,29 +880,134 @@ impl ExchangeRuntime {
             seq_num += 1;
         }
 
-        // Serialize once before changing state; these exact framed bytes go to disk and mmap.
+        // Serialize once; these exact framed bytes go to disk and then to mmap.
         let record = encode_record(&batch).map_err(RuntimeFailure::Store)?;
-        if let Some(store) = self.store.as_mut() {
-            store
-                .append_record(&record)
-                .map_err(RuntimeFailure::Store)?;
-        }
-
         let (result, executions) = prepared.commit(&mut self.core);
-
-        // Only now is the command part of history and visible to callbacks.
         self.next_event_seq = seq_num;
-        self.event_log.extend(batch);
-        if let Some(stream) = self.stream.as_mut() {
-            stream
-                .append(&record, seq_num - 1)
-                .map_err(RuntimeFailure::Stream)?;
-        }
-        self.core.notify_executions(&executions);
-        self.maybe_write_snapshot();
+        staged.push(Staged {
+            record,
+            last_sequence: seq_num - 1,
+            executions,
+            #[cfg(test)]
+            batch,
+        });
 
         Ok(result)
     }
+
+    /// Makes a group durable with ONE journal write and ONE sync, then publishes each command's
+    /// batch in order and runs its callbacks. Nothing here is reachable before the sync returns.
+    fn flush(&mut self, staged: Vec<Staged>) -> Result<(), RuntimeFailure> {
+        if staged.is_empty() {
+            return Ok(()); // a group of reads changed nothing
+        }
+        if let Some(store) = self.store.as_mut() {
+            let records: Vec<&[u8]> = staged.iter().map(|s| s.record.as_slice()).collect();
+            store
+                .append_record(&records.concat())
+                .map_err(RuntimeFailure::Store)?;
+        }
+        for command in staged {
+            // Only now is the command part of history and visible to callbacks.
+            #[cfg(test)]
+            self.event_log.extend(command.batch);
+            if let Some(stream) = self.stream.as_mut() {
+                stream
+                    .append(&command.record, command.last_sequence)
+                    .map_err(RuntimeFailure::Stream)?;
+            }
+            self.core.notify_executions(&command.executions);
+        }
+        Ok(())
+    }
+
+    /// Group commit. Every command already waiting is staged in queue order, then one sync makes
+    /// the whole group durable, and only then are replies released — reads included. Until the
+    /// sync returns, the in-memory core is ahead of the disk, but nothing outside this worker can
+    /// observe it: no reply, no mmap batch, no callback, no snapshot. If the sync fails the worker
+    /// halts, and the restart rebuilds from the journal, discarding the unsynced state.
+    fn handle_group(
+        &mut self,
+        commands: impl Iterator<Item = ExchangeCommand>,
+    ) -> Result<(), RuntimeFailure> {
+        let mut staged = Vec::new();
+        let mut replies = Vec::new();
+        let mut fault = None;
+        for command in commands {
+            match self.stage_command(command, &mut staged) {
+                Ok(reply) => replies.push(reply),
+                Err(err) => {
+                    // That command is already answered. The valid commands before it still go
+                    // through the sync below; those queued after it are dropped unanswered, which
+                    // the gateway reports as unavailable.
+                    fault = Some(err);
+                    break;
+                }
+            }
+        }
+        let commands = staged.len();
+        let flushed = self.flush(staged);
+        let failure = flushed.as_ref().err().map(halted_message);
+        for reply in replies {
+            reply(failure.as_deref());
+        }
+        flushed?;
+        self.maybe_write_snapshot(commands as u64);
+        fault.map_or(Ok(()), Err)
+    }
+
+    /// One command as a group of one. Tests drive the runtime through these directly.
+    #[cfg(test)]
+    fn handle_command(&mut self, command: ExchangeCommand) -> Result<(), RuntimeFailure> {
+        self.handle_group(std::iter::once(command))
+    }
+
+    #[cfg(test)]
+    fn record_and_process_input_event(
+        &mut self,
+        event: ExchangeInputEvent,
+    ) -> Result<InputEventResult, RuntimeFailure> {
+        let mut staged = Vec::new();
+        let result = self.stage_input_event(event, &mut staged)?;
+        self.flush(staged)?;
+        self.maybe_write_snapshot(1);
+        Ok(result)
+    }
+}
+
+/// A command committed in memory whose journal record has not been synced yet.
+struct Staged {
+    record: Vec<u8>,
+    last_sequence: u64,
+    executions: Vec<crate::types::types::Execution>,
+    #[cfg(test)]
+    batch: Vec<EventEnvelope>,
+}
+
+/// A reply held back until its group is durable and published. It receives `None` on success, or
+/// the halt message if the group failed.
+type HeldReply = Box<dyn FnOnce(Option<&str>)>;
+
+fn hold<T: 'static>(
+    respond_to: tokio::sync::oneshot::Sender<Result<T, String>>,
+    result: Result<T, String>,
+) -> HeldReply {
+    Box::new(move |failure| {
+        let _ = respond_to.send(match failure {
+            None => result,
+            Some(message) => Err(message.to_string()),
+        });
+    })
+}
+
+/// A read has no error channel. On failure it is dropped, which the gateway reports as
+/// unavailable: it must not show state that never became durable.
+fn hold_read<T: 'static>(respond_to: tokio::sync::oneshot::Sender<T>, value: T) -> HeldReply {
+    Box::new(move |failure| {
+        if failure.is_none() {
+            let _ = respond_to.send(value);
+        }
+    })
 }
 
 fn halted_message(err: &RuntimeFailure) -> String {
@@ -1148,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn append_failure_leaves_prepared_state_uncommitted() {
+    fn append_failure_leaves_nothing_durable_or_visible() {
         let path = temp_log_path("atomic-append-failure");
         let (store, _) = EventStore::open(&path).unwrap();
         drop(store);
@@ -1162,11 +1263,18 @@ mod tests {
                 amount: 1_000,
             });
 
+        // Group commit stages a command in memory before its sync, so after a failed sync the
+        // live core is ahead of the disk. It is never used again: the worker halts, and the only
+        // way back is recovery from the journal, which holds nothing of the failed command.
         assert!(matches!(result, Err(RuntimeFailure::Store(_))));
-        assert_eq!(runtime.core.balance_view("buyer").balance, 0);
         assert!(runtime.event_log.is_empty());
-        assert_eq!(runtime.next_event_seq, 1);
+        drop(runtime);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let recovered = recover_runtime(rx, &path).unwrap();
+        assert_eq!(recovered.core.balance_view("buyer").balance, 0);
+        assert_eq!(recovered.next_event_seq, 1);
 
+        drop(recovered);
         std::fs::remove_file(path).unwrap();
     }
 
@@ -1199,25 +1307,17 @@ mod tests {
         runtime.core.subscribe(move |_| {
             callback_count_for_subscriber.fetch_add(1, Ordering::Relaxed);
         });
+        let durable_history = runtime.event_log().len();
 
         let result =
             runtime.record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
                 order: order("buy-1", "buyer", "BUY", 10, 1),
             });
 
+        // The fill was staged in memory, but it never became durable, so nobody hears about it.
         assert!(matches!(result, Err(RuntimeFailure::Store(_))));
         assert_eq!(callback_count.load(Ordering::Relaxed), 0);
-        assert_eq!(runtime.core.balance_view("buyer").balance, 100);
-        assert_eq!(runtime.core.position_views("seller")[0].quantity, 1);
-        assert_eq!(
-            runtime
-                .core
-                .execution_views("buyer", None, None, None, None)
-                .len(),
-            0
-        );
-        assert!(runtime.core.order_view("sell-1", "seller").is_some());
-        assert!(runtime.core.order_view("buy-1", "buyer").is_none());
+        assert_eq!(runtime.event_log().len(), durable_history);
 
         std::fs::remove_file(path).unwrap();
     }
@@ -1871,7 +1971,10 @@ mod tests {
         ));
         assert!(reader.next_batch().unwrap().is_none());
         assert!(runtime.event_log().is_empty());
-        assert!(runtime.core.position_views("seller").is_empty());
+        drop(runtime);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let recovered = recover_runtime(rx, &fixture.log).unwrap();
+        assert!(recovered.core.position_views("seller").is_empty());
     }
 
     #[test]
@@ -2160,11 +2263,173 @@ mod tests {
             Err(RuntimeFailure::Store(_))
         ));
         assert_eq!(std::fs::read(&snapshot).unwrap(), before);
-        assert_eq!(runtime.core.balance_view("buyer").balance, 0);
-
         drop(runtime);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let recovered = recover_runtime(rx, &path).unwrap();
+        assert_eq!(recovered.core.balance_view("buyer").balance, 0);
+
+        drop(recovered);
         let _ = std::fs::remove_file(&snapshot);
         let _ = std::fs::remove_file(&stream);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Queues commands the way a burst of HTTP clients would, before the worker looks.
+    fn queue<T>(
+        commands: &mut Vec<ExchangeCommand>,
+        make: impl FnOnce(oneshot::Sender<T>) -> ExchangeCommand,
+    ) -> oneshot::Receiver<T> {
+        let (respond_to, reply) = oneshot::channel();
+        commands.push(make(respond_to));
+        reply
+    }
+
+    #[test]
+    fn a_queued_group_shares_one_sync_and_its_reads_see_earlier_writes() {
+        let path = temp_log_path("group-commit");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut runtime = recover_runtime(rx, &path).unwrap();
+        let mut group = Vec::new();
+        let deposit = queue(&mut group, |respond_to| ExchangeCommand::Deposit {
+            user_id: "buyer".into(),
+            amount: 1_000,
+            respond_to,
+        });
+        let shares = queue(&mut group, |respond_to| ExchangeCommand::DepositShares {
+            user_id: "seller".into(),
+            symbol: "AAPL".into(),
+            quantity: 5,
+            respond_to,
+        });
+        let sell = queue(&mut group, |respond_to| ExchangeCommand::PlaceOrder {
+            order: order("sell-1", "seller", "SELL", 10, 5),
+            respond_to,
+        });
+        let buy = queue(&mut group, |respond_to| ExchangeCommand::PlaceOrder {
+            order: order("buy-1", "buyer", "BUY", 10, 5),
+            respond_to,
+        });
+        let balance = queue(&mut group, |respond_to| ExchangeCommand::GetBalance {
+            user_id: "buyer".into(),
+            respond_to,
+        });
+
+        runtime.handle_group(group.into_iter()).unwrap();
+
+        // Four writes, one sync.
+        assert_eq!(runtime.store.as_ref().unwrap().syncs, 1);
+        deposit.blocking_recv().unwrap().unwrap();
+        shares.blocking_recv().unwrap().unwrap();
+        assert_eq!(sell.blocking_recv().unwrap().unwrap().status, "new");
+        assert_eq!(buy.blocking_recv().unwrap().unwrap().status, "filled");
+        // The read queued last sees the fill staged before it in the same group.
+        assert_eq!(balance.blocking_recv().unwrap().balance, 950);
+
+        let live = runtime.core_snapshot_for_test();
+        drop(runtime);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let recovered = recover_runtime(rx, &path).unwrap();
+        assert_eq!(recovered.core_snapshot_for_test(), live);
+        drop(recovered);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_failed_group_sync_answers_every_command_unavailable_and_publishes_nothing() {
+        use crate::exchange::event_stream::tests::Fixture;
+        let fixture = Fixture::new();
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let mut reader = fixture.reader();
+        runtime.store = Some(EventStore::open_read_only_for_test(&fixture.log).unwrap());
+        let mut group = Vec::new();
+        let deposit = queue(&mut group, |respond_to| ExchangeCommand::Deposit {
+            user_id: "buyer".into(),
+            amount: 1_000,
+            respond_to,
+        });
+        let balance = queue(&mut group, |respond_to| ExchangeCommand::GetBalance {
+            user_id: "buyer".into(),
+            respond_to,
+        });
+
+        assert!(matches!(
+            runtime.handle_group(group.into_iter()),
+            Err(RuntimeFailure::Store(_))
+        ));
+
+        assert!(
+            deposit
+                .blocking_recv()
+                .unwrap()
+                .unwrap_err()
+                .starts_with("exchange unavailable:")
+        );
+        // The read would have shown a balance of 1,000 that never reached the disk. It is
+        // dropped instead, which the gateway reports as unavailable.
+        assert!(balance.blocking_recv().is_err());
+        assert!(reader.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_fault_mid_group_still_syncs_the_commands_before_it_and_drops_those_after() {
+        let path = temp_log_path("group-fault");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut runtime = recover_runtime(rx, &path).unwrap();
+        for input in [
+            ExchangeInputEvent::FundsDepositRequested {
+                user_id: "seller".into(),
+                amount: u64::MAX,
+            },
+            ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 10,
+            },
+            share_deposit("seller", 1),
+            ExchangeInputEvent::NewOrderRequested {
+                order: order("sell-1", "seller", "SELL", 10, 1),
+            },
+        ] {
+            runtime.record_and_process_input_event(input).unwrap();
+        }
+        let mut group = Vec::new();
+        let before = queue(&mut group, |respond_to| ExchangeCommand::Deposit {
+            user_id: "other".into(),
+            amount: 7,
+            respond_to,
+        });
+        // Crediting a seller who already holds u64::MAX is an internal fault, not a rejection.
+        let faulting = queue(&mut group, |respond_to| ExchangeCommand::PlaceOrder {
+            order: order("buy-1", "buyer", "BUY", 10, 1),
+            respond_to,
+        });
+        let after = queue(&mut group, |respond_to| ExchangeCommand::Deposit {
+            user_id: "late".into(),
+            amount: 3,
+            respond_to,
+        });
+
+        assert!(matches!(
+            runtime.handle_group(group.into_iter()),
+            Err(RuntimeFailure::Internal(_))
+        ));
+
+        before.blocking_recv().unwrap().unwrap();
+        assert!(
+            faulting
+                .blocking_recv()
+                .unwrap()
+                .unwrap_err()
+                .starts_with("exchange unavailable:")
+        );
+        assert!(after.blocking_recv().is_err());
+        drop(runtime);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let recovered = recover_runtime(rx, &path).unwrap();
+        assert_eq!(recovered.core.balance_view("other").balance, 7);
+        assert_eq!(recovered.core.balance_view("late").balance, 0);
+        assert!(recovered.core.order_view("buy-1", "buyer").is_none());
+        drop(recovered);
         std::fs::remove_file(path).unwrap();
     }
 

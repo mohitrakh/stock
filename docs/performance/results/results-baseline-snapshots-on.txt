@@ -1,0 +1,66 @@
+### --orders 20000  [/bench-disk]
+bench: 20000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 271 orders/s over 73.813 s
+  latency us : p50 35422207  p90 38338559  p99 39354367  p99.9 39518207  max 39550975
+  syncs      : 20000 (1.0 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 94008 kB, VmRSS: 85572 kB
+### --orders 2000 --rate 200  [/bench-disk]
+bench: 2000 orders, rate 200/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 200 orders/s over 9.999 s
+  latency us : p50 4367  p90 17503  p99 35647  p99.9 45183  max 48447
+  syncs      : 2000 (1.0 orders per sync)
+  journal    : 642 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 26240 kB, VmRSS: 26240 kB
+### --orders 5000 --rate 1000  [/bench-disk]
+bench: 5000 orders, rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 339 orders/s over 14.768 s
+  latency us : p50 5214207  p90 8740863  p99 9674751  p99.9 9773055  max 9773055
+  syncs      : 5000 (1.0 orders per sync)
+  journal    : 690 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 33088 kB, VmRSS: 33088 kB
+### --orders 20000 --rate 10000  [/bench-disk]
+bench: 20000 orders, rate 10000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 421 orders/s over 47.528 s
+  latency us : p50 25673727  p90 41222143  p99 44924927  p99.9 45514751  max 45547519
+  syncs      : 20000 (1.0 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 94376 kB, VmRSS: 85712 kB
+### --orders 200000  [/bench-mem]
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1516 orders/s over 131.912 s
+  latency us : p50 3946495  p90 7970815  p99 53379071  p99.9 53510143  max 54493183
+  syncs      : 200000 (1.0 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 686888 kB, VmRSS: 520492 kB
+### --symbols 1 --depth 0 --orders 5000  [/bench-mem]
+bench: 5000 orders, rate max, 1 symbols, 100 users, depth 0 per symbol
+  throughput : 3994 orders/s over 1.252 s
+  latency us : p50 359167  p90 1005055  p99 1224703  p99.9 1245183  max 1247231
+  syncs      : 5000 (1.0 orders per sync)
+  journal    : 741 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 25556 kB, VmRSS: 25556 kB
+### --symbols 1 --depth 1000 --orders 5000  [/bench-mem]
+bench: 5000 orders, rate max, 1 symbols, 100 users, depth 1000 per symbol
+  throughput : 970 orders/s over 5.155 s
+  latency us : p50 1971199  p90 4501503  p99 5079039  p99.9 5144575  max 5152767
+  syncs      : 5000 (1.0 orders per sync)
+  journal    : 741 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 28492 kB, VmRSS: 28492 kB
+### --symbols 1 --depth 10000 --orders 5000  [/bench-mem]
+bench: 5000 orders, rate max, 1 symbols, 100 users, depth 10000 per symbol
+  throughput : 99 orders/s over 50.469 s
+  latency us : p50 22511615  p90 44466175  p99 49807359  p99.9 50397183  max 50495487
+  syncs      : 5000 (1.0 orders per sync)
+  journal    : 744 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 47128 kB, VmRSS: 46344 kB
+### --orders 1000000  [/bench-mem]
+# (run stopped by hand: at about 1,500 orders/s, with snapshots growing, it would have taken over an hour)

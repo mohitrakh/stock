@@ -1,30 +1,35 @@
 # Stock Exchange - Current Implementation
 
-Verified against this checkout on 2026-09-27. This file describes implemented behavior. `stock-exchange-system-design.md` is the target architecture; `PROJECT_DIRECTION.md` is the milestone journal.
+Verified against this checkout on 2026-09-29. This file describes implemented behavior. `stock-exchange-system-design.md` is the target architecture; `PROJECT_DIRECTION.md` is the milestone journal.
 
 ## Ownership and command flow
 
 Axum handlers send `ExchangeCommand` values through a bounded Tokio queue (10,000 commands) to one dedicated exchange-worker thread. Commands may carry a temporary `oneshot` reply channel. Persisted `ExchangeEvent` values contain only replayable business data.
 
-`ExchangeRuntime` owns the receiver, core, durable event store, mmap stream writer, optional core-snapshot schedule, in-memory replay history, and next journal sequence. After a snapshot restart the in-memory vector holds only the replayed suffix; the complete history remains in the durable journal. `ExchangeCore` owns the order manager, matching engine, and matching sequencer. The core does not access files, databases, queues, or HTTP.
+`ExchangeRuntime` owns the receiver, core, durable event store, mmap stream writer, optional core-snapshot schedule, and next journal sequence. It keeps no event history in production: the durable journal is the complete history, and the in-memory `event_log` exists only in test builds. `ExchangeCore` owns the order manager, matching engine, and matching sequencer. The core does not access files, databases, queues, or HTTP.
 
-A mutating command follows this order:
+The worker processes commands in groups (group commit). It blocks for one command, then takes every command already queued, up to 1,024:
 
 ```text
-prepare and validate the entire transition without changing live state
-  -> number input and outputs as one batch
-  -> serialize once, append to journal, sync_all
-  -> commit the prepared core transition
-  -> extend in-memory history and advance journal sequence
-  -> publish the complete batch and committed watermark through mmap
+for each command in the group, in queue order:
+  write:  prepare and validate the entire transition without changing live state
+          -> number input and outputs as one batch and encode its framed record
+          -> commit the prepared transition in memory (later commands in the group see it)
+  read:   answer from the core at its place in the queue
+  either: hold the reply
+then once for the group:
+  -> write every record with one write_all, then ONE sync_all
+  -> publish each complete batch and the committed watermark through mmap
   -> notify local execution callbacks
-  -> periodically replace a snapshot of this committed core state
-  -> answer the waiting HTTP request
+  -> release every held reply
+  -> count the commands toward the core-snapshot schedule
 ```
+
+Nothing outside the worker can observe a command before its group is synced: not a reply, a read, an mmap batch, a callback or a snapshot. A quiet exchange forms groups of one; a busy one shares each sync between up to 1,024 commands.
 
 Preparation includes every fill and cumulative settlement effect. Business rejections produce a durable input/rejection batch without changing trading state or consuming matching sequence. Internal faults halt processing; they are not recorded as ordinary client rejections.
 
-An append error leaves the live core, journal sequence, in-memory history, callbacks, and mmap publication unchanged. Disk outcome can be ambiguous after an I/O error, so the writer stops and recovery decides whether a complete record survived. A publication error occurs after durable/core commit: the writer also stops, but the command can appear on recovery. An unavailable response is therefore not proof that a command did not happen.
+An append or sync error answers every command in the group `exchange unavailable`, publishes nothing, runs no callbacks, and halts the worker. The in-memory core is then ahead of the disk, so it is never used again; recovery from the journal decides which complete records survived. An internal fault while staging answers that command `unavailable`, still syncs and answers the valid commands staged before it, drops the commands queued after it (the gateway reports 503), and halts. A publication error occurs after durable/core commit: the writer also stops, but the command can appear on recovery. An unavailable response is therefore not proof that a command did not happen.
 
 The worker closes its receiver on exit. `AppState.exchange_available` becomes false, and `/health` returns 503. While the worker is available, health returns 200. This flag is not a full readiness/latency monitor.
 
@@ -34,14 +39,14 @@ The worker closes its receiver on exit. `AppState.exchange_available` becomes fa
 |---|---|
 | `ExchangeCore` | Coordinates read-only preparation and infallible installation of validated plans. |
 | `OrderManager` | Owns lifecycle records, cash wallet, share positions, risk usage, execution indexes, and local execution callbacks. |
-| `MatchingEngine` | Owns symbol books and order-to-symbol lookup. Prepares matching/cancellation against a clone of the affected book, then installs it at commit. |
+| `MatchingEngine` | Owns symbol books and order-to-symbol lookup. Prepares matching with a read-only `OrderBook::plan_order` against the live book and applies the plan at commit; prepares cancellation with a read-only presence check and removes at commit. Nothing is copied. |
 | `OrderBook` | Holds bid/ask price levels and order-node lookup; matches price/time priority while skipping self trades. |
 | `PriceLevel` / `Node` | Maintain FIFO order at a price through indexed linked nodes. |
 | `Sequencer` | Supplies a candidate matching sequence with `peek`; `commit` advances it only when the prepared order/cancellation commits. |
 
 The production path uses `prepare_add_order` / `commit_add_order` and `prepare_cancel_order` / `commit_cancel_order`. It does not use the former mutating `prepare_order -> apply_executions -> complete_cancel` path.
 
-The order manager's `prepare_new_order` validates execution pairs, cumulative fills, projected cash/shares, collateral, risk, lifecycle changes, and execution views. `prepare_cancel_plan` validates ownership, state, and collateral release. Their commit methods install the prepared values. Preparation clones the affected symbol book, not the entire exchange.
+The order manager's `prepare_new_order` validates execution pairs, cumulative fills, projected cash/shares, collateral, risk, lifecycle changes, and execution views. `prepare_cancel_plan` validates ownership, state, and collateral release. Their commit methods install the prepared values. Preparation reads the live books; a match plan lists the resting orders to reduce or remove, the executions, and the remainder to rest, so its cost follows the orders the new order reaches, not the size of the book.
 
 ## Prices, collateral, risk, and fills
 
@@ -75,13 +80,13 @@ The format is an 8-byte `EXCHLOG1` header, followed by records:
 payload length (u32 LE) | CRC-32 (u32 LE) | JSON Vec<EventEnvelope>
 ```
 
-Each record contains exactly one input and its outputs. The maximum JSON payload is 64 MiB. The runtime calls `encode_record` before persistence and passes those same bytes to `append_record` and later mmap publication. `append_record` uses `write_all` and `sync_all`.
+Each record contains exactly one input and its outputs. The maximum JSON payload is 64 MiB. The runtime calls `encode_record` before persistence and passes those same bytes to `append_record` and later mmap publication. `append_record` takes one or more complete framed records (a whole group) and uses one `write_all` and one `sync_all`; a process crash can only cut the tail of a group, and recovery drops the torn record as before; after power loss a damaged complete record still refuses startup, as it always could.
 
 `EventStore::open` acquires a nonblocking exclusive lifetime file lock, validates the header and records, and truncates an incomplete final frame. Complete records with invalid checksums, JSON, or command shape cause refusal. Deterministic replay then checks business correctness. Two writers cannot recover or append to the same journal concurrently through this API. `EventStore::open_existing_matching` is the warm-promotion opener: it never creates or initializes a journal, and it compares the locked file's device/inode with the expected identity before reading or repairing it.
 
 New journal files are created with mode 0600, and initialization synchronizes both the file and parent directory. Existing file permissions are unchanged. Ownership is explicitly unlocked on drop; OS process death also releases the lock.
 
-The journal remains one unbounded file. A start with no usable snapshot reads and replays it from the beginning. A valid core snapshot lets exchange startup read, validate, and retain only the later suffix. There is one journal fsync per command.
+The journal remains one unbounded file. A start with no usable snapshot reads and replays it from the beginning. A valid core snapshot lets exchange startup read, validate, and replay only the later suffix. There is one journal sync per group of queued commands.
 
 ## Committed mmap stream and readers
 
@@ -217,10 +222,20 @@ The separate MDP listener has its own public routes and no database dependency:
 
 The previous `/exchange/orderbook/{symbol}` route and `ExchangeCommand::GetOrderBook` path have been removed. Internal core L2 methods remain for correctness tests.
 
+## Benchmark
+
+`--bench` is an in-process load generator over the production worker, journal, mmap stream and snapshot schedule. It needs an empty directory and never deletes anything:
+
+```sh
+cargo run --release -- --bench EMPTY_DIR [--orders N] [--rate ORDERS_PER_SEC|0] [--symbols N] [--users N] [--depth RESTING_PER_SYMBOL] [--snapshot-every COMMANDS|0]
+```
+
+The workload is deterministic (fixed-seed). Fixed-rate mode measures latency from each order's intended send time into an HdrHistogram; `--rate 0` measures maximum throughput. Output: orders/s, p50/p90/p99/p99.9/max, orders per journal sync, journal bytes per order, rejections, and process memory. See `docs/performance/00-benchmark-harness.md`.
+
 ## Verification and remaining scope
 
-On Linux, `cargo fmt -- --check` and `cargo test --locked` pass: 131 unit tests plus 6 executable integration tests (verified 2026-09-29). The crate uses Unix-only APIs and does not build on Windows. Warm-replica coverage proves journal catch-up and live following without writes, a snapshot start, output-mismatch rejection that leaves the applied checkpoint in place, promotion refused while another process owns the journal, a swapped journal refused without its torn tail being repaired, recovery of a durable batch hidden from mmap, and promotion rebuilding from the journal rather than a differing mmap cache. Coverage includes overnight risk rollover and durable replay, independent fast/slow readers, window overwrite, oversize batches, checkpoint boundary/identity validation, cache/journal corruption, competing writers, durable-but-unpublished recovery, failed append with no publication, fatal publication failure, real cross-process reading, SIGKILL at publication boundaries, probe checkpoint resume, and MDP projection/recovery/HTTP behavior without PostgreSQL. Candle coverage proves one-trade-per-pair OHLCV aggregation, invalid timestamp atomicity, combined-state round-trip, journal catch-up, range validation, persisted restart without duplicate volume, and live mmap following. Core-snapshot coverage restores normalized FIFO books and ledgers, verifies suffix-only replay with both sequence domains continuing, rejects a journal mismatch, repairs only torn suffix tails, preserves a corrupt artifact while falling back to full replay, keeps the prior checkpoint on replacement failure, and proves a failed append cannot advance a snapshot. The ignored opt-in Reporter executable test resets a supplied isolated database, applies the migration, injects a checkpoint transaction failure, then verifies rollback, journal-to-mmap catch-up, lifecycle/trade rows, and no duplicates after process restart. It passed against a freshly initialized local PostgreSQL 18 instance on 2026-09-27.
+On Linux, `cargo fmt -- --check` and `cargo test --locked` pass: 136 unit tests plus the executable integration tests (verified 2026-09-29). Group-commit tests prove one sync per queued group, reads that see earlier writes in their group, every command answered unavailable and nothing published after a failed sync, and a mid-group fault that still syncs the commands before it. A differential test runs 20,000 random order/cancel steps through the planned matcher and the old in-place matcher and requires identical executions, books and indexes after every step. The crate uses Unix-only APIs and does not build on Windows. Warm-replica coverage proves journal catch-up and live following without writes, a snapshot start, output-mismatch rejection that leaves the applied checkpoint in place, promotion refused while another process owns the journal, a swapped journal refused without its torn tail being repaired, recovery of a durable batch hidden from mmap, and promotion rebuilding from the journal rather than a differing mmap cache. Coverage includes overnight risk rollover and durable replay, independent fast/slow readers, window overwrite, oversize batches, checkpoint boundary/identity validation, cache/journal corruption, competing writers, durable-but-unpublished recovery, failed append with no publication, fatal publication failure, real cross-process reading, SIGKILL at publication boundaries, probe checkpoint resume, and MDP projection/recovery/HTTP behavior without PostgreSQL. Candle coverage proves one-trade-per-pair OHLCV aggregation, invalid timestamp atomicity, combined-state round-trip, journal catch-up, range validation, persisted restart without duplicate volume, and live mmap following. Core-snapshot coverage restores normalized FIFO books and ledgers, verifies suffix-only replay with both sequence domains continuing, rejects a journal mismatch, repairs only torn suffix tails, preserves a corrupt artifact while falling back to full replay, keeps the prior checkpoint on replacement failure, and proves a failed append cannot advance a snapshot. The ignored opt-in Reporter executable test resets a supplied isolated database, applies the migration, injects a checkpoint transaction failure, then verifies rollback, journal-to-mmap catch-up, lifecycle/trade rows, and no duplicates after process restart. It passed against a freshly initialized local PostgreSQL 18 instance on 2026-09-27.
 
 These tests include core/runtime and actual executable checks. MDP coverage includes oracle comparison, multi-fill and cancellation behavior, malformed batches, aggregation beyond `u32::MAX`, state replacement failures, journal catch-up, MDP and exchange-stream restarts, live following, and fail-closed 503 responses. A manual isolated-database run also exercised authenticated trading HTTP plus the separate MDP process through rest, partial fill, cancellation, MDP restart, and resumed live publication. A live run of the real primary and warm executables against PostgreSQL exercised promotion end to end: 409 while the primary ran, live following, a `SIGKILL` of the primary, 202, identical balances, positions, and order state on the promoted primary, a new trade there, and journal sequences contiguous across the hand-off. This does not claim machine power-loss testing or performance benchmarking. Clippy still reports existing compatibility/dead-code and style warnings.
 
-Both subscribers are correctness-first and have not been throughput tested. Candle buckets are retained without a limit and have no rollups or external historical store. Tax/customer statements, settlement, historical reporting APIs, journal compaction/retention, automatic hot-warm failover, cross-host replication and recovery, mmap ingress, lock-free queues, group commit, and CPU pinning remain separate milestones.
+Measured with `--bench` on a Docker Desktop VM: about 37,000-39,000 orders/s on disk at maximum rate, 43,000 in memory, 8,300 with the production snapshot schedule (the snapshot serializes the whole, ever-growing state on the worker), and p99 about 20-30 ms at 1,000 orders/s. Both subscribers are correctness-first and have not been throughput tested. Candle buckets are retained without a limit and have no rollups or external historical store. Tax/customer statements, settlement, historical reporting APIs, journal compaction/retention, automatic hot-warm failover, cross-host replication and recovery, mmap ingress, lock-free queues, pipelined journal sync, and CPU pinning remain separate milestones.

@@ -1,0 +1,65 @@
+### noram --orders 1000000 --snapshot-every 0  [/bench-mem]
+bench: 1000000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 30865 orders/s over 32.399 s
+  latency us : p50 297215  p90 518911  p99 1951743  p99.9 2007039  max 2010111  (queue-bound at max rate)
+  syncs      : 978 (1022.5 orders per sync)
+  journal    : 762 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 1318092 kB, VmRSS: 1234472 kB
+### noram --orders 200000 --snapshot-every 0  [/bench-mem]
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 42667 orders/s over 4.688 s
+  latency us : p50 248319  p90 306431  p99 346623  p99.9 351487  max 360959  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 251672 kB, VmRSS: 250900 kB
+### noram --orders 20000 --snapshot-every 0  [/bench-disk]
+bench: 20000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 36648 orders/s over 0.546 s
+  latency us : p50 267519  p90 303103  p99 307199  p99.9 307199  max 307455  (queue-bound at max rate)
+  syncs      : 21 (952.4 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 50188 kB, VmRSS: 50188 kB
+### noram --orders 200000 --rate 43000 --snapshot-every 0  [/bench-disk]
+bench: 200000 orders, rate 43000/s, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 24914 orders/s over 8.028 s
+  latency us : p50 1361919  p90 3106815  p99 3346431  p99.9 3381247  max 3383295
+  syncs      : 200 (1000.0 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 251544 kB, VmRSS: 250688 kB
+### noram --symbols 1 --depth 0 --orders 5000 --snapshot-every 0  [/bench-mem]
+bench: 5000 orders, rate max, 1 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 50210 orders/s over 0.100 s
+  latency us : p50 61023  p90 95231  p99 95423  p99.9 95487  max 95487  (queue-bound at max rate)
+  syncs      : 6 (833.3 orders per sync)
+  journal    : 741 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 22832 kB, VmRSS: 22832 kB
+### noram --symbols 1 --depth 1000 --orders 5000 --snapshot-every 0  [/bench-mem]
+bench: 5000 orders, rate max, 1 symbols, 100 users, depth 1000 per symbol, snapshots off
+  throughput : 48769 orders/s over 0.103 s
+  latency us : p50 59231  p90 97919  p99 98239  p99.9 98303  max 98303  (queue-bound at max rate)
+  syncs      : 6 (833.3 orders per sync)
+  journal    : 741 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 25052 kB, VmRSS: 25052 kB
+### noram --symbols 1 --depth 10000 --orders 5000 --snapshot-every 0  [/bench-mem]
+bench: 5000 orders, rate max, 1 symbols, 100 users, depth 10000 per symbol, snapshots off
+  throughput : 49027 orders/s over 0.102 s
+  latency us : p50 58591  p90 98559  p99 98687  p99.9 98687  max 98751  (queue-bound at max rate)
+  syncs      : 6 (833.3 orders per sync)
+  journal    : 744 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 36616 kB, VmRSS: 35504 kB
+### noram --orders 200000  [/bench-disk]
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snapshots every 10000
+  throughput : 8255 orders/s over 24.229 s
+  latency us : p50 1269759  p90 2051071  p99 2224127  p99.9 3383295  max 3383295  (queue-bound at max rate)
+  syncs      : 196 (1020.4 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 546040 kB, VmRSS: 386928 kB
+### noram done: memory cpu disk target depth prod

@@ -160,7 +160,7 @@ impl ExchangeCore {
             .matching_engine
             .prepare_order(order.clone())
             .map_err(CoreError::Internal)?;
-        let executions = matching.executions.clone();
+        let executions = matching.plan.executions.clone();
         let manager = self
             .order_manager
             .prepare_new_order(order.clone(), &executions)

@@ -1,0 +1,81 @@
+### groupcommit --orders 20000 --snapshot-every 0  [/bench-disk]
+bench: 20000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 18713 orders/s over 1.069 s
+  latency us : p50 391935  p90 717823  p99 744959  p99.9 744959  max 745983  (queue-bound at max rate)
+  syncs      : 21 (952.4 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 67372 kB, VmRSS: 67372 kB
+### groupcommit --orders 2000 --rate 200 --snapshot-every 0  [/bench-disk]
+bench: 2000 orders, rate 200/s, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 200 orders/s over 9.998 s
+  latency us : p50 3167  p90 8343  p99 34783  p99.9 59679  max 67071
+  syncs      : 1900 (1.1 orders per sync)
+  journal    : 642 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 26068 kB, VmRSS: 26068 kB
+### groupcommit --orders 5000 --rate 1000 --snapshot-every 0  [/bench-disk]
+bench: 5000 orders, rate 1000/s, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 1000 orders/s over 5.002 s
+  latency us : p50 3647  p90 7527  p99 22335  p99.9 31023  max 33759
+  syncs      : 2887 (1.7 orders per sync)
+  journal    : 690 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 31832 kB, VmRSS: 31832 kB
+### groupcommit --orders 20000 --rate 10000 --snapshot-every 0  [/bench-disk]
+bench: 20000 orders, rate 10000/s, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 9907 orders/s over 2.019 s
+  latency us : p50 9487  p90 123903  p99 168319  p99.9 186239  max 188159
+  syncs      : 386 (51.8 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 63776 kB, VmRSS: 63776 kB
+### groupcommit --orders 200000 --rate 43000 --snapshot-every 0  [/bench-disk]
+bench: 200000 orders, rate 43000/s, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 3194 orders/s over 62.608 s
+  latency us : p50 11649023  p90 45514751  p99 56688639  p99.9 57999359  max 57999359
+  syncs      : 198 (1010.1 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 386128 kB, VmRSS: 385056 kB
+### groupcommit --orders 200000 --snapshot-every 0  [/bench-mem]
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 3309 orders/s over 60.439 s
+  latency us : p50 2623487  p90 6332415  p99 7409663  p99.9 7856127  max 7856127  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 385276 kB, VmRSS: 384496 kB
+### groupcommit --symbols 1 --depth 0 --orders 5000 --snapshot-every 0  [/bench-mem]
+bench: 5000 orders, rate max, 1 symbols, 100 users, depth 0 per symbol, snapshots off
+  throughput : 3879 orders/s over 1.289 s
+  latency us : p50 550911  p90 1285119  p99 1285119  p99.9 1285119  max 1285119  (queue-bound at max rate)
+  syncs      : 6 (833.3 orders per sync)
+  journal    : 741 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 27300 kB, VmRSS: 27300 kB
+### groupcommit --symbols 1 --depth 1000 --orders 5000 --snapshot-every 0  [/bench-mem]
+bench: 5000 orders, rate max, 1 symbols, 100 users, depth 1000 per symbol, snapshots off
+  throughput : 779 orders/s over 6.419 s
+  latency us : p50 3276799  p90 6418431  p99 6418431  p99.9 6418431  max 6418431  (queue-bound at max rate)
+  syncs      : 6 (833.3 orders per sync)
+  journal    : 741 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 30292 kB, VmRSS: 30292 kB
+### groupcommit --symbols 1 --depth 10000 --orders 5000 --snapshot-every 0  [/bench-mem]
+bench: 5000 orders, rate max, 1 symbols, 100 users, depth 10000 per symbol, snapshots off
+  throughput : 107 orders/s over 46.632 s
+  latency us : p50 27033599  p90 46628863  p99 46628863  p99.9 46628863  max 46628863  (queue-bound at max rate)
+  syncs      : 6 (833.3 orders per sync)
+  journal    : 744 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 48332 kB, VmRSS: 47652 kB
+### groupcommit --orders 200000  [/bench-disk]
+bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snapshots every 10000
+  throughput : 2812 orders/s over 71.131 s
+  latency us : p50 3260415  p90 7700479  p99 8617983  p99.9 8781823  max 8781823  (queue-bound at max rate)
+  syncs      : 196 (1020.4 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 636536 kB, VmRSS: 482044 kB
+### groupcommit done: disk rates target cpu depth prod

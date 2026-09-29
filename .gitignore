@@ -10,3 +10,5 @@ exchange-events.log
 !docs/tasks/08-market-data-publisher-v1.md
 !docs/tasks/12-candlestick-publisher-v1.md
 !docs/tasks/13-warm-replica-v1.md
+!docs/tasks/14-critical-path-performance-v1.md
+!docs/performance/*.md

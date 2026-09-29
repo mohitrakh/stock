@@ -1,4 +1,4 @@
-# Project Direction - Same-host Warm Replica v1 Complete
+# Project Direction - Critical-Path Performance v1 Complete
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -12,13 +12,14 @@ The repository is a learning stock exchange with an exchange-grade architecture 
 
 ## Current Status
 
-The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log, journal-bound core snapshots with suffix replay, and a bounded mmap stream with independent readers and durable catch-up. MDP v1 reconstructs public L2 books independently. Reporter v1 is the second independent subscriber: it consumes the same complete committed batches and atomically projects durable order lifecycle and one-row-per-trade history into PostgreSQL. Its database/checkpoint transaction and restart behavior are verified with an isolated PostgreSQL acceptance test. Same-host Warm Replica v1 independently follows committed batches into a read-only deterministic core and supports a manual, writer-fenced hand-off. Neither subscriber nor the warm follower is on the trading path.
+The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log, journal-bound core snapshots with suffix replay, and a bounded mmap stream with independent readers and durable catch-up. MDP v1 reconstructs public L2 books independently. Reporter v1 is the second independent subscriber: it consumes the same complete committed batches and atomically projects durable order lifecycle and one-row-per-trade history into PostgreSQL. Its database/checkpoint transaction and restart behavior are verified with an isolated PostgreSQL acceptance test. Same-host Warm Replica v1 independently follows committed batches into a read-only deterministic core and supports a manual, writer-fenced hand-off. Neither subscriber nor the warm follower is on the trading path. Critical-path performance v1 made the exchange measurable (`--bench`) and about 100× faster on disk: the worker group-commits every queued command behind one journal sync, and matching plans fills against the live book instead of copying it.
 
 ```text
 Axum HTTP handler
   -> bounded Tokio mpsc command queue
   -> dedicated exchange worker thread
-  -> ExchangeRuntime
+  -> ExchangeRuntime: take every queued command (up to 1,024) as one group
+       for each command, in queue order:
        -> prepare the complete transition through ExchangeCore (no live mutation)
             -> OrderManager
                  -> RiskManager (daily cap; day derived from the order's own timestamp)
@@ -26,22 +27,23 @@ Axum HTTP handler
                  -> Positions   (shares: locks a sell's quantity)
             -> Sequencer
             -> MatchingEngine
-                 -> OrderBook
-       -> number the input and every output it produced as one batch
-       -> EventStore::append_record (one framed record, write_all + sync_all)
-       -> commit the prepared core transition
-       -> extend the in-memory event log
-       -> publish complete batch and committed watermark through mmap
+                 -> OrderBook::plan_order (read-only; the live book is never copied)
+       -> number the input and every output it produced as one batch; encode its record
+       -> commit the prepared transition in memory (the next command sees it)
+       -> hold the reply
+     then, once per group:
+       -> EventStore::append_record (all records, one write_all + ONE sync_all)
+       -> publish each complete batch and the committed watermark through mmap
        -> notify local execution callbacks
+       -> release every held reply
        -> periodically replace the journal-bound core snapshot
-       -> reply through temporary oneshot channel
 
 Axum HTTP handler (reads)
   -> same bounded Tokio mpsc command queue
-  -> same exchange worker thread
+  -> same exchange worker thread, inside the same group
   -> ExchangeRuntime
        -> ExchangeCore read method (no event appended, nothing written)
-       -> reply through temporary oneshot channel
+       -> reply held until the group's sync, so a read never shows unsynced state
 
 application startup (main thread, before the listener binds)
   -> validate journal-bound core snapshot when present
@@ -68,7 +70,7 @@ same-host warm replica process
 
 `ExchangeCommand` is live gateway plumbing and may contain `respond_to`. `ExchangeEvent` contains replayable business data and must remain free of HTTP response channels.
 
-`ExchangeRuntime` owns the command receiver, `EventStore`, `StreamWriter`, a journal-bound snapshot schedule, and the ordered in-memory event history. After snapshot recovery that vector contains only the replayed suffix; the complete history remains in the journal. `ExchangeCore` owns the deterministic trading components; it never touches the files. All core operations still run on one exchange-worker thread. `ReplicaCore` is a separate read-only follower core: it has no writer, queue, callbacks, database, or customer routes. Readers and the warm follower are separate consumers, not additional owners of exchange state.
+`ExchangeRuntime` owns the command receiver, `EventStore`, `StreamWriter`, and a journal-bound snapshot schedule. It keeps no event history in production; the complete history is the journal, and an in-memory copy exists only in test builds. Group commit commits each command in memory before its group's sync, so after a failed sync the live core is ahead of the disk: the worker halts, that core is never used again, and recovery from the journal is the only way back. `ExchangeCore` owns the deterministic trading components; it never touches the files. All core operations still run on one exchange-worker thread. `ReplicaCore` is a separate read-only follower core: it has no writer, queue, callbacks, database, or customer routes. Readers and the warm follower are separate consumers, not additional owners of exchange state.
 
 `replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. `ReplicaCore` uses the same complete-batch comparison before it advances its applied checkpoint. Production startup calls `recover_runtime_with_stream_and_snapshot` before binding the listener. A valid versioned, checksummed snapshot is tied to the journal device/inode and a complete-batch byte boundary; it restores the core and replays only the later suffix. A missing, corrupt, inconsistent, or journal-mismatched snapshot is preserved and falls back to full replay. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`; `EVENT_SNAPSHOT_PATH` defaults to that path plus `.snapshot`; and `EVENT_SNAPSHOT_INTERVAL` defaults to 10,000 commands. The journal is authoritative; the mmap file is a disposable delivery cache and the snapshot is only a recovery checkpoint. Warm promotion takes the writer lock with `EventStore::open_existing_matching`, which proves the locked file is the journal the warm followed before reading or repairing it, then fully replays the recovered journal rather than promoting mmap-derived state.
 
@@ -79,9 +81,13 @@ Latest verified status on 2026-09-29, on Linux (the crate uses Unix-only APIs an
 ```text
 cargo fmt -- --check
 cargo test --locked
-131 unit tests + 6 executable integration tests passed; 0 failed
+136 unit tests + the executable integration tests passed; 0 failed
 1 opt-in Reporter acceptance test ignored (needs REPORTER_TEST_DATABASE_URL)
 ```
+
+Measured with `--bench` (Docker Desktop VM, release build): about 37,000–39,000 orders/s on disk at
+maximum rate, 43,000 in memory, and 8,300 with the production snapshot schedule; p99 about 20–30 ms
+at 1,000 orders/s. See `docs/tasks/14-critical-path-performance-v1.md`.
 
 Warm Replica v1 was additionally verified by a live run of the real primary and warm executables against PostgreSQL: a refused promotion while the primary ran, live following, a `SIGKILL` of the primary, a successful promotion, identical balances, positions, and order state on the promoted primary, a new trade there, and one contiguous journal across the hand-off.
 
@@ -498,6 +504,22 @@ Verified on 2026-09-29 on Linux: `cargo fmt -- --check` is clean and `cargo test
 
 This is v1 of the target design's hot-warm engine, not the whole of it. There is no heartbeat, automatic failover, leader election, second host, reliable-UDP or Raft replication, network-partition handling, or RTO/RPO measurement. Promotion replays the whole journal rather than reusing the caught-up warm core, so its duration grows with history.
 
+## 19. Critical-Path Performance v1
+
+Full write-up: `docs/tasks/14-critical-path-performance-v1.md`, with one file per optimization in `docs/performance/`.
+
+The first measurement of the exchange, and the fixes it pointed at. `--bench` (`src/exchange/bench.rs`) drives the real worker, journal, mmap stream and snapshot schedule with a deterministic open-loop workload, records latency from each order's *intended* send time in an HdrHistogram (the answer to coordinated omission), and reports orders per sync and memory. The baseline was 384 orders/s on disk, with about 99% of every order spent waiting for its own `fsync`, and per-order cost that grew with book depth (90 orders/s at 10,000 resting orders even with free syncs).
+
+Three optimizations followed, each measured on its own:
+
+1. **Group commit** (`docs/performance/01-group-commit.md`). The worker stages every queued command (prepared and committed in memory, in queue order), writes all their records with one `write_all` and one `sync_all`, and only then publishes, runs callbacks and releases replies, reads included. Natural batching, with no timer: groups of 1 when quiet and up to 1,024 when busy. Disk throughput went from 384 to 18,713 orders/s, and at a fixed 1,000/s p99 went from 5.1 s to 22 ms. The failure rule changed: after a failed sync the in-memory core is never used again; the worker halts, and a process restart recovers from the journal. Durable-before-visible is unchanged.
+2. **Planned matching** (`docs/performance/02-match-without-copying-the-book.md`). `MatchingEngine::prepare_order` used to clone the whole symbol book to match on a throwaway copy; cancel did too. `OrderBook::plan_order` now works out fills read-only against the live book, and `apply_plan` applies them at commit. The old matcher is kept as a test oracle, and a 20,000-step differential test proves identical executions, books and indexes. Throughput at 10,000 resting orders went from 107 to 52,465 orders/s; 200,000 orders in memory went from 3,309 to 43,438 orders/s.
+3. **No history in RAM** (`docs/performance/03-no-history-in-ram.md`). The runtime's never-read `event_log` vector (600–700 bytes per order, forever) now exists only in test builds. Peak memory at 1,000,000 orders fell from 1.92 GB to 1.32 GB, and throughput from 4,477 to 30,865 orders/s, because the VM had been reclaiming memory at the cost of most of its CPU.
+
+The benchmark also found the next bottleneck: the periodic core snapshot serializes the entire, ever-growing exchange state on the trading thread, which holds the optimized exchange to about 8,300 orders/s. The remaining per-order CPU is spread over preparation (~9 µs), JSON encoding (~7 µs), commit (~6 µs) and per-record mmap publication (~4 µs), and on disk the worker idles during each group's sync.
+
+Verified on 2026-09-29: `cargo fmt -- --check` is clean, `cargo test --locked` passes 136 unit tests and the integration tests, and the release build's warning count is unchanged at 13.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -512,9 +534,11 @@ This is v1 of the target design's hot-warm engine, not the whole of it. There is
 - `Order.leaves_qty` and `ManagedOrder.remaining_quantity` are separate sources of truth for the same number
 - one global minor-unit price scale is assumed; per-product currency and tick-size metadata are not modeled
 - wallet balance credits are checked for overflow before commit
-- the event log is one file that grows without bound; snapshots reduce exchange-core replay work but do not compact or retain less journal history
-- one `fsync` per command; group commit is the marked upgrade path
-- a store write failure halts the worker before the prepared change is committed
+- the event log is one file that grows without bound; snapshots reduce exchange-core replay work but do not compact or retain less journal history; startup reads the part of the journal it replays (all of it without a usable snapshot or on warm promotion, the suffix with one) into memory in one piece rather than streaming it
+- order records, the per-user execution index, and price-level node slots still grow with every order
+- one journal `sync_all` per group of queued commands; the worker waits during it (no pipelined journaler thread yet), and p99 cannot beat the disk's own sync latency
+- the core snapshot serializes the whole exchange state (every order and execution ever) on the worker thread every 10,000 commands, so its cost grows with history; it is the largest remaining throughput limit
+- after a failed journal sync the in-memory core is ahead of the disk; it is never used again, the worker halts, and the process must be restarted to recover from the journal
 - a `client_order_id` is unique forever, never reusable after its order is terminal as FIX permits
 - snapshots rely on the journal file identity and committed boundary; an invalid snapshot falls back to full replay and is retained for diagnosis
 - event-log sequencing and matching-input sequencing remain distinct concepts
@@ -523,7 +547,7 @@ This is v1 of the target design's hot-warm engine, not the whole of it. There is
 - candle state retains every one-minute bucket without a retention limit, rollups, or external historical store
 - there is no public reporting API or trade-tape service
 - mmap is a same-host Unix transport using cooperative file locks, JSON, and a bounded window; it is not lock-free, cross-server replication, or an ingress transport
-- the journal still grows without bound; a snapshot-recovered exchange retains only its suffix in memory, while reader checkpoint validation still scans history on reader restart
+- the journal still grows without bound; reader checkpoint validation still scans history on reader restart
 - mmap is not the durable recovery source; never modify, truncate, replace, or unlink mapped files while processes use them
 - consumer crashes require checkpoint/state coordination; arbitrary downstream effects are not exactly-once
 - internal matching and settlement failures are rejected before commit and halt the worker if they cannot be represented as a business rejection
@@ -535,7 +559,7 @@ This is v1 of the target design's hot-warm engine, not the whole of it. There is
 
 ## What Not To Work On Yet
 
-No next milestone is selected. Do not grow the completed warm replica into automatic failover, heartbeats, leader election, cross-host replication, reliable UDP, or Raft except as a milestone selected for that purpose: each needs its own failure model, fencing rules, and RTO/RPO targets. The same applies to tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, group commit, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, and FIX/SBE. The reporter defects in `DEFERRED_ITEMS.md` are known and should be selected deliberately rather than fixed in passing. The committed mmap reader remains the input for all independent subscribers and for the warm follower; inbound commands remain on the existing bounded Tokio queue.
+No next milestone is selected. The measured candidates, in the order the numbers suggest, are: subscriber throughput (MDP rewrites and syncs its whole state file per command), the core snapshot cost, a pipelined journal sync with per-group mmap publication, then cross-machine replication. Do not grow the completed warm replica into automatic failover, heartbeats, leader election, cross-host replication, reliable UDP, or Raft except as a milestone selected for that purpose: each needs its own failure model, fencing rules, and RTO/RPO targets. The same applies to tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, and FIX/SBE. The reporter defects in `DEFERRED_ITEMS.md` are known and should be selected deliberately rather than fixed in passing. The committed mmap reader remains the input for all independent subscribers and for the warm follower; inbound commands remain on the existing bounded Tokio queue.
 
 ## Rule For Future Sessions
 
