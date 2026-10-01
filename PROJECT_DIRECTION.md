@@ -1,4 +1,4 @@
-# Project Direction - Milestone 21 (Subscribers Keep Up) In Progress
+# Project Direction - Milestone 21 (Subscribers Keep Up) Complete
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -12,7 +12,7 @@ The repository is a learning stock exchange with an exchange-grade architecture 
 
 ## Current Status
 
-The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log, journal-bound core snapshots with suffix replay, and a bounded mmap stream with independent readers and durable catch-up. MDP v1 reconstructs public L2 books independently. Reporter v1 is the second independent subscriber: it consumes the same complete committed batches and atomically projects durable order lifecycle and one-row-per-trade history into PostgreSQL. Its database/checkpoint transaction and restart behavior are verified with an isolated PostgreSQL acceptance test. Same-host Warm Replica v1 independently follows committed batches into a read-only deterministic core and supports a manual, writer-fenced hand-off. Neither subscriber nor the warm follower is on the trading path. Critical-path performance v1 made the exchange measurable (`--bench`) and about 100× faster on disk: the worker group-commits every queued command behind one journal sync, and matching plans fills against the live book instead of copying it.
+The project has a working HTTP-to-exchange boundary, atomic prepare/commit processing, a durable append-only event log, journal-bound core snapshots with suffix replay, and a bounded mmap stream with independent readers and durable catch-up. MDP v1 reconstructs public L2 books independently. Reporter v1 is the second independent subscriber: it consumes the same complete committed batches and atomically projects durable order lifecycle and one-row-per-trade history into PostgreSQL. Its database/checkpoint transactions and restart behavior are verified with isolated PostgreSQL acceptance tests. Same-host Warm Replica v1 independently follows committed batches into a read-only deterministic core and supports a manual, writer-fenced hand-off. Neither subscriber nor the warm follower is on the trading path. Since milestone 21 both subscribers keep up: the MDP applies batches in place and saves once a second, and the reporter commits up to 1,000 batches per PostgreSQL transaction and records rejected submissions and refused cancellations apart from order lifecycles. Critical-path performance v1 made the exchange measurable (`--bench`) and about 100× faster on disk: the worker group-commits every queued command behind one journal sync, and matching plans fills against the live book instead of copying it.
 
 ```text
 Axum HTTP handler
@@ -78,13 +78,14 @@ same-host warm replica process
 
 Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
 
-Latest verified status on 2026-09-29, on Linux (the crate uses Unix-only APIs and does not build on Windows):
+Latest verified status on 2026-09-30, on Linux (the office Ubuntu machine; the crate uses Unix-only APIs and does not build on Windows):
 
 ```text
 cargo fmt -- --check
 cargo test --locked
-136 unit tests + the executable integration tests passed; 0 failed
-1 opt-in Reporter acceptance test ignored (needs REPORTER_TEST_DATABASE_URL)
+142 unit tests + the executable integration tests passed; 0 failed
+2 opt-in Reporter acceptance tests ignored by default (need REPORTER_TEST_DATABASE_URL);
+  both passed against PostgreSQL 16 when run with it
 ```
 
 Measured with `--bench` (Docker Desktop VM, release build): about 37,000–39,000 orders/s on disk at
@@ -95,7 +96,7 @@ replica writes them, up from about 8,300 when the trading thread did. See
 
 Warm Replica v1 was additionally verified by a live run of the real primary and warm executables against PostgreSQL: a refused promotion while the primary ran, live following, a `SIGKILL` of the primary, a successful promotion, identical balances, positions, and order state on the promoted primary, a new trade there, and one contiguous journal across the hand-off.
 
-Verification includes separate OS-process readers, forced writer kills after append and during publication, reader checkpoint resume, the probe executable without a database, and the MDP executable catching up from the journal, serving HTTP, restarting from state, following live publication, and failing closed after a follower error. A manual run with isolated PostgreSQL also drove the real exchange and MDP through rest, partial fill, cancellation, MDP restart, and resumed live publication. Reporter qualification injects a failing checkpoint write after lifecycle/trade writes have begun and proves the whole transaction rolls back; it then proves journal-to-mmap catch-up, multi-fill/cancel/reject projection, and a post-commit Reporter restart without duplicate rows. Snapshot tests prove FIFO core restoration, suffix replay and both sequence continuations, corrupt-snapshot fallback without deleting the artifact, snapshot replacement atomicity, journal identity binding, torn suffix repair, and no snapshot advance after a failed append. These are local correctness tests, not throughput measurements or a machine-power-loss test. Existing compatibility APIs and repository-wide clippy warnings remain.
+Verification includes separate OS-process readers, forced writer kills after append and during publication, reader checkpoint resume, the probe executable without a database, and the MDP executable catching up from the journal, serving HTTP, restarting from state, following live publication, and failing closed after a follower error. A manual run with isolated PostgreSQL also drove the real exchange and MDP through rest, partial fill, cancellation, MDP restart, and resumed live publication. Reporter qualification injects a failing checkpoint write after lifecycle/trade writes have begun and proves the whole transaction rolls back; it then proves journal-to-mmap catch-up, multi-fill/cancel/reject projection (including a retried order id, a reused rejected id, an intruder's cancellation, and two symbols sharing execution ids), and a post-commit Reporter restart without duplicate rows. A second test fails the group after a full 1,000-batch group and proves only that group rolls back. Snapshot tests prove FIFO core restoration, suffix replay and both sequence continuations, corrupt-snapshot fallback without deleting the artifact, snapshot replacement atomicity, journal identity binding, torn suffix repair, and no snapshot advance after a failed append. These are local correctness tests, not throughput measurements or a machine-power-loss test. Existing compatibility APIs and repository-wide clippy warnings remain.
 
 ## Completed Milestones
 
@@ -534,13 +535,100 @@ Measured on disk with snapshots every 10,000 commands: 200,000 orders went from 
 
 Verified on 2026-09-29: `cargo fmt` is clean, `cargo test --locked` passes 138 unit tests and the integration tests, and release warnings are unchanged at 13.
 
-## 21. Subscribers Keep Up (in progress)
+## 21. Subscribers Keep Up
 
-Goal: make the two subscribers follow the exchange at its own speed, and fix the reporter's recorded bugs. Parts: (1) market data applies in place and saves once a second — **complete**; (2) the reporter commits many batches per PostgreSQL transaction — **complete**; (3) reporter bug fixes: a reused order id halting it, a rejected cancellation overwriting the owner's row, and (found by this milestone's benchmark) execution ids that repeat across symbols breaking its unique constraint — pending.
+**Status: completed on 2026-09-30.** Full write-up: `docs/tasks/16-subscribers-keep-up.md`; one file per optimization in `docs/performance/` (`05`, `06`).
+
+Goal: make the two subscribers follow the exchange at its own speed, and fix the reporter's recorded bugs. Parts: (1) market data applies in place and saves once a second — **complete**; (2) the reporter commits many batches per PostgreSQL transaction — **complete**; (3) reporter bug fixes: a reused order id halting it, a rejected cancellation overwriting the owner's row, execution ids that repeat across symbols (found by this milestone's benchmark), plus two problems found by the independent review — **complete**.
 
 **Part 1, complete (2026-09-29).** Write-up: `docs/performance/05-market-data-keeps-up.md`. The MDP used to copy both projections, serialize its whole state, and fsync twice for every command: about 39 commands/s. It now applies each batch in place under one lock holding `Option<View>` (`None` = unavailable, set before the lock is released if a batch fails, so a half-applied view is never served), and saves the view with the checkpoint of its last applied batch at most once a second (counted from the end of the previous save), plus once at the end of catch-up. A crash replays at most about a second of journal onto the last saved pair. A guard withdraws the view if the follower thread ends for any reason. Measured on a 200,000-order journal: catch-up from 39 to about 56,000 commands/s (3.6 s instead of about 86 minutes); live, it stayed within a second of the exchange at 5,000 orders/s and at the exchange's maximum (about 34,500 orders/s). `cargo test` passes 140 unit tests and the market-data executable tests.
 
 **Part 2, complete (2026-09-29).** Write-up: `docs/performance/06-reporter-batched-transactions.md`. The reporter used one PostgreSQL transaction (and so one WAL fsync) per command, and three statements per trade: about 365 commands/s. `apply_available`, used for both catch-up and live following, now applies up to 1,000 batches per transaction and commits them with the checkpoint just after the last applied batch; a group also ends when the reporter is caught up, and any error rolls back the whole group and stops the reporter. Each trade is now one statement: a data-modifying CTE fills both orders and inserts the trade only if both fills applied. Measured on a 200,000-order journal: 365 → 1,050 commands/s with group commit, → 1,578 with one round trip per trade (4.3×). Live, it keeps up at 1,000 orders/s; at 5,000 orders/s it falls behind and drains a 10-second burst in about 21 s. Per-row PostgreSQL work (indexes, foreign keys, row versions) now dominates, so set-based multi-row writes or `COPY` are the next lever. The PostgreSQL acceptance test passes.
+
+**Part 3, complete (2026-09-30).** Write-up: `docs/tasks/16-subscribers-keep-up.md`.
+- (A) A rejected submission, such as a client's retry of an accepted id or an id rejected before, is a row in `rejected_orders`, keyed by its input's journal sequence. It no longer collides with the accepted order's key and halts the reporter.
+- (B) A refused cancellation is a row in `rejected_cancellations` with the requester. It never touches the owner's order row, and a successful cancellation must come from the owner.
+- (C) Execution ids are unique per symbol, because each book numbers its own. The 10-symbol benchmark journal, which stopped the old reporter at event 255, now completes.
+- (D, found by the independent review) Client-supplied order ids and symbols are checked at the gateway: 1–64 bytes, no control characters. A multi-kilobyte cancel id would otherwise have stopped the reporter on every restart, because PostgreSQL cannot index it.
+- (E, found by the review) The reporter's `/health` goes to 503 however its follower thread ends.
+
+The migration `20260930000000_reporter_rejections.sql` runs in one transaction. It empties the report so the reporter rebuilds it from sequence 1, and adds a required `report_version` column so a reporter from before it cannot save a checkpoint. Measured on the office Ubuntu machine, the fixed reporter catches up at about 2,100 commands/s on both the 1-symbol and the 10-symbol journal. The Part 2 code does 1,400–1,900 there, depending on database state, so the fixes cost nothing. `cargo test` passes 142 unit tests and the integration tests; both PostgreSQL acceptance tests pass.
+
+## Selected Next Milestone: 22. Trading Day
+
+**Status: selected on 2026-10-01; not started.** Decisions confirmed by the owner:
+- a loopback operator port opens and closes the market;
+- every order still resting at the close expires (day orders only);
+- the previous day is cleared from memory at the next open;
+- earlier days are read from the reporter's database only.
+
+### Goal
+
+Give the exchange a trading day (open, trade, close) and bound its memory to one day. The design asks for normal trading hours only. Today the exchange accepts orders at any time and keeps every order and fill forever, so its memory, snapshots, restart time and the warm replica's snapshot cost grow without limit. A snapshot was already 82 MB at 200,000 orders. At the design's 1 billion orders a day, memory would run out within hours. LMAX snapshots nightly and replays only the day's journal; this milestone gives the exchange the same shape.
+
+### Behaviour
+
+1. **Sessions are journaled commands, never clock reads.** New inputs `MarketOpenRequested { trading_day }` and `MarketCloseRequested` produce `MarketOpened { trading_day }`, `MarketClosed { trading_day }`, or `SessionRejected { reason }`. The worker processes them like any other command, so replay, the warm replica and every subscriber see exactly the same day boundaries. This is the reason risk limits are events: a decision taken from the clock would replay differently.
+   - `trading_day` is a calendar date chosen by the operator (`2026-10-01`), and each must be later than the last.
+   - Opening an open market or closing a closed one is rejected.
+   - A new journal starts closed.
+2. **While the market is closed, new orders are rejected** with a journaled `OrderRejected` ("market closed"). Deposits, share deposits and risk-limit changes are accepted at any time. A cancellation while closed finds nothing resting and is rejected as today.
+3. **At the close, every resting order expires.** For each one:
+   - its unfilled collateral is released: cash at the limit price for a buy, shares for a sell;
+   - its risk exposure is released;
+   - its state becomes `Expired`, and it leaves the book;
+   - it consumes a matching sequence, as a cancellation does, and the close's journal record carries one `OrderExpired { order_id, seq_num }` for it.
+
+   One record holds every expiry. A close that would exceed the 64 MiB record limit (about 450,000 resting orders) is rejected before anything changes; closing symbol by symbol would be the later fix.
+4. **The next open clears the previous day.** Finished orders (filled, canceled, expired) and the per-user fills index leave memory. Balances, positions, risk limits, and each symbol's book with its execution counter stay, so execution ids never repeat. Daily risk usage restarts from zero, because nothing rests overnight.
+5. **Ids per trading day.** A client order id must be unique within a trading day (the FIX tag 11 rule), and can be reused on a later day. `GET /exchange/orders/{id}` and `GET /exchange/executions` answer for the current or just-closed day; earlier days are in the reporter's PostgreSQL tables.
+6. **The risk day is the trading day.** The order-timestamp day (`RiskManager::roll_day`) and milestone 13's overnight carry-over are removed.
+
+### Components
+
+- **Core** (`core.rs`, `order_manager.rs`, `matching_engine.rs`, `order_book.rs`, `risk_manager.rs`): session state in `ExchangeCore`; a prepared close (expiry plan for every resting order) and its infallible commit; an open that clears the previous day and resets risk; `OrderState::Expired`.
+- **Runtime** (`runtime.rs`, `types.rs`):
+  - new `ExchangeCommand` variants to open, close and read the session;
+  - the closed-market check sits in `prepare_input_event`, the one entry point shared by live processing, replay and the warm replica. Core unit tests that call `ExchangeCore` directly are unaffected.
+- **Operator port** (`main.rs`): a loopback-only listener, `EXCHANGE_OPERATOR_ADDR` (default `127.0.0.1:4004`), with:
+  - `POST /session/open` with `{"trading_day":"2026-10-01"}`;
+  - `POST /session/close`;
+  - `GET /session`.
+
+  It uses the same trust model as the warm replica's management port. A promoted warm replica serves it too, because it uses the same startup path.
+- **Snapshot**: format version 2 adds the session; a version-1 snapshot is refused and falls back to full replay. The warm replica also writes a snapshot just after each open, when the state is smallest.
+- **Shared decoder** (`committed_batch.rs`): `MarketOpened { trading_day }`, and `MarketClosed { trading_day, expired }` listing the expired order ids.
+- **MDP**: removes expired orders from its book at the close; candles are unchanged.
+- **Reporter** (third migration, which again empties the report for a rebuild):
+  - order rows gain `trading_day`, keyed by `(trading_day, order_id)`;
+  - status `expired` is added;
+  - the checkpoint row stores the current trading day, which the reporter learns from the journal.
+- **Benchmark**: opens the market before sending orders; `--days N` runs N trading days (open, orders, close).
+
+### Compatibility
+
+Existing journals do not replay: their orders were accepted with no session open, so replay reports an `OutputMismatch`. Start a new journal, as milestones 9 and 13 required. Market-data state files and the report are rebuilt from the new journal.
+
+### Parts
+
+Each part goes through code, tests, measurement where relevant, its docs, and an update to this journal.
+
+1. Sessions: commands, operator port, closed-market rejection, the risk day from sessions, snapshot version 2.
+2. Expiry at the close, through the decoder, the MDP and the reporter.
+3. Clearing the previous day at the next open: ids per day, reporter keys and migration, the warm replica's snapshot at the open.
+4. Measurement. Compare the milestone 21 binary on the same order volume with no days against the new binary over several days: memory, snapshot size and write time, warm-replica lag, and restart time per day. Write `docs/performance/07-*.md` and `docs/tasks/17-trading-day.md`.
+
+### Completion criteria
+
+- Orders before the first open and after a close are rejected and journaled; deposits work at any time.
+- After a close every book is empty, and balances, locks, positions and risk usage equal what cancelling each resting order would have given.
+- After the next open the previous day's orders and fills are gone from memory, the same client order id is accepted again, and no execution id repeats.
+- Replay, snapshot recovery and warm-replica following across open, close and open rebuild identical state; a promoted warm replica serves the operator port.
+- The MDP's book is empty after a close. The reporter records expired orders and per-day keys, and restarts without duplicates.
+- The multi-day benchmark shows memory, snapshot size and restart time staying flat across days.
+- `cargo fmt -- --check`, `cargo test --locked`, both PostgreSQL acceptance tests and an independent review all pass.
+
+Not in this milestone: opening or closing auctions, a holiday calendar or automatic schedule, good-till-cancel orders, market orders, journal files per day or archival, and a reporting or history API.
 
 ## Known Prototype Limitations
 
@@ -551,7 +639,7 @@ Goal: make the two subscribers follow the exchange at its own speed, and fix the
 - short selling is not supported at all: a sell must be fully backed by shares held, with no borrow model
 - settlement is instant at match; there is no T+1/T+2 settlement cycle or pending-position concept
 - share deposits let anyone credit themselves any quantity, exactly as cash deposits do; both are placeholders for real custody
-- there is no product/instrument registry, so a share or risk-limit request accepts any non-empty symbol string
+- there is no product/instrument registry, so orders, share deposits and risk limits accept any symbol of 1-64 bytes without control characters
 - self-trade prevention skips the aggressor's own orders but cannot stop a user crossing against themselves; that needs engine-generated cancellations
 - `Order.leaves_qty` and `ManagedOrder.remaining_quantity` are separate sources of truth for the same number
 - one global minor-unit price scale is assumed; per-product currency and tick-size metadata are not modeled
@@ -579,11 +667,12 @@ Goal: make the two subscribers follow the exchange at its own speed, and fix the
 - promotion replays the entire journal instead of reusing the caught-up warm core, so its duration grows with history
 - the warm replica's management API is unauthenticated and loopback-only; `202` from `/promote` means the old writer is fenced, not that the customer listener is ready
 - the crate uses Unix-only APIs (advisory file locks, device/inode journal identity, mmap) and builds and tests on Linux only
-- Reporter has two recorded correctness defects — a reused client order id halts it permanently, and a rejected cancellation overwrites the owner's order row; see `DEFERRED_ITEMS.md`
+- the reporter applies about 1,600 commands/s: it keeps up at 1,000 orders/s but falls behind a sustained faster exchange and catches up afterwards; set-based writes or `COPY` are the next lever
+- the report keys accepted orders by `order_id` and trades' execution ids by symbol, which is correct only while ids are never reused; a trading-day boundary must revisit both first (`DEFERRED_ITEMS.md`)
 
 ## What Not To Work On Yet
 
-No next milestone is selected. The planned order is: a trading-day boundary that bounds ever-growing state (and so snapshot size), subscriber throughput (MDP rewrites and syncs its whole state file per command, about 84 commands/s), then journal replication to a second machine. A pipelined journal sync with per-group mmap publication and promotion from the warm replica's own snapshot are smaller follow-ups. Do not grow the completed warm replica into automatic failover, heartbeats, leader election, cross-host replication, reliable UDP, or Raft except as a milestone selected for that purpose: each needs its own failure model, fencing rules, and RTO/RPO targets. The same applies to tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, and FIX/SBE. The reporter defects in `DEFERRED_ITEMS.md` are known and should be selected deliberately rather than fixed in passing. The committed mmap reader remains the input for all independent subscribers and for the warm follower; inbound commands remain on the existing bounded Tokio queue.
+Milestone 22, the trading day, is selected; its specification is the section above. After it comes journal replication to a second machine with manual, epoch-fenced promotion and measured RPO/RTO. The trading day must change the report keys recorded in `DEFERRED_ITEMS.md` before it lets an order id be reused. A pipelined journal sync with per-group mmap publication, promotion from the warm replica's own snapshot, and set-based reporter writes are smaller follow-ups. Do not grow the completed warm replica into automatic failover, heartbeats, leader election, cross-host replication, reliable UDP, or Raft except as a milestone selected for that purpose: each needs its own failure model, fencing rules, and RTO/RPO targets. The same applies to tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, and FIX/SBE. The committed mmap reader remains the input for all independent subscribers and for the warm follower; inbound commands remain on the existing bounded Tokio queue.
 
 ## Rule For Future Sessions
 

@@ -27,9 +27,27 @@ pub struct ShareDepositRequest {
     pub quantity: u64,
 }
 
-/// Bound on a client-supplied order id. It becomes a map key held for the life of the order, so it
-/// is checked at the edge rather than trusted.
-const MAX_CLIENT_ORDER_ID_LEN: usize = 64;
+/// Bound on a client-supplied identifier: an order id or a symbol. Identifiers become map keys,
+/// journal fields and reporting index keys, so they are checked at the edge rather than trusted:
+/// PostgreSQL cannot store a NUL byte, and a btree index entry holds at most about 2.7 KB. One
+/// oversized or binary value accepted into the journal would stop the reporter at that record on
+/// every restart.
+const MAX_IDENTIFIER_LEN: usize = 64;
+
+/// Trims a client-supplied identifier and requires 1 to `MAX_IDENTIFIER_LEN` bytes with no control
+/// characters.
+fn identifier(field: &str, value: &str) -> Result<String, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_IDENTIFIER_LEN
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(AppError::Validation(format!(
+            "{field} must be 1 to {MAX_IDENTIFIER_LEN} characters, none of them control characters"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
 
 #[derive(Deserialize)]
 pub struct OrderRequest {
@@ -122,25 +140,15 @@ pub async fn place_order(
     // A client-supplied id is what makes a retry recognisable as a retry; a generated one is
     // unique every time, so the duplicate check can never fire on it.
     let order_id = match payload.client_order_id {
-        Some(client_order_id) => {
-            let trimmed = client_order_id.trim();
-
-            if trimmed.is_empty() || trimmed.len() > MAX_CLIENT_ORDER_ID_LEN {
-                return Err(AppError::Validation(format!(
-                    "client_order_id must be 1 to {} characters",
-                    MAX_CLIENT_ORDER_ID_LEN
-                )));
-            }
-
-            trimmed.to_string()
-        }
+        Some(client_order_id) => identifier("client_order_id", &client_order_id)?,
         None => Uuid::new_v4().to_string(),
     };
+    let symbol = identifier("symbol", &payload.symbol)?;
 
     let order = Order::new(
         order_id,
         auth.user_id.clone(),
-        payload.symbol,
+        symbol,
         &payload.side,
         payload.price,
         payload.quantity,
@@ -172,11 +180,7 @@ pub async fn deposit_shares(
     auth: AuthUser,
     Json(payload): Json<ShareDepositRequest>,
 ) -> Result<StatusCode, AppError> {
-    let symbol = payload.symbol.trim();
-
-    if symbol.is_empty() {
-        return Err(AppError::Validation("symbol is required".to_string()));
-    }
+    let symbol = identifier("symbol", &payload.symbol)?;
 
     if payload.quantity == 0 {
         return Err(AppError::Validation(
@@ -186,7 +190,7 @@ pub async fn deposit_shares(
 
     ask(&state, |respond_to| ExchangeCommand::DepositShares {
         user_id: auth.user_id,
-        symbol: symbol.to_string(),
+        symbol,
         quantity: payload.quantity,
         respond_to,
     })
@@ -217,15 +221,11 @@ pub async fn set_risk_limit(
     auth: AuthUser,
     Json(payload): Json<RiskLimitRequest>,
 ) -> Result<StatusCode, AppError> {
-    let symbol = payload.symbol.trim();
-
-    if symbol.is_empty() {
-        return Err(AppError::Validation("symbol is required".to_string()));
-    }
+    let symbol = identifier("symbol", &payload.symbol)?;
 
     ask(&state, |respond_to| ExchangeCommand::SetRiskLimit {
         user_id: auth.user_id,
-        symbol: symbol.to_string(),
+        symbol,
         max_daily_quantity: payload.max_daily_quantity,
         respond_to,
     })
@@ -308,8 +308,11 @@ pub async fn cancel_order(
     auth: AuthUser,
     Json(payload): Json<CancelRequest>,
 ) -> Result<StatusCode, AppError> {
+    // No order can have an id that fails the identifier check, so such a request is answered
+    // without being journaled.
+    let order_id = identifier("order_id", &payload.order_id).map_err(|_| AppError::NotFound)?;
     ask(&state, |respond_to| ExchangeCommand::CancelOrder {
-        order_id: payload.order_id,
+        order_id,
         user_id: auth.user_id,
         respond_to,
     })
@@ -323,4 +326,22 @@ pub async fn cancel_order(
     })?;
 
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifiers_are_trimmed_bounded_and_printable() {
+        assert_eq!(
+            identifier("symbol", "  AAPL ").ok().as_deref(),
+            Some("AAPL")
+        );
+        assert!(identifier("symbol", &"x".repeat(MAX_IDENTIFIER_LEN)).is_ok());
+        assert!(identifier("symbol", &"x".repeat(MAX_IDENTIFIER_LEN + 1)).is_err());
+        assert!(identifier("symbol", "   ").is_err());
+        assert!(identifier("order_id", "abc\0def").is_err());
+        assert!(identifier("order_id", "abc\ndef").is_err());
+    }
 }

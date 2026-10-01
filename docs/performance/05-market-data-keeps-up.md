@@ -155,15 +155,21 @@ without it.
 ## Tests
 
 - `a_failed_batch_is_never_served_or_saved`: two good batches, each saved (interval zero), then a
-  batch with a duplicated execution id. The step fails, the view becomes `None`, a save attempt
-  fails because there is nothing to save, and the state file is byte-for-byte unchanged.
+  buy with two trades. The shared decoder accepts it, but the second trade names an order the
+  projection never saw, so the step fails after the first trade has already changed the book in
+  place. The view becomes `None`, a save attempt fails because there is nothing to save, and the
+  state file is byte-for-byte unchanged. (The first version of this test used a duplicated
+  execution id, which the decoder rejects before anything changes, so it never produced a
+  half-applied view. The independent review caught that.)
 - `unsaved_batches_wait_for_the_interval_and_the_final_save_catches_up`: with a long interval, two
   batches are served immediately but not saved; the explicit final save writes them with the right
   checkpoint.
 - `restarting_from_an_older_save_replays_to_the_same_view`: the real exchange produces deposits, two
-  sells and a crossing buy. One follower saves after the first batch and then applies the rest
-  unsaved, as if it crashed. A second follower loads that older save and replays, and ends with an
-  identical book and candles (one trade, one candle, one ask, one bid).
+  sells, a crossing buy and a third sell. One follower saves right after the trade and then applies
+  the last batch unsaved, as if it crashed. A second follower loads that save and replays, and ends
+  with an identical book and candles: one candle of volume 5, so the trade was not applied twice.
+  (Saving after the first batch, as the first version did, saved an empty state that could not show
+  double counting.)
 - The three executable tests in `tests/market_data.rs` (catch-up, restart, live following, candles,
   and a corrupt state file) pass unchanged.
 - The candle test that required "nothing changes on a failed batch" now only requires the failure.

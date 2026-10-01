@@ -394,6 +394,38 @@ Full write-up: `docs/tasks/15-snapshots-by-the-warm-replica.md`; measurements in
 - Throughput with snapshots every 10,000 commands: about 8,300 -> about 21,900 orders/s; at 5,000 orders/s the worst latency went from 0.7-1.04 s to 170-442 ms.
 - `cargo test --locked` passes 138 unit tests and the integration tests; release warnings unchanged at 13.
 
+## Completed Milestone - Subscribers Keep Up
+
+Full write-up: `docs/tasks/16-subscribers-keep-up.md`; measurements in `docs/performance/05-market-data-keeps-up.md` and `docs/performance/06-reporter-batched-transactions.md`.
+
+- [x] MDP: serve one `RwLock<Option<View>>` (book, candles, applied checkpoint); apply each batch in place; withdraw the whole view (`None`) before releasing the lock if a batch fails.
+- [x] MDP: save the view with its applied checkpoint at most once a second, counted from the end of the previous save, plus once at the end of catch-up; never on an error path.
+- [x] MDP: withdraw the view when the follower thread ends for any reason; remove the candle projection's internal copy.
+- [x] Reporter: apply up to 1,000 batches per PostgreSQL transaction, committed with the checkpoint just after the last applied batch; end a group when caught up; one code path for catch-up and following.
+- [x] Reporter: record each trade in one statement (data-modifying CTE).
+- [x] Reporter: record rejected submissions in `rejected_orders` and refused cancellations (with the requester) in `rejected_cancellations`, keyed by the input's journal sequence; keep only accepted orders in `reported_orders`; require the owner on a successful cancellation.
+- [x] Reporter: make execution ids unique per symbol; add the `20260930000000_reporter_rejections.sql` migration.
+- [x] Measure each optimization separately and write one document per optimization plus the task write-up.
+
+### Acceptance Criteria - Verified
+
+- MDP catch-up about 39 -> about 56,000 commands/s; live, within a second of the exchange at 5,000 orders/s and at its maximum (about 34,500 orders/s).
+- Reporter catch-up about 365 -> 1,050 (group commit) -> 1,578 commands/s (one round trip per trade); live, it keeps up at 1,000 orders/s.
+- A failed MDP batch is never served or saved; a restart from an older save replays to an identical view.
+- A failure in a reporter group rolls back only that group; the previous 1,000-batch group and its checkpoint stay committed, and a restart applies the rest exactly once.
+- A retried or reused order id, an intruder's cancellation, a cancellation of an already-canceled order, and two symbols with the same execution ids are all recorded correctly, without halting the reporter or changing an owner's row.
+- On the office Ubuntu machine the fixed reporter catches up at about 2,100 commands/s on both the 1-symbol and the 10-symbol journal; the 10-symbol journal used to stop it at event 255.
+- Client-supplied order ids and symbols are limited to 1-64 bytes with no control characters at the gateway, so no journaled value can stop the reporter.
+- `cargo fmt -- --check` clean; `cargo test --locked` passes 142 unit tests and the integration tests; both PostgreSQL acceptance tests pass.
+
 ## Next Milestone
 
-No next milestone is selected. Planned order: a trading-day boundary that bounds ever-growing state (and so snapshot size), subscriber throughput (MDP rewrites and syncs its whole state per command), then journal replication to a second machine. Smaller follow-ups: a pipelined journal sync with per-group mmap publication, and promotion from the warm replica's own snapshot. Two Reporter correctness defects are recorded in `DEFERRED_ITEMS.md`.
+Selected: milestone 22, Trading Day. The specification is in `PROJECT_DIRECTION.md` ("Selected Next Milestone: 22. Trading Day"). Not started.
+
+- [ ] Part 1: session commands (`MarketOpenRequested` / `MarketCloseRequested`), the loopback operator port, closed-market rejection in `prepare_input_event`, the risk day from sessions, snapshot version 2.
+- [ ] Part 2: expiry of every resting order at the close (`OrderExpired`, collateral and risk released), through the shared decoder, the MDP and the reporter.
+- [ ] Part 3: clearing the previous day at the next open; client order ids unique per trading day; reporter keys `(trading_day, order_id)` and the third migration; a warm-replica snapshot after each open.
+- [ ] Part 4: multi-day benchmark (`--bench --days N`) against the milestone 21 binary; `docs/performance/07-*.md`, `docs/tasks/17-trading-day.md`.
+- [ ] Update `PROJECT_DIRECTION.md` after every part; independent review; `cargo fmt -- --check`, `cargo test --locked`, PostgreSQL acceptance tests.
+
+After it: journal replication to a second machine. Smaller follow-ups: a pipelined journal sync with per-group mmap publication, promotion from the warm replica's own snapshot, and set-based reporter writes.

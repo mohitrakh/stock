@@ -123,7 +123,13 @@ it catches up after the burst: the 10-second burst at 5,000/s took about 21 s to
 
 ## Tests
 
-The PostgreSQL acceptance test (`tests/reporter.rs`, run against a disposable PostgreSQL) passes
-unchanged with both steps. Its six-batch fixture is now one transaction. Its injected checkpoint
-failure therefore rolls back the entire group, and the test's "nothing was written" check holds.
-Part 3 of this milestone extends the test with a group that crosses the 1,000-batch boundary.
+The PostgreSQL acceptance test (`tests/reporter.rs`, run against a disposable PostgreSQL) passed
+unchanged with both steps. Its fixture, then six batches, became one transaction, and its injected
+checkpoint failure still left nothing written. That test cannot tell a group from single batches,
+though: every checkpoint write fails either way.
+
+Part 3 of this milestone added `a_failed_group_rolls_back_only_itself`, which crosses the
+1,000-batch boundary. Its journal holds 1,000 resting orders, then a trade, then an order whose
+insert a database trigger refuses. After the failure, exactly the first 1,000 orders are in the
+database, with the checkpoint just after the 1,000th batch. The trade was rolled back with its
+group, so its resting order is still `new`. A restart applies the last two batches exactly once.

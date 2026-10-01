@@ -41,3 +41,45 @@ reporter reached 103443 2418 ms after the benchmark finished
 journal's last command starts at "seq_num":172155; reporter checkpoint when the benchmark finished: 51691
 reporter reached 172157 21412 ms after the benchmark finished
 (the drain time includes about 2.4 s of measurement overhead before the first poll; at 1,000/s the checkpoint already equalled the journal end when the benchmark finished)
+
+# part 3 (reporter bug fixes): catch-up from empty tables, measured on the office Ubuntu machine
+# (Intel i3-7100, 2 cores / 4 threads, SATA SSD, Ubuntu 22.04; PostgreSQL 16 in Docker; not the
+# Docker Desktop VM used above, so compare only rows measured on the same machine)
+# journals: --bench --orders 200000 --users 10 with --symbols 1 (200,020 commands) and --symbols 10 (200,110 commands)
+bench while creating them on this machine: 44,461 orders/s (1 symbol), 42,486 orders/s (10 symbols)
+=== part3: reporter catch-up from empty tables, 200020 commands (/data/j1)
+  caught up in 95832 ms = 2087 commands/s
+  next_sequence 689381 trades 144670 orders 200000
+=== part3: reporter catch-up from empty tables, 200110 commands (/data/j10)
+  caught up in 95178 ms = 2102 commands/s
+  next_sequence 689043 trades 144411 orders 200000
+  rejected orders 0 rejected cancels 0 symbols with trades 10
+=== part2 binary (stock-m21rep2, built on the Docker Desktop VM), same machine, old schema
+  one-symbol journal: caught up in 142342 ms = 1405 commands/s (same rows and checkpoint)
+  ten-symbol journal: reporter exited: duplicate key value violates unique constraint "reported_trades_first_execution_id_key"
+# fair A/B on the one-symbol journal: alternating runs, PostgreSQL CHECKPOINT before each
+  part2 round 1: 134014 ms = 1492 commands/s     part3 round 1: 95301 ms = 2098 commands/s
+  part2 round 2: 129973 ms = 1538 commands/s     part3 round 2: 93390 ms = 2141 commands/s
+# is it the build? part 2's reporter code rebuilt on this machine with the same toolchain
+  part2 rebuilt: 142442 ms = 1404 commands/s     part3: 93635 ms = 2136 commands/s
+# where the time goes: freshly started PostgreSQL 16 with pg_stat_statements, one run each
+# columns: calls | total ms | mean ms | statement
+=== part2 (rebuilt here): reporter catch-up from empty tables, 200020 commands (/data/j1)
+  caught up in 106710 ms = 1874 commands/s
+144670 | 41881 | 0.2895 | WITH filled AS ( UPDATE reported_orders ... INSERT INTO reported_trades ...   (one per trade)
+200000 | 19693 | 0.0985 | INSERT INTO reported_orders ...
+289340 |  2428 | 0.0084 | foreign-key check SELECT ... FROM ONLY reported_orders ... FOR KEY SHARE
+   201 |     7 | 0.0349 | INSERT INTO reporter_checkpoint ...   (once per group)
+  total PostgreSQL execution ms: 64091
+=== part3: reporter catch-up from empty tables, 200020 commands (/data/j1)
+  caught up in 95029 ms = 2104 commands/s
+144670 | 32927 | 0.2276 | WITH filled AS ( UPDATE reported_orders ... INSERT INTO reported_trades ...
+200000 | 18644 | 0.0932 | INSERT INTO reported_orders ...
+289340 |  2415 | 0.0083 | foreign-key check
+   201 |     8 | 0.0377 | INSERT INTO reporter_checkpoint ...
+  total PostgreSQL execution ms: 54088
+# reading: part 3 is not slower. On a fresh database it is 12% faster, and the whole difference is
+# PostgreSQL execution time, mostly the trade statement. The larger gap in the earlier runs came
+# from database state: the same part-2 code did 1,404-1,538 commands/s on a PostgreSQL that had
+# already served many runs, and 1,874 on a fresh one; part 3 did about 2,100 on both.
+# Outside PostgreSQL (decode, round trips, client) each run spends about 41-43 s.

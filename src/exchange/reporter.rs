@@ -118,9 +118,11 @@ async fn save_checkpoint(
     let inode = field("inode")?;
     let next_sequence = field("next_sequence")?;
     let byte_offset = field("byte_offset")?;
+    // report_version 2 is the milestone 21 schema. The column has no default, so a reporter built
+    // before it cannot save a checkpoint into a migrated database.
     sqlx::query(
-        "INSERT INTO reporter_checkpoint (singleton, journal_device, journal_inode, next_sequence, byte_offset) \
-         VALUES ($1, $2::numeric, $3::numeric, $4::numeric, $5::numeric) \
+        "INSERT INTO reporter_checkpoint (singleton, report_version, journal_device, journal_inode, next_sequence, byte_offset) \
+         VALUES ($1, 2, $2::numeric, $3::numeric, $4::numeric, $5::numeric) \
          ON CONFLICT (singleton) DO UPDATE SET journal_device = EXCLUDED.journal_device, \
          journal_inode = EXCLUDED.journal_inode, next_sequence = EXCLUDED.next_sequence, byte_offset = EXCLUDED.byte_offset",
     ).bind(CHECKPOINT_ID).bind(number(device)).bind(number(inode))
@@ -240,7 +242,7 @@ async fn apply_command(
             // The engine lets only the owner cancel, so checking the owner costs nothing and stops
             // the reporter if the journal and this projection ever disagree.
             let updated = sqlx::query(
-                "UPDATE reported_orders SET status = 'canceled', cancellation_sequence = $1::numeric, cancellation_outcome = 'canceled', cancellation_reason = NULL \
+                "UPDATE reported_orders SET status = 'canceled', cancellation_sequence = $1::numeric \
                  WHERE order_id = $2 AND user_id = $3 AND status IN ('new', 'partially_filled')",
             ).bind(number(matching_sequence)).bind(order_id).bind(user_id).execute(&mut **tx).await?;
             if updated.rows_affected() != 1 {
@@ -327,6 +329,16 @@ struct ReporterState {
     available: Arc<AtomicBool>,
 }
 
+/// Marks the reporter unavailable when the follower thread ends for any reason, a panic included,
+/// so `/health` never answers 200 for a report that has stopped moving.
+struct UnavailableOnExit(Arc<AtomicBool>);
+
+impl Drop for UnavailableOnExit {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 async fn health(State(state): State<ReporterState>) -> impl IntoResponse {
     if state.available.load(Ordering::Acquire) {
         (StatusCode::OK, "OK")
@@ -360,6 +372,7 @@ pub async fn run(args: &[String]) -> ReporterResult<()> {
     thread::Builder::new()
         .name("reporter-follower".into())
         .spawn(move || {
+            let _unavailable_on_exit = UnavailableOnExit(follower_available);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();
@@ -371,7 +384,6 @@ pub async fn run(args: &[String]) -> ReporterResult<()> {
                 Ok(()) => {}
                 Err(error) => eprintln!("reporter follower halted: {error}"),
             }
-            follower_available.store(false, Ordering::Release);
         })?;
 
     let app = Router::new()

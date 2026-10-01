@@ -13,3 +13,4 @@ exchange-events.log
 !docs/tasks/14-critical-path-performance-v1.md
 !docs/performance/*.md
 !docs/tasks/15-snapshots-by-the-warm-replica.md
+!docs/tasks/16-subscribers-keep-up.md

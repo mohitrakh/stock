@@ -15,36 +15,19 @@ the core, event schema, committed-batch decoder, MDP, Reporter, snapshots, and r
 
 It remains deferred. No claim is made here that the concern has been fixed.
 
-## Reporter halts permanently on a reused client order id
+## Report identities that assume ids are never reused
 
-Every new-order batch, accepted or rejected, becomes a plain `INSERT` into `reported_orders`,
-whose primary key is `order_id` (`reporter.rs`, `insert_order`, called for both outcomes). A client
-that retries an order with the same `client_order_id` — exactly the retry that id exists for —
-receives `409` from the exchange, and the journal records `OrderRejected` carrying that same
-`order_id`. The reporter then inserts a second row with an existing key; the transaction rolls
-back and the follower halts. Every restart replays the same batch and fails the same way, so the
-reporter stays down until someone intervenes. Trading and MDP are unaffected.
+Milestone 21 fixed the reporter's two recorded defects (a reused client order id halting it, and a
+refused cancellation overwriting the owner's row) and a third found by its benchmark (execution ids
+repeating across symbols). See `docs/tasks/16-subscribers-keep-up.md`. The fixes leave two keys
+that are correct only under today's engine rules:
 
-The trigger is ordinary retry behavior, not an attack or a corrupt journal. The live warm-replica
-run on 2026-09-29 performed exactly such a retry after promotion; no reporter was running.
+- `reported_orders` is keyed by `order_id`. That holds because the engine never accepts an id
+  twice: its duplicate check covers every order it has ever accepted, including finished ones.
+- `reported_trades` keeps `(symbol, execution id)` unique. That holds because each symbol's book
+  numbers its executions from `exec_0` once and never restarts the count.
 
-Confirmed by reading the code path end to end; not yet reproduced against PostgreSQL. A fix needs
-a decision on how a rejected duplicate submission is recorded — for example a separate
-rejected-submission table keyed by journal sequence rather than by `order_id` — and a regression
-case in the reporter acceptance test.
-
-## Rejected cancellation overwrites the owner's order row
-
-A rejected cancellation runs `UPDATE reported_orders SET cancellation_outcome = 'rejected' ...
-WHERE order_id = $2`, with no ownership, status, or affected-row check. The committed-batch decoder
-also discards the requester's `user_id` (`CancelOrderRequested { order_id, .. }`), so the reporter
-cannot tell whose attempt it was. Two consequences:
-
-- A user who tries to cancel someone else's order is refused by the exchange as `Unauthorized`,
-  yet the reporter writes that rejection onto the owner's row.
-- A rejected attempt to cancel an already-canceled order leaves `status = 'canceled'` beside
-  `cancellation_outcome = 'rejected'`.
-
-The schema has no constraint tying the cancellation columns to `status`. A fix likely records
-rejected cancellation attempts separately from the order's own lifecycle, keyed by journal
-sequence and carrying the requester.
+A trading-day boundary would likely break both. FIX only requires a client order id to be unique
+within one trading day, and books emptied at the close could restart their execution numbering. Such
+a milestone must first change these keys, for example to include the trading day or to use the
+journal sequence that already identifies each trade and each acceptance.

@@ -211,9 +211,7 @@ impl MarketDataProjection {
             CommittedCommand::NewOrder { order, outcome } => self.apply_new_order(&order, outcome),
             CommittedCommand::Cancellation {
                 order_id, outcome, ..
-            } => {
-                self.apply_cancellation(&order_id, outcome)
-            }
+            } => self.apply_cancellation(&order_id, outcome),
             CommittedCommand::Other => Ok(()),
         }
     }
@@ -1292,12 +1290,12 @@ mod tests {
         ] {
             publish(&mut store, &mut writer, &numbered(batch, &mut next));
         }
+        // The shared decoder accepts this batch. The projection fails on its second trade, which
+        // names an order it never saw, after the first trade has already changed the book in place.
         let mut executions = pair("first", "buy", "sell-1", 100, 1);
-        let mut second_pair = pair("second", "buy", "sell-2", 100, 1);
-        second_pair[0].execution_id = executions[0].execution_id.clone();
-        executions.extend(second_pair);
-        let malformed = accepted(order("buy", "buyer", "BUY", 100, 2), executions);
-        publish(&mut store, &mut writer, &numbered(malformed, &mut next));
+        executions.extend(pair("second", "buy", "ghost", 100, 1));
+        let half_applied = accepted(order("buy", "buyer", "BUY", 100, 2), executions);
+        publish(&mut store, &mut writer, &numbered(half_applied, &mut next));
 
         let state_path = fixture.dir.join("market-data.json");
         let reader = fixture.reader();
@@ -1379,7 +1377,7 @@ mod tests {
             ExchangeCommand::DepositShares {
                 user_id: "seller".into(),
                 symbol: "AAPL".into(),
-                quantity: 10,
+                quantity: 12,
                 respond_to,
             },
         );
@@ -1398,6 +1396,7 @@ mod tests {
             ("sell-1", "seller", "SELL", 100, 5),
             ("sell-2", "seller", "SELL", 102, 5),
             ("buy-1", "buyer", "BUY", 101, 7),
+            ("sell-3", "seller", "SELL", 103, 2),
         ] {
             let (respond_to, reply) = oneshot::channel();
             send(
@@ -1412,8 +1411,9 @@ mod tests {
         drop(tx);
         worker.join().unwrap();
 
-        // First run: save after the first batch only, then apply the rest without saving,
-        // as a crash between two saves would leave it.
+        // First run: save once the trade (the fifth batch) has been applied, then apply the last
+        // batch without saving, as a crash between two saves would leave it. A restart that
+        // applied the trade a second time would double the candle's volume.
         let state_path = fixture.dir.join("market-data.json");
         let reader = fixture.reader();
         let served = empty_view(&reader);
@@ -1423,7 +1423,9 @@ mod tests {
             state_path.clone(),
             Duration::from_secs(3600),
         );
-        assert!(first.step().unwrap());
+        for _ in 0..5 {
+            assert!(first.step().unwrap());
+        }
         first.save().unwrap();
         while first.step().unwrap() {}
         let expected = {
@@ -1462,12 +1464,14 @@ mod tests {
             ),
             expected
         );
-        // One trade (5 at 100) made one candle; sell-2 still rests, and buy-1's remainder bids.
+        // One trade (5 at 100) made one candle of volume 5; sell-2 and sell-3 rest, and buy-1's
+        // remainder bids.
         let book = expected.0.unwrap();
         assert_eq!(
             (book.asks.len(), book.bids.len(), expected.1.len()),
-            (1, 1, 1)
+            (2, 1, 1)
         );
+        assert_eq!(expected.1[0].volume, 5);
     }
 
     #[test]

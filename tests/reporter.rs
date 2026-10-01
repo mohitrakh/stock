@@ -1,8 +1,8 @@
 //! Isolated PostgreSQL acceptance for Reporter recovery. Run with:
 //! REPORTER_TEST_DATABASE_URL=postgresql://... cargo test --test reporter -- --ignored --nocapture
 //!
-//! The supplied database is deliberately reset by this test. It must not be shared with a real
-//! application or another test run.
+//! The supplied database is deliberately reset by these tests, one test at a time. It must not be
+//! shared with a real application or another test run.
 
 use std::{
     fs,
@@ -11,11 +11,19 @@ use std::{
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
 const CAPACITY: usize = 4096;
+/// The reporter's migrations, applied in this order.
+const MIGRATIONS: [&str; 2] = [
+    "20260926000000_create_reporter_tables.sql",
+    "20260930000000_reporter_rejections.sql",
+];
+/// Every test resets the one supplied database, so they must never overlap.
+static DATABASE: Mutex<()> = Mutex::new(());
 
 fn crc(bytes: &[u8]) -> u32 {
     let mut value = !0u32;
@@ -45,36 +53,40 @@ fn order(
     first_sequence: u64,
     id: &str,
     user: &str,
+    symbol: &str,
     side: &str,
     quantity: u32,
 ) -> serde_json::Value {
     serde_json::json!({
         "seq_num": first_sequence,
         "event": {"direction":"input","event":{"kind":"new_order_requested","data":{"order":{
-            "order_id":id,"user_id":user,"symbol":"AAPL","side":side,
+            "order_id":id,"user_id":user,"symbol":symbol,"side":side,
             "price":100,"quantity":quantity,"leaves_qty":quantity,"timestamp":1.0,"seq_num":0
         }}}}
     })
 }
 
-fn execution(id: &str, buy: &str, sell: &str, quantity: u32, timestamp: f64) -> serde_json::Value {
+fn execution(id: &str, buy: &str, sell: &str, symbol: &str, quantity: u32) -> serde_json::Value {
     serde_json::json!({
-        "execution_id":id,"buy_order_id":buy,"sell_order_id":sell,"symbol":"AAPL",
-        "price":100,"quantity":quantity,"timestamp":timestamp
+        "execution_id":id,"buy_order_id":buy,"sell_order_id":sell,"symbol":symbol,
+        "price":100,"quantity":quantity,"timestamp":3.0
     })
 }
 
+fn order_id(input: &serde_json::Value) -> serde_json::Value {
+    input["event"]["event"]["data"]["order"]["order_id"].clone()
+}
+
+/// The input, its acceptance, then each execution record in the order given.
 fn accepted_order(
-    first_sequence: u64,
-    id: &str,
-    user: &str,
-    side: &str,
-    quantity: u32,
+    input: serde_json::Value,
     matching_sequence: u64,
     executions: &[serde_json::Value],
 ) -> Vec<u8> {
+    let first_sequence = input["seq_num"].as_u64().unwrap();
+    let id = order_id(&input);
     let mut events = vec![
-        order(first_sequence, id, user, side, quantity),
+        input,
         serde_json::json!({
             "seq_num": first_sequence + 1,
             "event":{"direction":"output","event":{"kind":"order_accepted","data":{"order_id":id,"seq_num":matching_sequence}}}
@@ -89,10 +101,12 @@ fn accepted_order(
     record(serde_json::Value::Array(events))
 }
 
-fn rejected_order(first_sequence: u64, id: &str, user: &str) -> Vec<u8> {
+fn rejected_order(input: serde_json::Value, reason: &str) -> Vec<u8> {
+    let first_sequence = input["seq_num"].as_u64().unwrap();
+    let id = order_id(&input);
     record(serde_json::json!([
-        order(first_sequence, id, user, "buy", 1),
-        {"seq_num":first_sequence + 1,"event":{"direction":"output","event":{"kind":"order_rejected","data":{"order_id":id,"reason":"no funds"}}}}
+        input,
+        {"seq_num":first_sequence + 1,"event":{"direction":"output","event":{"kind":"order_rejected","data":{"order_id":id,"reason":reason}}}}
     ]))
 }
 
@@ -103,46 +117,73 @@ fn canceled(first_sequence: u64, order_id: &str, user_id: &str, matching_sequenc
     ]))
 }
 
-fn cancel_rejected(first_sequence: u64, order_id: &str, user_id: &str) -> Vec<u8> {
+fn cancel_rejected(first_sequence: u64, order_id: &str, user_id: &str, reason: &str) -> Vec<u8> {
     record(serde_json::json!([
         {"seq_num":first_sequence,"event":{"direction":"input","event":{"kind":"cancel_order_requested","data":{"order_id":order_id,"user_id":user_id}}}},
-        {"seq_num":first_sequence + 1,"event":{"direction":"output","event":{"kind":"cancel_rejected","data":{"order_id":order_id,"reason":"order not found"}}}}
+        {"seq_num":first_sequence + 1,"event":{"direction":"output","event":{"kind":"cancel_rejected","data":{"order_id":order_id,"reason":reason}}}}
     ]))
 }
 
-fn fixture(dir: &Path) -> (PathBuf, PathBuf) {
-    let records = vec![
-        accepted_order(1, "sell-a", "seller-a", "sell", 5, 1, &[]),
-        accepted_order(3, "sell-b", "seller-b", "sell", 5, 2, &[]),
+/// Every lifecycle the report distinguishes, including the three cases that used to halt the
+/// reporter or damage a row: a rejected retry of an accepted id, an accepted order reusing a
+/// rejected id, refused cancellations (by an intruder, and of an order already canceled), and a
+/// second symbol whose book numbers its executions from `exec_0` again.
+fn lifecycle_records() -> Vec<Vec<u8>> {
+    vec![
+        accepted_order(order(1, "sell-a", "seller-a", "AAPL", "sell", 5), 1, &[]),
+        accepted_order(order(3, "sell-b", "seller-b", "AAPL", "sell", 5), 2, &[]),
         accepted_order(
-            5,
-            "buy-1",
-            "buyer",
-            "buy",
-            8,
+            order(5, "buy-1", "buyer", "AAPL", "buy", 8),
             3,
             &[
-                execution("buy-exec-a", "buy-1", "sell-a", 5, 3.0),
-                execution("sell-exec-a", "buy-1", "sell-a", 5, 3.0),
-                execution("buy-exec-b", "buy-1", "sell-b", 3, 3.0),
-                execution("sell-exec-b", "buy-1", "sell-b", 3, 3.0),
+                execution("exec_0", "buy-1", "sell-a", "AAPL", 5),
+                execution("exec_1", "buy-1", "sell-a", "AAPL", 5),
+                execution("exec_2", "buy-1", "sell-b", "AAPL", 3),
+                execution("exec_3", "buy-1", "sell-b", "AAPL", 3),
             ],
         ),
         canceled(11, "sell-b", "seller-b", 4),
-        cancel_rejected(13, "missing", "buyer"),
-        rejected_order(15, "reject-1", "buyer"),
-    ];
+        cancel_rejected(13, "missing", "buyer", "order not found"),
+        rejected_order(order(15, "reject-1", "buyer", "AAPL", "buy", 1), "no funds"),
+        rejected_order(
+            order(17, "buy-1", "buyer", "AAPL", "buy", 8),
+            "order already exists",
+        ),
+        accepted_order(order(19, "reject-1", "buyer", "AAPL", "buy", 1), 5, &[]),
+        cancel_rejected(21, "reject-1", "intruder", "unauthorized"),
+        cancel_rejected(23, "sell-b", "seller-b", "order is not open"),
+        accepted_order(
+            order(25, "msft-sell", "seller-a", "MSFT", "sell", 2),
+            6,
+            &[],
+        ),
+        accepted_order(
+            order(27, "msft-buy", "buyer", "MSFT", "buy", 2),
+            7,
+            &[
+                execution("exec_0", "msft-buy", "msft-sell", "MSFT", 2),
+                execution("exec_1", "msft-buy", "msft-sell", "MSFT", 2),
+            ],
+        ),
+    ]
+}
+
+/// Writes `records` as a journal, and a stream whose cache holds only the last record: a real
+/// Reporter process then catches up from the journal and hands off to the cache.
+fn write_journal(dir: &Path, records: &[Vec<u8>]) -> (PathBuf, PathBuf) {
     let journal = dir.join("events.log");
     let stream = dir.join("events.mmap");
     let mut journal_bytes = b"EXCHLOG1".to_vec();
-    for record in &records {
+    for record in records {
         journal_bytes.extend_from_slice(record);
     }
     fs::write(&journal, &journal_bytes).unwrap();
 
-    // Older records are only in the journal; the final record is in mmap. This exercises
-    // journal catch-up and the handoff back to the cache in one real Reporter process.
     let cache = records.last().unwrap();
+    let last_batch: serde_json::Value = serde_json::from_slice(&cache[8..]).unwrap();
+    let last_sequence = last_batch.as_array().unwrap().last().unwrap()["seq_num"]
+        .as_u64()
+        .unwrap();
     let metadata = fs::metadata(&journal).unwrap();
     let mut header = b"EXCHBUS1".to_vec();
     for value in [
@@ -150,7 +191,7 @@ fn fixture(dir: &Path) -> (PathBuf, PathBuf) {
         metadata.ino(),
         CAPACITY as u64,
         journal_bytes.len() as u64,
-        16,
+        last_sequence,
         journal_bytes.len() as u64 - cache.len() as u64,
         cache.len() as u64,
     ] {
@@ -163,6 +204,12 @@ fn fixture(dir: &Path) -> (PathBuf, PathBuf) {
     header.resize(80 + CAPACITY, 0);
     fs::write(&stream, header).unwrap();
     (journal, stream)
+}
+
+fn temp_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("stock-reporter-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&dir).unwrap();
+    dir
 }
 
 fn unused_address() -> String {
@@ -214,19 +261,30 @@ fn query(database_url: &str, sql: &str) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_string()
 }
 
+/// `orders:trades:rejected orders:rejected cancellations:checkpoint next sequence`.
+fn summary(database_url: &str) -> String {
+    query(
+        database_url,
+        "SELECT (SELECT count(*) FROM reported_orders) || ':' || (SELECT count(*) FROM reported_trades) || ':' || (SELECT count(*) FROM rejected_orders) || ':' || (SELECT count(*) FROM rejected_cancellations) || ':' || COALESCE((SELECT next_sequence::text FROM reporter_checkpoint), 'none')",
+    )
+}
+
 fn reset_database(database_url: &str) {
     run_sql(
         database_url,
-        "DROP TABLE IF EXISTS reported_trades, reported_orders, reporter_checkpoint CASCADE",
+        "DROP TABLE IF EXISTS reported_trades, reported_orders, reporter_checkpoint, rejected_orders, rejected_cancellations CASCADE",
     );
-    let migration = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("migrations/20260926000000_create_reporter_tables.sql");
-    let output = psql(database_url, &["-f", migration.to_str().unwrap()]);
-    assert!(
-        output.status.success(),
-        "migration failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for migration in MIGRATIONS {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join(migration);
+        let output = psql(database_url, &["-f", path.to_str().unwrap()]);
+        assert!(
+            output.status.success(),
+            "migration {migration} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn spawn_reporter(database_url: &str, journal: &Path, stream: &Path, address: &str) -> Child {
@@ -304,18 +362,29 @@ impl Drop for ChildGuard {
 #[test]
 #[ignore = "requires a resettable isolated REPORTER_TEST_DATABASE_URL"]
 fn reporter_rolls_back_then_restarts_without_duplicate_history() {
+    let _serial = DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let database_url =
         std::env::var("REPORTER_TEST_DATABASE_URL").expect("set REPORTER_TEST_DATABASE_URL");
     reset_database(&database_url);
-    let dir = std::env::temp_dir().join(format!("stock-reporter-{}", uuid::Uuid::new_v4()));
-    fs::create_dir(&dir).unwrap();
-    let (journal, stream) = fixture(&dir);
+    // A reporter from before the milestone 21 migration cannot save a checkpoint into it.
+    let old_reporter_checkpoint = psql(
+        &database_url,
+        &[
+            "-c",
+            "INSERT INTO reporter_checkpoint (singleton, journal_device, journal_inode, next_sequence, byte_offset) VALUES (true, 1, 1, 1, 8)",
+        ],
+    );
+    assert!(!old_reporter_checkpoint.status.success());
+    let dir = temp_dir();
+    let (journal, stream) = write_journal(&dir, &lifecycle_records());
 
     // Checkpoint persistence fails after Reporter has started order/trade writes. The database
     // transaction must roll back every one of those writes with the checkpoint.
     run_sql(
         &database_url,
-        "CREATE FUNCTION reporter_fail_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected checkpoint failure'; END; $$; CREATE TRIGGER reporter_fail_checkpoint BEFORE INSERT OR UPDATE ON reporter_checkpoint FOR EACH ROW EXECUTE FUNCTION reporter_fail_checkpoint()",
+        "CREATE OR REPLACE FUNCTION reporter_fail_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected checkpoint failure'; END; $$; CREATE TRIGGER reporter_fail_checkpoint BEFORE INSERT OR UPDATE ON reporter_checkpoint FOR EACH ROW EXECUTE FUNCTION reporter_fail_checkpoint()",
     );
     assert_fails_before_ready(spawn_reporter(
         &database_url,
@@ -323,13 +392,7 @@ fn reporter_rolls_back_then_restarts_without_duplicate_history() {
         &stream,
         &unused_address(),
     ));
-    assert_eq!(
-        query(
-            &database_url,
-            "SELECT (SELECT count(*) FROM reported_orders) || ':' || (SELECT count(*) FROM reported_trades) || ':' || (SELECT count(*) FROM reporter_checkpoint)",
-        ),
-        "0:0:0"
-    );
+    assert_eq!(summary(&database_url), "0:0:0:0:none");
     run_sql(
         &database_url,
         "DROP TRIGGER reporter_fail_checkpoint ON reporter_checkpoint; DROP FUNCTION reporter_fail_checkpoint()",
@@ -338,40 +401,109 @@ fn reporter_rolls_back_then_restarts_without_duplicate_history() {
     let address = unused_address();
     let mut first = ChildGuard::new(spawn_reporter(&database_url, &journal, &stream, &address));
     wait_until_ready(first.child(), &address);
+    // Accepted orders only. buy-1 is untouched by its rejected retry, reject-1 was accepted after
+    // its rejection, and neither refused cancellation changed reject-1 or sell-b.
     assert_eq!(
         query(
             &database_url,
-            "SELECT string_agg(order_id || ':' || status || ':' || filled_quantity::text || ':' || remaining_quantity::text || ':' || COALESCE(cancellation_outcome, 'none'), ',' ORDER BY order_id) FROM reported_orders",
+            "SELECT string_agg(order_id || ':' || status || ':' || filled_quantity::text || ':' || remaining_quantity::text || ':' || COALESCE(cancellation_sequence::text, 'none'), ',' ORDER BY order_id COLLATE \"C\") FROM reported_orders",
         ),
-        "buy-1:filled:8:0:none,reject-1:rejected:0:1:none,sell-a:filled:5:0:none,sell-b:canceled:3:2:canceled"
+        "buy-1:filled:8:0:none,msft-buy:filled:2:0:none,msft-sell:filled:2:0:none,reject-1:new:0:1:none,sell-a:filled:5:0:none,sell-b:canceled:3:2:4"
+    );
+    // MSFT's first trade reuses AAPL's execution ids; the ids are unique per symbol.
+    assert_eq!(
+        query(
+            &database_url,
+            "SELECT string_agg(trade_sequence::text || ':' || symbol || ':' || first_execution_id || ':' || buy_order_id || ':' || sell_order_id || ':' || quantity::text, ',' ORDER BY trade_sequence) FROM reported_trades",
+        ),
+        "7:AAPL:exec_0:buy-1:sell-a:5,9:AAPL:exec_2:buy-1:sell-b:3,29:MSFT:exec_0:msft-buy:msft-sell:2"
     );
     assert_eq!(
         query(
             &database_url,
-            "SELECT string_agg(trade_sequence::text || ':' || buy_order_id || ':' || sell_order_id || ':' || quantity::text, ',' ORDER BY trade_sequence) FROM reported_trades",
+            "SELECT string_agg(input_sequence::text || ':' || order_id || ':' || user_id || ':' || reason, ',' ORDER BY input_sequence) FROM rejected_orders",
         ),
-        "7:buy-1:sell-a:5,9:buy-1:sell-b:3"
+        "15:reject-1:buyer:no funds,17:buy-1:buyer:order already exists"
     );
     assert_eq!(
         query(
             &database_url,
-            "SELECT next_sequence::text FROM reporter_checkpoint"
+            "SELECT string_agg(input_sequence::text || ':' || order_id || ':' || requested_by || ':' || reason, ',' ORDER BY input_sequence) FROM rejected_cancellations",
         ),
-        "17"
+        "13:missing:buyer:order not found,21:reject-1:intruder:unauthorized,23:sell-b:seller-b:order is not open"
     );
+    assert_eq!(summary(&database_url), "6:3:2:3:31");
 
     // This process has committed its projection. On restart, Reporter must load that checkpoint
-    // and avoid duplicating either historical lifecycle rows or trades.
+    // and avoid duplicating any lifecycle, trade, or rejection row.
     first.stop();
     let mut second = ChildGuard::new(spawn_reporter(&database_url, &journal, &stream, &address));
     wait_until_ready(second.child(), &address);
-    assert_eq!(
-        query(
-            &database_url,
-            "SELECT (SELECT count(*) FROM reported_orders) || ':' || (SELECT count(*) FROM reported_trades) || ':' || (SELECT next_sequence::text FROM reporter_checkpoint)",
-        ),
-        "4:2:17"
-    );
+    assert_eq!(summary(&database_url), "6:3:2:3:31");
     second.stop();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires a resettable isolated REPORTER_TEST_DATABASE_URL"]
+fn a_failed_group_rolls_back_only_itself() {
+    let _serial = DATABASE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let database_url =
+        std::env::var("REPORTER_TEST_DATABASE_URL").expect("set REPORTER_TEST_DATABASE_URL");
+    reset_database(&database_url);
+    let dir = temp_dir();
+
+    // 1,000 resting sells fill exactly one group. The next group holds a trade against the first
+    // of them, then an order whose insert a trigger refuses.
+    let mut records: Vec<Vec<u8>> = (1..=1_000u64)
+        .map(|n| {
+            let id = format!("rest-{n}");
+            accepted_order(order(2 * n - 1, &id, "seller", "AAPL", "sell", 1), n, &[])
+        })
+        .collect();
+    records.push(accepted_order(
+        order(2_001, "taker", "buyer", "AAPL", "buy", 1),
+        1_001,
+        &[
+            execution("exec_0", "taker", "rest-1", "AAPL", 1),
+            execution("exec_1", "taker", "rest-1", "AAPL", 1),
+        ],
+    ));
+    records.push(accepted_order(
+        order(2_005, "poison", "buyer", "AAPL", "buy", 1),
+        1_002,
+        &[],
+    ));
+    let (journal, stream) = write_journal(&dir, &records);
+
+    run_sql(
+        &database_url,
+        "CREATE OR REPLACE FUNCTION reporter_refuse_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected order failure'; END; $$; CREATE TRIGGER reporter_refuse_order BEFORE INSERT ON reported_orders FOR EACH ROW WHEN (NEW.order_id = 'poison') EXECUTE FUNCTION reporter_refuse_order()",
+    );
+    assert_fails_before_ready(spawn_reporter(
+        &database_url,
+        &journal,
+        &stream,
+        &unused_address(),
+    ));
+    // The first group committed with the checkpoint just after its 1,000th batch (sequence 2000).
+    // The failed group rolled back whole: no trade, and rest-1 is still resting.
+    assert_eq!(summary(&database_url), "1000:0:0:0:2001");
+    let rest_1 = "SELECT status FROM reported_orders WHERE order_id = 'rest-1'";
+    assert_eq!(query(&database_url, rest_1), "new");
+    run_sql(
+        &database_url,
+        "DROP TRIGGER reporter_refuse_order ON reported_orders; DROP FUNCTION reporter_refuse_order()",
+    );
+
+    // A restart resumes at that checkpoint and applies the rest exactly once.
+    let address = unused_address();
+    let mut reporter = ChildGuard::new(spawn_reporter(&database_url, &journal, &stream, &address));
+    wait_until_ready(reporter.child(), &address);
+    assert_eq!(summary(&database_url), "1002:1:0:0:2007");
+    assert_eq!(query(&database_url, rest_1), "filled");
+    reporter.stop();
     fs::remove_dir_all(dir).unwrap();
 }
