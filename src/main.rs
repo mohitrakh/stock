@@ -184,6 +184,21 @@ async fn serve_primary(
         worker_availability.store(false, Ordering::Release);
     });
 
+    // The operator opens and closes the market through its own loopback-only port.
+    let operator_address = exchange::operator::address().unwrap_or_else(|error| {
+        eprintln!("operator port: {error}");
+        std::process::exit(1);
+    });
+    let operator_listener = TcpListener::bind(operator_address)
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("could not bind the operator port {operator_address}: {error}");
+            std::process::exit(1);
+        });
+    println!("Operator port is listening on {operator_address}");
+    let operator = exchange::operator::router(tx.clone());
+    tokio::spawn(async move { axum::serve(operator_listener, operator).await });
+
     let state = AppState {
         db,
         tx,

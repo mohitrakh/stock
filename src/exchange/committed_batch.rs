@@ -72,7 +72,9 @@ pub fn decode(batch: &[EventEnvelope]) -> Result<CommittedCommand, String> {
         }
         ExchangeInputEvent::FundsDepositRequested { .. }
         | ExchangeInputEvent::SharesDepositRequested { .. }
-        | ExchangeInputEvent::RiskLimitSetRequested { .. } => Ok(CommittedCommand::Other),
+        | ExchangeInputEvent::RiskLimitSetRequested { .. }
+        | ExchangeInputEvent::MarketOpenRequested { .. }
+        | ExchangeInputEvent::MarketCloseRequested => Ok(CommittedCommand::Other),
     }
 }
 

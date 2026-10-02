@@ -420,9 +420,9 @@ Full write-up: `docs/tasks/16-subscribers-keep-up.md`; measurements in `docs/per
 
 ## Next Milestone
 
-Selected: milestone 22, Trading Day. The specification is in `PROJECT_DIRECTION.md` ("Selected Next Milestone: 22. Trading Day"). Not started.
+Selected: milestone 22, Trading Day. The specification is in `PROJECT_DIRECTION.md` ("22. Trading Day"); the write-up is `docs/tasks/17-trading-day.md`. In progress.
 
-- [ ] Part 1: session commands (`MarketOpenRequested` / `MarketCloseRequested`), the loopback operator port, closed-market rejection in `prepare_input_event`, the risk day from sessions, snapshot version 2.
+- [x] Part 1 (2026-10-02): session commands (`MarketOpenRequested` / `MarketCloseRequested`), the loopback operator port, closed-market rejection in `prepare_input_event`, the risk day from sessions, snapshot version 2.
 - [ ] Part 2: expiry of every resting order at the close (`OrderExpired`, collateral and risk released), through the shared decoder, the MDP and the reporter.
 - [ ] Part 3: clearing the previous day at the next open; client order ids unique per trading day; reporter keys `(trading_day, order_id)` and the third migration; a warm-replica snapshot after each open.
 - [ ] Part 4: multi-day benchmark (`--bench --days N`) against the milestone 21 binary; `docs/performance/07-*.md`, `docs/tasks/17-trading-day.md`.

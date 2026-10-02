@@ -1,4 +1,4 @@
-# Project Direction - Milestone 21 (Subscribers Keep Up) Complete
+# Project Direction - Milestone 22 (Trading Day) In Progress
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -78,12 +78,12 @@ same-host warm replica process
 
 Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
 
-Latest verified status on 2026-09-30, on Linux (the office Ubuntu machine; the crate uses Unix-only APIs and does not build on Windows):
+Latest verified status on 2026-10-02, on Linux (the office Ubuntu machine; the crate uses Unix-only APIs and does not build on Windows):
 
 ```text
 cargo fmt -- --check
 cargo test --locked
-142 unit tests + the executable integration tests passed; 0 failed
+147 unit tests + the executable integration tests passed; 0 failed
 2 opt-in Reporter acceptance tests ignored by default (need REPORTER_TEST_DATABASE_URL);
   both passed against PostgreSQL 16 when run with it
 ```
@@ -554,9 +554,9 @@ Goal: make the two subscribers follow the exchange at its own speed, and fix the
 
 The migration `20260930000000_reporter_rejections.sql` runs in one transaction. It empties the report so the reporter rebuilds it from sequence 1, and adds a required `report_version` column so a reporter from before it cannot save a checkpoint. Measured on the office Ubuntu machine, the fixed reporter catches up at about 2,100 commands/s on both the 1-symbol and the 10-symbol journal. The Part 2 code does 1,400–1,900 there, depending on database state, so the fixes cost nothing. `cargo test` passes 142 unit tests and the integration tests; both PostgreSQL acceptance tests pass.
 
-## Selected Next Milestone: 22. Trading Day
+## 22. Trading Day (in progress)
 
-**Status: selected on 2026-10-01; not started.** Decisions confirmed by the owner:
+**Status: selected on 2026-10-01; Part 1 complete on 2026-10-02.** Write-up: `docs/tasks/17-trading-day.md`. Decisions confirmed by the owner:
 - a loopback operator port opens and closes the market;
 - every order still resting at the close expires (day orders only);
 - the previous day is cleared from memory at the next open;
@@ -630,10 +630,29 @@ Each part goes through code, tests, measurement where relevant, its docs, and an
 
 Not in this milestone: opening or closing auctions, a holiday calendar or automatic schedule, good-till-cancel orders, market orders, journal files per day or archival, and a reporting or history API.
 
+### Progress
+
+**Part 1, complete (2026-10-02): opening and closing the market.**
+- **Journaled session.** `MarketOpenRequested { trading_day }` and `MarketCloseRequested` produce `MarketOpened`, `MarketClosed` or `SessionRejected` (`AlreadyOpen`, `NotAfterLastTradingDay`, `AlreadyClosed`). The core's `Session` starts closed with no day; days only move forward.
+- **Closed-market refusal.** While closed, `prepare_input_event` refuses new orders as `OrderRejected { reason: "MarketClosed" }`, which the customer API answers with 409. That function is shared by live trading, replay and the warm replica. Deposits, risk limits and cancellations are accepted at any time.
+- **Risk day.** The daily cap now restarts at each open (`RiskManager::start_day`) instead of following order timestamps; resting quantity still carries into the new day until Part 2 expires it.
+- **Operator port.** `127.0.0.1:4004` (`EXCHANGE_OPERATOR_ADDR`, loopback only) serves `POST /session/open`, `POST /session/close` and `GET /session`.
+- **Snapshots and benchmark.** Snapshots are format version 2 and carry the session. The benchmark opens a fixed day first.
+
+Verified on Linux: `cargo fmt -- --check`, and `cargo test --locked` with 147 unit tests plus the integration tests. A live run of the real binary covered:
+- refusal before the open;
+- trading while open;
+- refusal after the close;
+- refused re-opens;
+- after `SIGKILL` and restart, the session recovered from the journal;
+- a new day.
+
+The benchmark is unchanged at about 46,000 orders/s on the office Ubuntu machine.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
-- the daily cap counts shares, not notional; "day" is a UTC 86,400-second bucket with no market hours, weekends or holidays
+- the daily cap counts shares, not notional; the trading day is opened and closed by an operator command, with no automatic schedule, market-hours clock, weekends or holidays
 - risk limits are per `(user, symbol)`; there is no cross-symbol or portfolio-level risk
 - execution queries are served from an index built during settlement, not projected from the event store
 - short selling is not supported at all: a sell must be fully backed by shares held, with no borrow model
@@ -678,7 +697,7 @@ Milestone 22, the trading day, is selected; its specification is the section abo
 
 Start by reading this file and `EXCHANGE_PIPELINE_TODO.md`. Verify the code and test result before trusting old milestone notes.
 
-The crate uses Unix-only APIs and does not compile on Windows. Build and test on Linux — the Ubuntu machine, or a `rust` container with the repository mounted (from Git Bash, set `MSYS_NO_PATHCONV=1` so container paths are not rewritten). The customer and warm-replica listeners bind loopback only, so a live failover run needs the primary, the warm replica, and the HTTP client in one network namespace.
+The crate uses Unix-only APIs and does not compile on Windows. Build and test on Linux — the Ubuntu machine, or a `rust` container with the repository mounted (from Git Bash, set `MSYS_NO_PATHCONV=1` so container paths are not rewritten). The customer, operator, and warm-replica listeners bind loopback only, so a live failover run needs the primary, the warm replica, and the HTTP client in one network namespace. A new journal starts with the market closed: open a trading day on the operator port (`POST 127.0.0.1:4004/session/open`) before placing orders.
 
 Discuss architecture before implementation. If a suggestion conflicts with the target design or changes the command/event boundary, stop and explain the tradeoff. Update this journal whenever a milestone is completed so the next session does not repeat old work.
 

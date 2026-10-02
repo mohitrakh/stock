@@ -172,7 +172,17 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     let users: Vec<String> = (0..config.users).map(|u| format!("u{u}")).collect();
     let symbols: Vec<String> = (0..config.symbols).map(|s| format!("S{s:03}")).collect();
 
-    // Setup, untimed: cash for every user and shares in every symbol.
+    // Setup, untimed: open a trading day (a fixed date, so every run journals the same history),
+    // then cash for every user and shares in every symbol.
+    let trading_day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("a valid date");
+    send(&tx, |respond_to| ExchangeCommand::OpenMarket {
+        trading_day,
+        respond_to,
+    })
+    .await?
+    .await
+    .map_err(|_| "exchange worker stopped".to_string())?
+    .map_err(|reason| format!("could not open the market: {reason}"))?;
     let mut funded = Vec::new();
     let mut shares = Vec::new();
     for user in &users {

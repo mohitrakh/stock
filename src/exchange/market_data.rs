@@ -1271,6 +1271,19 @@ mod tests {
         tx.blocking_send(command).unwrap();
     }
 
+    /// Orders are refused until a trading day is open; the open is journaled like any command.
+    fn open_market(tx: &mpsc::Sender<ExchangeCommand>) {
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            tx,
+            ExchangeCommand::OpenMarket {
+                trading_day: chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+                respond_to,
+            },
+        );
+        reply.blocking_recv().unwrap().unwrap();
+    }
+
     fn empty_view(reader: &StreamReader) -> Served {
         Arc::new(RwLock::new(Some(View {
             orders: MarketDataProjection::default(),
@@ -1371,6 +1384,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
         let worker = thread::spawn(move || runtime.run());
+        open_market(&tx);
         let (respond_to, reply) = oneshot::channel();
         send(
             &tx,
@@ -1411,9 +1425,9 @@ mod tests {
         drop(tx);
         worker.join().unwrap();
 
-        // First run: save once the trade (the fifth batch) has been applied, then apply the last
-        // batch without saving, as a crash between two saves would leave it. A restart that
-        // applied the trade a second time would double the candle's volume.
+        // First run: save once the trade (the sixth batch, after the open) has been applied, then
+        // apply the last batch without saving, as a crash between two saves would leave it. A
+        // restart that applied the trade a second time would double the candle's volume.
         let state_path = fixture.dir.join("market-data.json");
         let reader = fixture.reader();
         let served = empty_view(&reader);
@@ -1423,7 +1437,7 @@ mod tests {
             state_path.clone(),
             Duration::from_secs(3600),
         );
-        for _ in 0..5 {
+        for _ in 0..6 {
             assert!(first.step().unwrap());
         }
         first.save().unwrap();
@@ -1522,6 +1536,7 @@ mod tests {
         let worker = thread::spawn(move || runtime.run());
         let mut reader = StreamReader::open(&fixture.log, &fixture.bus, None).unwrap();
         let mut projection = MarketDataProjection::default();
+        open_market(&tx);
 
         let (respond_to, response) = oneshot::channel();
         tx.blocking_send(ExchangeCommand::DepositShares {

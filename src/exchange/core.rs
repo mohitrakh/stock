@@ -5,12 +5,31 @@ use crate::{
         order_manager::{OrderManager, OrderManagerError, PreparedCancel, PreparedNewOrder},
         types::{
             BalanceView, Execution, ExecutionView, Order, OrderBookView, OrderView, PositionView,
-            RiskLimitView,
+            RiskLimitView, SessionView,
         },
     },
 };
 
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+
+/// The trading session. Only journaled open and close commands change it, so replay rebuilds it
+/// exactly. A new exchange has never opened: no trading day, and closed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Session {
+    trading_day: Option<NaiveDate>,
+    open: bool,
+}
+
+/// Why an open or close was refused. These are ordinary business rejections: they are journaled
+/// as `SessionRejected` and change nothing.
+#[derive(Debug, PartialEq)]
+pub enum SessionError {
+    AlreadyOpen,
+    /// Trading days only move forward, so a replayed history can never revisit a day.
+    NotAfterLastTradingDay(NaiveDate),
+    AlreadyClosed,
+}
 
 pub struct AddOrderOutcome {
     pub order_id: String,
@@ -47,6 +66,7 @@ pub struct ExchangeCore {
     order_manager: OrderManager,
     matching_engine: MatchingEngine,
     sequencer: Sequencer,
+    session: Session,
 }
 
 /// Complete deterministic state required to resume the single-owner exchange core. It has no
@@ -56,6 +76,7 @@ pub(crate) struct CoreSnapshot {
     order_manager: crate::types::order_manager::OrderManagerSnapshot,
     matching_engine: crate::types::matching_engine::MatchingEngineSnapshot,
     next_matching_sequence: u64,
+    session: Session,
 }
 
 impl ExchangeCore {
@@ -64,7 +85,74 @@ impl ExchangeCore {
             order_manager: OrderManager::new(),
             matching_engine: MatchingEngine::new(),
             sequencer: Sequencer::new(1),
+            session: Session::default(),
         }
+    }
+
+    /// Whether new orders are accepted. The runtime checks this before preparing an order; core
+    /// methods such as `add_order` do not, so unit tests can exercise matching on their own.
+    pub fn is_market_open(&self) -> bool {
+        self.session.open
+    }
+
+    pub fn session_view(&self) -> SessionView {
+        SessionView {
+            trading_day: self.session.trading_day,
+            open: self.session.open,
+        }
+    }
+
+    /// A trading day opens only while the market is closed, and only for a day later than the
+    /// last one.
+    pub(crate) fn prepare_open_market(&self, trading_day: NaiveDate) -> Result<(), SessionError> {
+        if self.session.open {
+            return Err(SessionError::AlreadyOpen);
+        }
+        if let Some(last) = self.session.trading_day
+            && trading_day <= last
+        {
+            return Err(SessionError::NotAfterLastTradingDay(last));
+        }
+        Ok(())
+    }
+
+    /// Starts the day: the risk manager's traded usage expires, and quantity still resting counts
+    /// toward the new day.
+    pub(crate) fn commit_open_market(&mut self, trading_day: NaiveDate) {
+        self.session = Session {
+            trading_day: Some(trading_day),
+            open: true,
+        };
+        self.order_manager.start_trading_day();
+    }
+
+    /// Returns the day being closed.
+    pub(crate) fn prepare_close_market(&self) -> Result<NaiveDate, SessionError> {
+        match self.session {
+            Session {
+                trading_day: Some(day),
+                open: true,
+            } => Ok(day),
+            _ => Err(SessionError::AlreadyClosed),
+        }
+    }
+
+    pub(crate) fn commit_close_market(&mut self) {
+        self.session.open = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_market(&mut self, trading_day: NaiveDate) -> Result<(), SessionError> {
+        self.prepare_open_market(trading_day)?;
+        self.commit_open_market(trading_day);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_market(&mut self) -> Result<NaiveDate, SessionError> {
+        let day = self.prepare_close_market()?;
+        self.commit_close_market();
+        Ok(day)
     }
 
     pub fn deposit(&mut self, user_id: String, amount: u64) -> Result<(), OrderManagerError> {
@@ -275,12 +363,16 @@ impl ExchangeCore {
             order_manager: self.order_manager.snapshot(),
             matching_engine: self.matching_engine.snapshot(),
             next_matching_sequence: self.sequencer.next_sequence(),
+            session: self.session,
         }
     }
 
     pub(crate) fn from_snapshot(snapshot: CoreSnapshot) -> Result<Self, String> {
         if snapshot.next_matching_sequence == 0 {
             return Err("core snapshot has an invalid next matching sequence".to_string());
+        }
+        if snapshot.session.open && snapshot.session.trading_day.is_none() {
+            return Err("core snapshot has an open market without a trading day".to_string());
         }
         let order_manager = OrderManager::from_snapshot(snapshot.order_manager)?;
         let matching_engine = MatchingEngine::from_snapshot(snapshot.matching_engine)?;
@@ -297,6 +389,7 @@ impl ExchangeCore {
             order_manager,
             matching_engine,
             sequencer: Sequencer::new(snapshot.next_matching_sequence),
+            session: snapshot.session,
         };
         core.validate_snapshot()?;
         Ok(core)
@@ -877,36 +970,99 @@ mod tests {
             .unwrap();
     }
 
+    fn day(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 10, day).unwrap()
+    }
+
     #[test]
     fn overnight_fills_and_cancellation_cannot_refund_todays_traded_usage() {
         let mut core = funded_core();
         core.deposit("trader".to_string(), 1_000).unwrap();
         core.set_risk_limit("trader".to_string(), "AAPL".to_string(), 10);
 
-        let mut overnight = order("overnight", "trader", "BUY", 10, 10);
-        overnight.timestamp = 3_600.0;
-        core.add_order(overnight).unwrap();
+        core.open_market(day(1)).unwrap();
+        core.add_order(order("overnight", "trader", "BUY", 10, 10))
+            .unwrap();
+        core.close_market().unwrap();
 
         // Four shares trade on day two. Usage remains ten: four traded today plus six still open.
-        let mut day_two_sell = order("day-two-sell", "seller", "SELL", 10, 4);
-        day_two_sell.timestamp = 90_000.0;
-        core.add_order(day_two_sell).unwrap();
+        core.open_market(day(2)).unwrap();
+        core.add_order(order("day-two-sell", "seller", "SELL", 10, 4))
+            .unwrap();
         assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 10);
 
         core.cancel_order_for_user("overnight", "trader").unwrap();
         assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 4);
 
-        let mut too_many = order("too-many", "trader", "BUY", 10, 7);
-        too_many.timestamp = 90_001.0;
         assert!(matches!(
-            core.add_order(too_many),
+            core.add_order(order("too-many", "trader", "BUY", 10, 7)),
             Err(OrderManagerError::RiskRejected(_))
         ));
 
-        let mut remaining_allowance = order("remaining", "trader", "BUY", 10, 6);
-        remaining_allowance.timestamp = 90_002.0;
-        core.add_order(remaining_allowance).unwrap();
+        core.add_order(order("remaining", "trader", "BUY", 10, 6))
+            .unwrap();
         assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 10);
+    }
+
+    #[test]
+    fn a_new_trading_day_expires_the_previous_days_traded_usage() {
+        let mut core = funded_core();
+        core.deposit("trader".to_string(), 1_000).unwrap();
+        core.set_risk_limit("trader".to_string(), "AAPL".to_string(), 4);
+
+        core.open_market(day(1)).unwrap();
+        core.add_order(order("sell", "seller", "SELL", 10, 4))
+            .unwrap();
+        core.add_order(order("buy", "trader", "BUY", 10, 4))
+            .unwrap();
+        assert!(matches!(
+            core.add_order(order("more", "trader", "BUY", 10, 1)),
+            Err(OrderManagerError::RiskRejected(_))
+        ));
+        core.close_market().unwrap();
+
+        // The day is the operator's trading day, not the order timestamp, so nothing about the
+        // orders themselves decides when the allowance comes back.
+        core.open_market(day(2)).unwrap();
+        assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 0);
+        core.add_order(order("next-day", "trader", "BUY", 10, 4))
+            .unwrap();
+    }
+
+    #[test]
+    fn the_session_opens_only_forward_and_closes_only_when_open() {
+        let mut core = ExchangeCore::new();
+        assert_eq!(
+            core.session_view(),
+            SessionView {
+                trading_day: None,
+                open: false
+            }
+        );
+        assert_eq!(core.close_market(), Err(SessionError::AlreadyClosed));
+
+        core.open_market(day(2)).unwrap();
+        assert!(core.is_market_open());
+        assert_eq!(core.open_market(day(3)), Err(SessionError::AlreadyOpen));
+        assert_eq!(core.close_market(), Ok(day(2)));
+        assert_eq!(core.close_market(), Err(SessionError::AlreadyClosed));
+
+        assert_eq!(
+            core.open_market(day(2)),
+            Err(SessionError::NotAfterLastTradingDay(day(2)))
+        );
+        assert_eq!(
+            core.open_market(day(1)),
+            Err(SessionError::NotAfterLastTradingDay(day(2)))
+        );
+        core.open_market(day(3)).unwrap();
+        assert_eq!(
+            core.session_view(),
+            SessionView {
+                trading_day: Some(day(3)),
+                open: true
+            }
+        );
     }
 
     #[test]

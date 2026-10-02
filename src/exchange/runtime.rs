@@ -9,9 +9,12 @@ use crate::{
     },
     types::{
         exchange_event::{EventEnvelope, ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent},
-        types::{ExchangeCommand, OrderView},
+        types::{ExchangeCommand, OrderView, SessionView},
     },
 };
+
+/// The rejection reason journaled for an order sent while the market is closed.
+pub(crate) const MARKET_CLOSED: &str = "MarketClosed";
 
 pub struct ExchangeRuntime {
     rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
@@ -82,6 +85,7 @@ enum InputEventResult {
     SetRiskLimit(Result<(), String>),
     PlaceOrder(Result<OrderView, String>),
     CancelOrder(Result<(), String>),
+    Session(Result<SessionView, String>),
 }
 enum PreparedCommit {
     None,
@@ -101,6 +105,8 @@ enum PreparedCommit {
     },
     AddOrder(Box<PreparedAddOrder>),
     CancelOrder(Box<PreparedCancelOrder>),
+    OpenMarket(chrono::NaiveDate),
+    CloseMarket,
 }
 
 struct PreparedInput {
@@ -218,6 +224,24 @@ impl InputEventResult {
             _ => unreachable!("expected cancel order result"),
         }
     }
+
+    fn into_session_result(self) -> Result<SessionView, String> {
+        match self {
+            Self::Session(result) => result,
+            _ => unreachable!("expected session result"),
+        }
+    }
+}
+
+/// A refused open or close changes nothing; the refusal is journaled like any business rejection.
+fn rejected_session(error: crate::exchange::core::SessionError) -> PreparedInput {
+    let reason = format!("{:?}", error);
+    PreparedInput {
+        result: InputEventResult::Session(Err(reason.clone())),
+        output_events: vec![ExchangeOutputEvent::SessionRejected { reason }],
+        commit: PreparedCommit::None,
+        executions: Vec::new(),
+    }
 }
 
 fn prepare_input_event(
@@ -301,6 +325,19 @@ fn prepare_input_event(
                 })
             }
         },
+        // Checked here, the one entry point shared by live trading, replay and the warm replica,
+        // so all three agree on which orders the session refused.
+        ExchangeInputEvent::NewOrderRequested { order } if !core.is_market_open() => {
+            Ok(PreparedInput {
+                result: InputEventResult::PlaceOrder(Err(MARKET_CLOSED.to_string())),
+                output_events: vec![ExchangeOutputEvent::OrderRejected {
+                    order_id: order.order_id,
+                    reason: MARKET_CLOSED.to_string(),
+                }],
+                commit: PreparedCommit::None,
+                executions: Vec::new(),
+            })
+        }
         ExchangeInputEvent::NewOrderRequested { order } => {
             let order_id = order.order_id.clone();
             match core.prepare_add_order(order) {
@@ -366,6 +403,32 @@ fn prepare_input_event(
                 Err(CoreError::Internal(reason)) => Err(CoreError::Internal(reason)),
             }
         }
+        ExchangeInputEvent::MarketOpenRequested { trading_day } => {
+            Ok(match core.prepare_open_market(trading_day) {
+                Ok(()) => PreparedInput {
+                    result: InputEventResult::Session(Ok(SessionView {
+                        trading_day: Some(trading_day),
+                        open: true,
+                    })),
+                    output_events: vec![ExchangeOutputEvent::MarketOpened { trading_day }],
+                    commit: PreparedCommit::OpenMarket(trading_day),
+                    executions: Vec::new(),
+                },
+                Err(error) => rejected_session(error),
+            })
+        }
+        ExchangeInputEvent::MarketCloseRequested => Ok(match core.prepare_close_market() {
+            Ok(trading_day) => PreparedInput {
+                result: InputEventResult::Session(Ok(SessionView {
+                    trading_day: Some(trading_day),
+                    open: false,
+                })),
+                output_events: vec![ExchangeOutputEvent::MarketClosed { trading_day }],
+                commit: PreparedCommit::CloseMarket,
+                executions: Vec::new(),
+            },
+            Err(error) => rejected_session(error),
+        }),
     }
 }
 
@@ -390,6 +453,8 @@ impl PreparedInput {
             } => core.commit_risk_limit(user_id, symbol, limit),
             PreparedCommit::AddOrder(prepared) => core.commit_add_order(*prepared),
             PreparedCommit::CancelOrder(prepared) => core.commit_cancel_order(*prepared),
+            PreparedCommit::OpenMarket(trading_day) => core.commit_open_market(trading_day),
+            PreparedCommit::CloseMarket => core.commit_close_market(),
         }
         (self.result, executions)
     }
@@ -799,6 +864,24 @@ impl ExchangeRuntime {
                 respond_to,
                 self.core.order_view(&order_id, &user_id),
             )),
+            ExchangeCommand::OpenMarket {
+                trading_day,
+                respond_to,
+            } => self.stage_write(
+                ExchangeInputEvent::MarketOpenRequested { trading_day },
+                staged,
+                respond_to,
+                InputEventResult::into_session_result,
+            ),
+            ExchangeCommand::CloseMarket { respond_to } => self.stage_write(
+                ExchangeInputEvent::MarketCloseRequested,
+                staged,
+                respond_to,
+                InputEventResult::into_session_result,
+            ),
+            ExchangeCommand::GetSession { respond_to } => {
+                Ok(hold_read(respond_to, self.core.session_view()))
+            }
         }
     }
 
@@ -1156,6 +1239,26 @@ mod tests {
         ExchangeRuntime::new(rx)
     }
 
+    fn trading_day(day: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(2026, 10, day).unwrap()
+    }
+
+    /// Orders are refused until a trading day is open. A history that trades and is replayed
+    /// starts with this journaled command.
+    fn open_market() -> ExchangeInputEvent {
+        ExchangeInputEvent::MarketOpenRequested {
+            trading_day: trading_day(1),
+        }
+    }
+
+    /// A runtime whose market is already open, for tests that never replay their history. Like
+    /// the direct deposits those tests make, the open is applied to the core, not journaled.
+    fn open_runtime() -> ExchangeRuntime {
+        let mut runtime = runtime();
+        runtime.core.open_market(trading_day(1)).unwrap();
+        runtime
+    }
+
     /// A sell order must now be backed by shares, so histories that contain one have to fund the
     /// seller first — and that funding has to be an event, or replay would rebuild a seller with
     /// no inventory and reject the sell it is meant to reproduce.
@@ -1168,17 +1271,6 @@ mod tests {
     }
 
     fn order(id: &str, user: &str, side: &str, price: u64, quantity: u32) -> Order {
-        order_at(id, user, side, price, quantity, 1.0)
-    }
-
-    fn order_at(
-        id: &str,
-        user: &str,
-        side: &str,
-        price: u64,
-        quantity: u32,
-        timestamp: f64,
-    ) -> Order {
         Order::new(
             id.to_string(),
             user.to_string(),
@@ -1187,7 +1279,7 @@ mod tests {
             price,
             quantity,
             None,
-            timestamp,
+            1.0,
             0,
         )
         .unwrap()
@@ -1226,7 +1318,7 @@ mod tests {
     #[test]
     fn append_failure_does_not_publish_execution_callbacks() {
         let path = temp_log_path("atomic-callback-failure");
-        let mut runtime = runtime();
+        let mut runtime = open_runtime();
 
         runtime
             .record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
@@ -1303,7 +1395,7 @@ mod tests {
 
     #[test]
     fn place_order_appends_accepted_after_successful_core_processing() {
-        let mut runtime = runtime();
+        let mut runtime = open_runtime();
         runtime.core.deposit("buyer".to_string(), 1_000).unwrap();
         let (respond_to, _response_rx) = oneshot::channel();
 
@@ -1334,7 +1426,7 @@ mod tests {
 
     #[test]
     fn place_order_appends_rejected_after_failed_core_processing() {
-        let mut runtime = runtime();
+        let mut runtime = open_runtime();
         let (respond_to, _response_rx) = oneshot::channel();
 
         runtime
@@ -1397,7 +1489,7 @@ mod tests {
 
     #[test]
     fn matching_order_appends_execution_created_events() {
-        let mut runtime = runtime();
+        let mut runtime = open_runtime();
         runtime.core.deposit("buyer".to_string(), 1_000).unwrap();
         runtime.core.deposit_shares("seller", "AAPL", 5).unwrap();
         runtime
@@ -1445,7 +1537,7 @@ mod tests {
 
     #[test]
     fn event_log_can_be_consumed_in_sequence() {
-        let mut runtime = runtime();
+        let mut runtime = open_runtime();
 
         let (respond_to, _response_rx) = oneshot::channel();
         runtime
@@ -1556,6 +1648,7 @@ mod tests {
     #[test]
     fn same_input_sequence_produces_same_output_events() {
         let inputs = vec![
+            open_market(),
             ExchangeInputEvent::FundsDepositRequested {
                 user_id: "buyer".to_string(),
                 amount: 1_000,
@@ -1583,13 +1676,14 @@ mod tests {
             second_outputs.extend(second_processed.output_events);
         }
 
-        assert_eq!(first_outputs.len(), 6);
+        assert_eq!(first_outputs.len(), 7);
         assert_eq!(first_outputs, second_outputs);
     }
     #[test]
     fn replay_rebuilds_matching_state_and_sequence() {
         let mut original = runtime();
 
+        let _ = original.record_and_process_input_event(open_market());
         let _ =
             original.record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
                 user_id: "buyer".to_string(),
@@ -1606,7 +1700,7 @@ mod tests {
             order: order("buy-1", "buyer", "BUY", 10, 5),
         });
 
-        assert_eq!(original.event_log().len(), 10);
+        assert_eq!(original.event_log().len(), 12);
 
         let mut rebuilt_core = replay_event_log(original.event_log()).unwrap();
 
@@ -1709,6 +1803,7 @@ mod tests {
     fn recovered_runtime_continues_event_and_matching_sequences() {
         let mut original = runtime();
 
+        let _ = original.record_and_process_input_event(open_market());
         let _ =
             original.record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
                 user_id: "buyer".to_string(),
@@ -1726,7 +1821,7 @@ mod tests {
         });
 
         let recorded_log = original.event_log().to_vec();
-        assert_eq!(recorded_log.len(), 10);
+        assert_eq!(recorded_log.len(), 12);
 
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
 
@@ -1743,12 +1838,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response_rx.blocking_recv().unwrap(), Ok(()));
-        assert_eq!(recovered.event_log().len(), 12);
+        assert_eq!(recovered.event_log().len(), 14);
 
-        assert_eq!(recovered.event_log()[10].seq_num, 11);
-        assert_eq!(recovered.event_log()[11].seq_num, 12);
+        assert_eq!(recovered.event_log()[12].seq_num, 13);
+        assert_eq!(recovered.event_log()[13].seq_num, 14);
 
-        match &recovered.event_log()[10].event {
+        match &recovered.event_log()[12].event {
             ExchangeEvent::Input(ExchangeInputEvent::CancelOrderRequested {
                 order_id,
                 user_id,
@@ -1759,7 +1854,7 @@ mod tests {
             other => panic!("unexpected event: {:?}", other),
         }
 
-        match &recovered.event_log()[11].event {
+        match &recovered.event_log()[13].event {
             ExchangeEvent::Output(ExchangeOutputEvent::OrderCanceled { order_id, seq_num }) => {
                 assert_eq!(order_id, "sell-1");
                 assert_eq!(*seq_num, 3);
@@ -1770,7 +1865,7 @@ mod tests {
 
     #[test]
     fn queries_do_not_append_to_the_event_log() {
-        let mut runtime = runtime();
+        let mut runtime = open_runtime();
         runtime.core.deposit("buyer".to_string(), 1_000).unwrap();
 
         let (respond_to, _response_rx) = oneshot::channel();
@@ -1813,7 +1908,7 @@ mod tests {
 
     #[test]
     fn place_order_reply_reports_fill_state() {
-        let mut runtime = runtime();
+        let mut runtime = open_runtime();
         runtime.core.deposit("buyer".to_string(), 1_000).unwrap();
         runtime.core.deposit_shares("seller", "AAPL", 4).unwrap();
         runtime
@@ -1859,6 +1954,7 @@ mod tests {
         let mut reader = fixture.reader();
         let mut expected = Vec::new();
         for input in [
+            open_market(),
             ExchangeInputEvent::FundsDepositRequested {
                 user_id: "buyer".into(),
                 amount: 1000,
@@ -1964,6 +2060,7 @@ mod tests {
             let mut runtime = recover_runtime(rx, &path).unwrap();
 
             for command in [
+                open_market(),
                 ExchangeInputEvent::FundsDepositRequested {
                     user_id: "buyer".to_string(),
                     amount: 1_000,
@@ -1979,14 +2076,22 @@ mod tests {
                 runtime.record_and_process_input_event(command).unwrap();
             }
 
-            assert_eq!(runtime.event_log().len(), 10);
+            assert_eq!(runtime.event_log().len(), 12);
         }
 
         // Second run: same file, brand-new process state.
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut restarted = recover_runtime(rx, &path).unwrap();
 
-        assert_eq!(restarted.event_log().len(), 10);
+        assert_eq!(restarted.event_log().len(), 12);
+        // The session came back too: the market is still open for trading day 1.
+        assert_eq!(
+            restarted.core.session_view(),
+            SessionView {
+                trading_day: Some(trading_day(1)),
+                open: true
+            }
+        );
 
         // Wallet, locks and order state all came back.
         let balance = restarted.core.balance_view("buyer");
@@ -2018,7 +2123,7 @@ mod tests {
         );
 
         // Cancelling the resting quantity works, and both counters continue where they left off:
-        // event sequences 9 and 10, matching sequence 3.
+        // event sequences 13 and 14, matching sequence 3.
         let (respond_to, response_rx) = oneshot::channel();
         restarted
             .handle_command(ExchangeCommand::CancelOrder {
@@ -2029,10 +2134,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(response_rx.blocking_recv().unwrap(), Ok(()));
-        assert_eq!(restarted.event_log().len(), 12);
-        assert_eq!(restarted.event_log()[10].seq_num, 11);
+        assert_eq!(restarted.event_log().len(), 14);
+        assert_eq!(restarted.event_log()[12].seq_num, 13);
 
-        match &restarted.event_log()[11].event {
+        match &restarted.event_log()[13].event {
             ExchangeEvent::Output(ExchangeOutputEvent::OrderCanceled { order_id, seq_num }) => {
                 assert_eq!(order_id, "sell-1");
                 assert_eq!(*seq_num, 3);
@@ -2045,7 +2150,7 @@ mod tests {
         // reservation released back to available.
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let third = recover_runtime(rx, &path).unwrap();
-        assert_eq!(third.event_log().len(), 12);
+        assert_eq!(third.event_log().len(), 14);
         assert_eq!(
             third.core.order_view("sell-1", "seller").unwrap().status,
             "canceled"
@@ -2072,6 +2177,7 @@ mod tests {
             let mut runtime =
                 recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot).unwrap();
             for input in [
+                open_market(),
                 ExchangeInputEvent::FundsDepositRequested {
                     user_id: "buyer".into(),
                     amount: 100,
@@ -2103,13 +2209,14 @@ mod tests {
         let mut restarted =
             recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot).unwrap();
 
-        // The checkpoint already owns the first six commands; only the cancellation is held and
+        // The checkpoint already owns the first seven commands; only the cancellation is held and
         // replayed as the suffix. The full history remains in the journal for subscribers.
         assert_eq!(restarted.event_log().len(), 2);
-        // The six checkpointed commands produced sixteen envelopes: the crossing buy emits two
+        // The seven checkpointed commands produced eighteen envelopes: the crossing buy emits two
         // execution events for each fill as well as its accepted event. The cancellation begins
-        // the two-envelope suffix at event sequence 17.
-        assert_eq!(restarted.event_log()[0].seq_num, 17);
+        // the two-envelope suffix at event sequence 19.
+        assert_eq!(restarted.event_log()[0].seq_num, 19);
+        assert!(restarted.core.is_market_open());
         assert_eq!(
             restarted
                 .core
@@ -2233,6 +2340,10 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut runtime = recover_runtime(rx, &path).unwrap();
         let mut group = Vec::new();
+        let open = queue(&mut group, |respond_to| ExchangeCommand::OpenMarket {
+            trading_day: trading_day(1),
+            respond_to,
+        });
         let deposit = queue(&mut group, |respond_to| ExchangeCommand::Deposit {
             user_id: "buyer".into(),
             amount: 1_000,
@@ -2259,8 +2370,9 @@ mod tests {
 
         runtime.handle_group(group.into_iter()).unwrap();
 
-        // Four writes, one sync.
+        // Five writes, one sync. The orders queued after the open see the market open.
         assert_eq!(runtime.store.as_ref().unwrap().syncs, 1);
+        assert!(open.blocking_recv().unwrap().unwrap().open);
         deposit.blocking_recv().unwrap().unwrap();
         shares.blocking_recv().unwrap().unwrap();
         assert_eq!(sell.blocking_recv().unwrap().unwrap().status, "new");
@@ -2320,6 +2432,7 @@ mod tests {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut runtime = recover_runtime(rx, &path).unwrap();
         for input in [
+            open_market(),
             ExchangeInputEvent::FundsDepositRequested {
                 user_id: "seller".into(),
                 amount: u64::MAX,
@@ -2385,6 +2498,7 @@ mod tests {
             let mut runtime = recover_runtime(rx, &path).unwrap();
 
             for command in [
+                open_market(),
                 ExchangeInputEvent::RiskLimitSetRequested {
                     user_id: "buyer".to_string(),
                     symbol: "AAPL".to_string(),
@@ -2452,11 +2566,16 @@ mod tests {
                     amount: 1_000,
                 },
                 share_deposit("seller", 10),
+                open_market(),
                 ExchangeInputEvent::NewOrderRequested {
-                    order: order_at("overnight", "buyer", "BUY", 10, 10, 3_600.0),
+                    order: order("overnight", "buyer", "BUY", 10, 10),
+                },
+                ExchangeInputEvent::MarketCloseRequested,
+                ExchangeInputEvent::MarketOpenRequested {
+                    trading_day: trading_day(2),
                 },
                 ExchangeInputEvent::NewOrderRequested {
-                    order: order_at("day-two-sell", "seller", "SELL", 10, 4, 90_000.0),
+                    order: order("day-two-sell", "seller", "SELL", 10, 4),
                 },
                 ExchangeInputEvent::CancelOrderRequested {
                     order_id: "overnight".to_string(),
@@ -2477,15 +2596,15 @@ mod tests {
 
         let rejected = restarted
             .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
-                order: order_at("too-many", "buyer", "BUY", 10, 7, 90_001.0),
+                order: order("too-many", "buyer", "BUY", 10, 7),
             })
             .unwrap()
             .into_place_order_result();
-        assert!(rejected.is_err());
+        assert!(rejected.unwrap_err().contains("RiskRejected"));
 
         restarted
             .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
-                order: order_at("remaining", "buyer", "BUY", 10, 6, 90_002.0),
+                order: order("remaining", "buyer", "BUY", 10, 6),
             })
             .unwrap()
             .into_place_order_result()
@@ -2515,6 +2634,9 @@ mod tests {
         runtime.core.deposit("buyer".to_string(), 1_000).unwrap();
 
         runtime
+            .record_and_process_input_event(open_market())
+            .unwrap();
+        runtime
             .record_and_process_input_event(ExchangeInputEvent::RiskLimitSetRequested {
                 user_id: "buyer".to_string(),
                 symbol: "AAPL".to_string(),
@@ -2528,7 +2650,7 @@ mod tests {
             })
             .unwrap();
 
-        match &runtime.event_log()[3].event {
+        match &runtime.event_log()[5].event {
             ExchangeEvent::Output(ExchangeOutputEvent::OrderRejected { order_id, reason }) => {
                 assert_eq!(order_id, "too-big");
                 assert!(reason.contains("RiskRejected"));
@@ -2588,7 +2710,7 @@ mod tests {
 
     #[test]
     fn a_users_order_is_not_readable_by_anyone_else() {
-        let mut runtime = runtime();
+        let mut runtime = open_runtime();
         runtime.core.deposit("buyer".to_string(), 1_000).unwrap();
 
         let (respond_to, _response_rx) = oneshot::channel();
@@ -2609,5 +2731,115 @@ mod tests {
             .unwrap();
 
         assert!(order_rx.blocking_recv().unwrap().is_none());
+    }
+
+    fn outputs_of(runtime: &ExchangeRuntime) -> Vec<ExchangeOutputEvent> {
+        runtime
+            .event_log()
+            .iter()
+            .filter_map(|envelope| match &envelope.event {
+                ExchangeEvent::Output(output) => Some(output.clone()),
+                ExchangeEvent::Input(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn orders_are_refused_while_the_market_is_closed_and_replay_agrees() {
+        let mut runtime = runtime();
+        let place = |runtime: &mut ExchangeRuntime, id: &str| {
+            runtime
+                .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
+                    order: order(id, "buyer", "BUY", 10, 1),
+                })
+                .unwrap()
+                .into_place_order_result()
+                .map(|view| view.order_id)
+        };
+
+        // A new exchange has never opened. Cash moves at any time; orders do not.
+        runtime
+            .record_and_process_input_event(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 100,
+            })
+            .unwrap()
+            .into_deposit_result()
+            .unwrap();
+        assert_eq!(place(&mut runtime, "early"), Err(MARKET_CLOSED.to_string()));
+
+        runtime
+            .record_and_process_input_event(open_market())
+            .unwrap();
+        assert_eq!(place(&mut runtime, "during"), Ok("during".to_string()));
+
+        runtime
+            .record_and_process_input_event(ExchangeInputEvent::MarketCloseRequested)
+            .unwrap();
+        assert_eq!(place(&mut runtime, "late"), Err(MARKET_CLOSED.to_string()));
+
+        let refused = |id: &str| ExchangeOutputEvent::OrderRejected {
+            order_id: id.into(),
+            reason: MARKET_CLOSED.into(),
+        };
+        // Deposited, refused, opened, accepted, closed, refused.
+        let outputs = outputs_of(&runtime);
+        assert_eq!(outputs[1], refused("early"));
+        assert_eq!(
+            outputs[4],
+            ExchangeOutputEvent::MarketClosed {
+                trading_day: trading_day(1)
+            }
+        );
+        assert_eq!(outputs[5], refused("late"));
+
+        // The refusals are history: replay regenerates exactly the same outcomes and state.
+        let replayed = replay_event_log(runtime.event_log()).unwrap();
+        assert_eq!(replayed.snapshot(), runtime.core_snapshot_for_test());
+        assert!(!replayed.is_market_open());
+    }
+
+    #[test]
+    fn refused_session_changes_are_journaled_and_change_nothing() {
+        let mut runtime = runtime();
+        let session = |runtime: &mut ExchangeRuntime, input| {
+            runtime
+                .record_and_process_input_event(input)
+                .unwrap()
+                .into_session_result()
+        };
+        let open_on = |day| ExchangeInputEvent::MarketOpenRequested {
+            trading_day: trading_day(day),
+        };
+
+        assert_eq!(
+            session(&mut runtime, ExchangeInputEvent::MarketCloseRequested),
+            Err("AlreadyClosed".to_string())
+        );
+        assert!(session(&mut runtime, open_on(2)).is_ok());
+        assert_eq!(
+            session(&mut runtime, open_on(3)),
+            Err("AlreadyOpen".to_string())
+        );
+        assert!(session(&mut runtime, ExchangeInputEvent::MarketCloseRequested).is_ok());
+        let backwards = session(&mut runtime, open_on(1)).unwrap_err();
+        assert!(backwards.starts_with("NotAfterLastTradingDay"));
+
+        assert_eq!(
+            outputs_of(&runtime)
+                .iter()
+                .filter(|output| matches!(output, ExchangeOutputEvent::SessionRejected { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(
+            runtime.core.session_view(),
+            SessionView {
+                trading_day: Some(trading_day(2)),
+                open: false
+            }
+        );
+        let replayed = replay_event_log(runtime.event_log()).unwrap();
+        assert_eq!(replayed.session_view(), runtime.core.session_view());
     }
 }

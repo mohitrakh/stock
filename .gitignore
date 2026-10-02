@@ -14,3 +14,4 @@ exchange-events.log
 !docs/performance/*.md
 !docs/tasks/15-snapshots-by-the-warm-replica.md
 !docs/tasks/16-subscribers-keep-up.md
+!docs/tasks/17-trading-day.md

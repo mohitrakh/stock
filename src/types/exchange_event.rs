@@ -1,4 +1,5 @@
 use super::types::{Execution, Order};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,6 +31,13 @@ pub enum ExchangeInputEvent {
         symbol: String,
         max_daily_quantity: u64,
     },
+    /// Starts a trading day. The operator names the day, and the command is journaled rather than
+    /// derived from a clock, so replay rebuilds exactly the same days on any machine at any time.
+    MarketOpenRequested {
+        trading_day: NaiveDate,
+    },
+    /// Ends the current trading day.
+    MarketCloseRequested,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +85,16 @@ pub enum ExchangeOutputEvent {
     ExecutionCreated {
         execution: Execution,
     },
+    MarketOpened {
+        trading_day: NaiveDate,
+    },
+    MarketClosed {
+        trading_day: NaiveDate,
+    },
+    /// An open or close that the session's state does not allow, such as opening an open market.
+    SessionRejected {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,6 +134,41 @@ mod tests {
         ];
 
         let bytes = serde_json::to_vec(&batch).unwrap();
+        let recovered: Vec<EventEnvelope> = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(recovered, batch);
+    }
+
+    #[test]
+    fn session_events_round_trip_with_an_iso_trading_day() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let batch = vec![
+            EventEnvelope {
+                seq_num: 1,
+                event: ExchangeEvent::Input(ExchangeInputEvent::MarketOpenRequested {
+                    trading_day: day,
+                }),
+            },
+            EventEnvelope {
+                seq_num: 2,
+                event: ExchangeEvent::Output(ExchangeOutputEvent::MarketOpened {
+                    trading_day: day,
+                }),
+            },
+            EventEnvelope {
+                seq_num: 3,
+                event: ExchangeEvent::Input(ExchangeInputEvent::MarketCloseRequested),
+            },
+            EventEnvelope {
+                seq_num: 4,
+                event: ExchangeEvent::Output(ExchangeOutputEvent::MarketClosed {
+                    trading_day: day,
+                }),
+            },
+        ];
+
+        let bytes = serde_json::to_vec(&batch).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains(r#""trading_day":"2026-10-01""#));
         let recovered: Vec<EventEnvelope> = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(recovered, batch);

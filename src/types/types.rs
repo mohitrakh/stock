@@ -190,6 +190,14 @@ pub struct OrderBookView {
     pub asks: Vec<L2Level>,
 }
 
+/// The trading session: the current (or last) trading day, and whether orders are accepted.
+/// `trading_day` is `None` until the market has opened for the first time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct SessionView {
+    pub trading_day: Option<chrono::NaiveDate>,
+    pub open: bool,
+}
+
 /// Live gateway plumbing, not replayable business data — every variant carries a response
 /// channel. The read variants are deliberately *not* mirrored by an `ExchangeInputEvent`: they
 /// change no state, so recording them would pad the event log and slow every future replay
@@ -247,5 +255,16 @@ pub enum ExchangeCommand {
         order_id: String,
         user_id: String,
         respond_to: oneshot::Sender<Option<OrderView>>,
+    },
+    /// Operator commands, sent only by the loopback operator port.
+    OpenMarket {
+        trading_day: chrono::NaiveDate,
+        respond_to: oneshot::Sender<Result<SessionView, String>>,
+    },
+    CloseMarket {
+        respond_to: oneshot::Sender<Result<SessionView, String>>,
+    },
+    GetSession {
+        respond_to: oneshot::Sender<SessionView>,
     },
 }

@@ -164,8 +164,9 @@ pub async fn place_order(
     })
     .await?
     .map_err(|err| {
-        // A reused client order id is the retry case, not a malformed request.
-        if err.contains("AlreadyExists") {
+        // A reused client order id is the retry case, not a malformed request, and a closed
+        // market is the exchange's state, not the request's fault.
+        if err.contains("AlreadyExists") || err == crate::exchange::runtime::MARKET_CLOSED {
             AppError::Conflict(err)
         } else {
             map_exchange_error(err)

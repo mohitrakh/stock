@@ -617,6 +617,13 @@ mod tests {
         recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap()
     }
 
+    /// Orders are refused until a trading day opens, so a history that trades starts with this.
+    fn open_market() -> ExchangeInputEvent {
+        ExchangeInputEvent::MarketOpenRequested {
+            trading_day: chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+        }
+    }
+
     fn unused_address() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().to_string()
@@ -672,6 +679,7 @@ mod tests {
         let snapshot = fixture.dir.join("events.snapshot");
         let mut primary = runtime_for(&fixture);
         for input in [
+            open_market(),
             ExchangeInputEvent::FundsDepositRequested {
                 user_id: "buyer".into(),
                 amount: 1_000,
@@ -995,6 +1003,7 @@ mod tests {
                 .unwrap();
         let startup_snapshot = std::fs::read(&snapshot).unwrap();
         for input in [
+            open_market(),
             ExchangeInputEvent::FundsDepositRequested {
                 user_id: "buyer".into(),
                 amount: 100,
@@ -1010,6 +1019,7 @@ mod tests {
             ExchangeInputEvent::NewOrderRequested {
                 order: order("buy", "buyer", "BUY", 10, 3),
             },
+            ExchangeInputEvent::MarketCloseRequested,
             ExchangeInputEvent::FundsDepositRequested {
                 user_id: "buyer".into(),
                 amount: 7,
@@ -1023,13 +1033,13 @@ mod tests {
         let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 2).unwrap();
         warm.catch_up().unwrap();
 
-        // Five commands with a snapshot every two: the last one was written after the fourth, at
-        // exactly the warm's applied position at that moment.
+        // Seven commands with a snapshot every two: the last one was written after the sixth (the
+        // close), at exactly the warm's applied position at that moment.
         let loaded = snapshot::load(&snapshot, &fixture.log).unwrap().unwrap();
-        let fifth_command_envelopes = 2;
+        let last_command_envelopes = 2;
         assert_eq!(
             loaded.boundary.next_event_sequence,
-            primary.next_event_sequence() - fifth_command_envelopes
+            primary.next_event_sequence() - last_command_envelopes
         );
         let live = primary.core_snapshot_for_test();
         drop(primary);
@@ -1038,11 +1048,9 @@ mod tests {
         let restarted =
             recover_runtime_with_stream_and_snapshot(rx, &fixture.log, &fixture.bus, &snapshot)
                 .unwrap();
-        // The restart loaded the warm's snapshot and replayed only the fifth command.
-        assert_eq!(
-            restarted.event_log().len(),
-            fifth_command_envelopes as usize
-        );
+        // The restart loaded the warm's snapshot, closed session included, and replayed only the
+        // last command.
+        assert_eq!(restarted.event_log().len(), last_command_envelopes as usize);
         assert_eq!(restarted.core_snapshot_for_test(), live);
     }
 

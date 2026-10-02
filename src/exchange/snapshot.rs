@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use super::{core::CoreSnapshot, event_store::crc32};
 
 const MAGIC: &[u8; 8] = b"EXCHSNP1";
-const VERSION: u32 = 1;
+/// 2: the core carries the trading session (milestone 22). A version-1 snapshot is refused, and
+/// startup falls back to replaying the journal.
+const VERSION: u32 = 2;
 const HEADER_LEN: usize = 20; // magic + payload length + CRC-32
 const MAX_PAYLOAD_LEN: u64 = 512 * 1024 * 1024;
 

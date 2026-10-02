@@ -149,7 +149,7 @@ impl OrderManager {
         }
 
         self.risk_manager
-            .check_read_only(order)
+            .check(order)
             .map_err(|err| OrderManagerError::RiskRejected(format!("{:?}", err)))?;
 
         match order.side {
@@ -679,6 +679,11 @@ impl OrderManager {
 
     pub(crate) fn set_risk_limit(&mut self, user_id: String, symbol: String, limit: u64) {
         self.risk_manager.set_limit(user_id, symbol, limit);
+    }
+
+    /// A trading day opened: daily risk usage starts again.
+    pub(crate) fn start_trading_day(&mut self) {
+        self.risk_manager.start_day();
     }
     pub(crate) fn register_order(&mut self, order: Order) {
         let order_id = order.order_id.clone();

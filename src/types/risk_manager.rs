@@ -4,9 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use super::types::{Order, RiskError};
 
-/// Seconds in a trading day, used to turn an order's timestamp into a day number.
-const SECONDS_PER_DAY: f64 = 86_400.0;
-
 /// The cap applied to any `(user, symbol)` with no explicit limit — the design document's own
 /// example, "a user can only trade a maximum of 1 million shares of Apple stock in one day".
 ///
@@ -19,18 +16,15 @@ pub struct RiskManager {
     limits: HashMap<(String, String), u64>,
     /// Quantity still resting and able to trade, including orders from earlier days.
     open_volumes: HashMap<(String, String), u64>,
-    /// Today's executed quantity plus every quantity still open and able to execute today.
+    /// Today's executed quantity plus every quantity still open and able to execute today. "Today"
+    /// is the trading day the operator opened; `start_day` begins a new one.
     volumes: HashMap<(String, String), u64>,
-    /// Which day the counters in `volumes` belong to, as a day number derived from order
-    /// timestamps. `None` until the first order is seen.
-    current_day: Option<i64>,
 }
 
 /// Risk counters are persisted as rows because JSON object keys cannot faithfully represent the
 /// `(user, symbol)` keys used by the in-memory lookup maps.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RiskManagerSnapshot {
-    current_day: Option<i64>,
     entries: Vec<RiskSnapshotEntry>,
 }
 
@@ -49,7 +43,6 @@ impl RiskManager {
             limits: HashMap::new(),
             open_volumes: HashMap::new(),
             volumes: HashMap::new(),
-            current_day: None,
         }
     }
 
@@ -71,58 +64,20 @@ impl RiskManager {
             .unwrap_or(0)
     }
 
-    fn day_of(timestamp: f64) -> i64 {
-        (timestamp / SECONDS_PER_DAY).floor() as i64
-    }
-
-    /// Rolls daily usage when an order's own timestamp says a new day has started.
+    /// Starts a trading day, when the operator opens the market.
     ///
-    /// The day comes from the event, never from the system clock. A wall-clock reset would destroy
-    /// deterministic replay: the same log would rebuild different state tomorrow than it did today,
-    /// and orders that were accepted would start being rejected. `Order.timestamp` is already
-    /// recorded in `NewOrderRequested`, so deriving the day from it replays exactly.
-    ///
-    /// Only rolls forward. A timestamp that goes backwards across a boundary — clock jitter at the
-    /// gateway — is ignored rather than resetting the counters a second time.
-    fn roll_day(&mut self, timestamp: f64) {
-        let day = Self::day_of(timestamp);
-
-        match self.current_day {
-            Some(current) if day <= current => {}
-            _ => {
-                // Executed quantity belongs to the day it traded and expires here. Resting orders
-                // do not expire: they can still execute today, so their remaining quantity is the
-                // starting usage for the new day.
-                self.volumes.clone_from(&self.open_volumes);
-                self.current_day = Some(day);
-            }
-        }
+    /// The day comes from a journaled open, never from a clock or an order's timestamp: a
+    /// wall-clock reset would make the same log rebuild different state tomorrow than it did today.
+    /// Executed quantity belongs to the day it traded and expires here. Resting orders do not: they
+    /// can still execute today, so their remaining quantity is the new day's starting usage.
+    pub fn start_day(&mut self) {
+        self.volumes.clone_from(&self.open_volumes);
     }
 
-    /// Rolls the trading day if this order starts one, then checks it against the limit.
-    ///
-    /// Takes `&mut self` because the day roll is state. It runs before matching, so the volume it
-    /// counts is what the order could trade, not what it did — a pre-trade check cannot know fills
-    /// that have not happened yet.
-    pub fn check(&mut self, order: &Order) -> Result<(), RiskError> {
-        self.roll_day(order.timestamp);
-
-        self.check_current_day(order)
-    }
-
-    pub fn check_read_only(&self, order: &Order) -> Result<(), RiskError> {
-        let day = Self::day_of(order.timestamp);
-        let key = (order.user_id.clone(), order.symbol.clone());
-        let current_volume = if self.current_day.is_some_and(|current| day > current) {
-            self.open_volumes.get(&key).copied().unwrap_or(0)
-        } else {
-            self.volumes.get(&key).copied().unwrap_or(0)
-        };
-
-        self.check_projected(order, current_volume)
-    }
-
-    fn check_current_day(&self, order: &Order) -> Result<(), RiskError> {
+    /// Checks an order against today's limit. It runs before matching, so the volume it counts is
+    /// what the order could trade, not what it did: a pre-trade check cannot know fills that have
+    /// not happened yet.
+    pub fn check(&self, order: &Order) -> Result<(), RiskError> {
         let current_volume = self
             .volumes
             .get(&(order.user_id.clone(), order.symbol.clone()))
@@ -159,7 +114,6 @@ impl RiskManager {
 
     /// Counts an accepted order against the day, once its collateral has been reserved.
     pub fn record(&mut self, order: &Order) {
-        self.roll_day(order.timestamp);
         let key = (order.user_id.clone(), order.symbol.clone());
         let current = self.volumes.get(&key).copied().unwrap_or(0);
         let open = self.open_volumes.get(&key).copied().unwrap_or(0);
@@ -247,7 +201,6 @@ impl RiskManager {
         keys.dedup();
 
         RiskManagerSnapshot {
-            current_day: self.current_day,
             entries: keys
                 .into_iter()
                 .map(|(user_id, symbol)| {
@@ -289,18 +242,10 @@ impl RiskManager {
             }
         }
 
-        if snapshot.current_day.is_none()
-            && (open_volumes.values().any(|&volume| volume != 0)
-                || volumes.values().any(|&volume| volume != 0))
-        {
-            return Err("risk snapshot has usage without a current trading day".to_string());
-        }
-
         Ok(Self {
             limits,
             open_volumes,
             volumes,
-            current_day: snapshot.current_day,
         })
     }
 }
@@ -364,25 +309,23 @@ mod tests {
     }
 
     #[test]
-    fn the_day_rolls_from_the_order_timestamp_not_the_clock() {
+    fn a_new_day_starts_only_when_the_market_opens() {
         let mut risk = RiskManager::new();
         risk.set_limit("trader".to_string(), "AAPL".to_string(), 10);
 
-        let day_one = order_at("trader", 10, 3_600.0);
-        risk.check(&day_one).unwrap();
-        risk.record(&day_one);
-
-        // Same day, later: the allowance is gone.
-        assert!(risk.check(&order_at("trader", 1, 7_200.0)).is_err());
-
-        // Once the order has traded, it is no longer open exposure. Its traded usage expires at
-        // the next day boundary.
+        let traded = order_at("trader", 10, 3_600.0);
+        risk.check(&traded).unwrap();
+        risk.record(&traded);
+        // Once the order has traded, it is no longer open exposure; its usage stays for the day.
         risk.record_fill("trader", "AAPL", 10);
 
-        // A timestamp in the next day resets it. Nothing here consults the system clock, which is
-        // what lets a recorded history replay to the same answers on any future date.
-        risk.check(&order_at("trader", 10, 90_000.0)).unwrap();
+        // A timestamp a day later changes nothing: only an opened trading day does. Nothing here
+        // consults a clock, which is what lets a recorded history replay to the same answers.
+        assert!(risk.check(&order_at("trader", 1, 90_000.0)).is_err());
+
+        risk.start_day();
         assert_eq!(risk.used_today("trader", "AAPL"), 0);
+        risk.check(&order_at("trader", 10, 90_000.0)).unwrap();
     }
 
     #[test]
@@ -394,6 +337,7 @@ mod tests {
         risk.check(&resting).unwrap();
         risk.record(&resting);
 
+        risk.start_day();
         assert!(matches!(
             risk.check(&order_at("trader", 1, 90_000.0)),
             Err(RiskError::LimitExceeded {
@@ -402,22 +346,6 @@ mod tests {
             })
         ));
         assert_eq!(risk.used_today("trader", "AAPL"), 10);
-    }
-
-    #[test]
-    fn a_backwards_timestamp_does_not_reset_the_day_again() {
-        let mut risk = RiskManager::new();
-        risk.set_limit("trader".to_string(), "AAPL".to_string(), 10);
-
-        let second_day = order_at("trader", 10, 90_000.0);
-        risk.check(&second_day).unwrap();
-        risk.record(&second_day);
-
-        // Clock jitter pointing back into the previous day must not hand back the allowance.
-        assert!(matches!(
-            risk.check(&order_at("trader", 1, 3_600.0)),
-            Err(RiskError::LimitExceeded { .. })
-        ));
     }
 
     #[test]
