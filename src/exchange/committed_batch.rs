@@ -3,6 +3,8 @@
 
 use std::collections::HashSet;
 
+use chrono::NaiveDate;
+
 use crate::types::{
     exchange_event::{EventEnvelope, ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent},
     types::{Execution, Order},
@@ -34,6 +36,12 @@ pub enum CancelOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ExpiredOrder {
+    pub order_id: String,
+    pub matching_sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum CommittedCommand {
     NewOrder {
         order: Order,
@@ -45,6 +53,14 @@ pub enum CommittedCommand {
         user_id: String,
         outcome: CancelOutcome,
     },
+    /// A trading day opened. A client order id is unique within a trading day only.
+    MarketOpened { trading_day: NaiveDate },
+    /// A trading day closed, and every order still resting expired, oldest first.
+    MarketClosed {
+        trading_day: NaiveDate,
+        expired: Vec<ExpiredOrder>,
+    },
+    /// Anything that changes no order: deposits, risk limits, a refused open or close.
     Other,
 }
 
@@ -70,12 +86,64 @@ pub fn decode(batch: &[EventEnvelope]) -> Result<CommittedCommand, String> {
         ExchangeInputEvent::CancelOrderRequested { order_id, user_id } => {
             decode_cancellation(order_id, user_id, &outputs)
         }
+        ExchangeInputEvent::MarketOpenRequested { trading_day } => {
+            decode_open(*trading_day, &outputs)
+        }
+        ExchangeInputEvent::MarketCloseRequested => decode_close(&outputs),
         ExchangeInputEvent::FundsDepositRequested { .. }
         | ExchangeInputEvent::SharesDepositRequested { .. }
-        | ExchangeInputEvent::RiskLimitSetRequested { .. }
-        | ExchangeInputEvent::MarketOpenRequested { .. }
-        | ExchangeInputEvent::MarketCloseRequested => Ok(CommittedCommand::Other),
+        | ExchangeInputEvent::RiskLimitSetRequested { .. } => Ok(CommittedCommand::Other),
     }
+}
+
+fn decode_open(
+    requested: NaiveDate,
+    outputs: &[(u64, &ExchangeOutputEvent)],
+) -> Result<CommittedCommand, String> {
+    match outputs {
+        [(_, ExchangeOutputEvent::MarketOpened { trading_day })] if *trading_day == requested => {
+            Ok(CommittedCommand::MarketOpened {
+                trading_day: requested,
+            })
+        }
+        [(_, ExchangeOutputEvent::SessionRejected { .. })] => Ok(CommittedCommand::Other),
+        _ => Err("open batch has no matching open or refusal".into()),
+    }
+}
+
+fn decode_close(outputs: &[(u64, &ExchangeOutputEvent)]) -> Result<CommittedCommand, String> {
+    let trading_day = match outputs[0].1 {
+        ExchangeOutputEvent::SessionRejected { .. } if outputs.len() == 1 => {
+            return Ok(CommittedCommand::Other);
+        }
+        ExchangeOutputEvent::MarketClosed { trading_day } => *trading_day,
+        _ => return Err("close batch has no matching close or refusal".into()),
+    };
+    let mut order_ids = HashSet::new();
+    let mut expired = Vec::with_capacity(outputs.len() - 1);
+    for (_, output) in &outputs[1..] {
+        let ExchangeOutputEvent::OrderExpired { order_id, seq_num } = output else {
+            return Err("non-expiry output follows the close".into());
+        };
+        // Expiries take consecutive matching sequences, like a run of cancellations.
+        let consecutive = match expired.last() {
+            None => *seq_num > 0,
+            Some(ExpiredOrder {
+                matching_sequence, ..
+            }) => matching_sequence.checked_add(1) == Some(*seq_num),
+        };
+        if !consecutive || !order_ids.insert(order_id.as_str()) {
+            return Err("close expiries are out of sequence or repeat an order".into());
+        }
+        expired.push(ExpiredOrder {
+            order_id: order_id.clone(),
+            matching_sequence: *seq_num,
+        });
+    }
+    Ok(CommittedCommand::MarketClosed {
+        trading_day,
+        expired,
+    })
 }
 
 fn decode_new_order(
@@ -244,6 +312,104 @@ mod tests {
             }),
         ));
         assert!(decode(&malformed).is_err());
+    }
+
+    fn close(outputs: Vec<ExchangeOutputEvent>) -> Vec<EventEnvelope> {
+        std::iter::once(ExchangeEvent::Input(
+            ExchangeInputEvent::MarketCloseRequested,
+        ))
+        .chain(outputs.into_iter().map(ExchangeEvent::Output))
+        .enumerate()
+        .map(|(index, event)| envelope(index as u64 + 1, event))
+        .collect()
+    }
+
+    fn expiry(order_id: &str, seq_num: u64) -> ExchangeOutputEvent {
+        ExchangeOutputEvent::OrderExpired {
+            order_id: order_id.into(),
+            seq_num,
+        }
+    }
+
+    #[test]
+    fn a_close_lists_its_expiries_and_a_refused_close_changes_nothing() {
+        let trading_day = NaiveDate::from_ymd_opt(2026, 10, 5).unwrap();
+        let closed = ExchangeOutputEvent::MarketClosed { trading_day };
+        assert_eq!(
+            decode(&close(vec![
+                closed.clone(),
+                expiry("old", 7),
+                expiry("new", 8)
+            ]))
+            .unwrap(),
+            CommittedCommand::MarketClosed {
+                trading_day,
+                expired: vec![
+                    ExpiredOrder {
+                        order_id: "old".into(),
+                        matching_sequence: 7
+                    },
+                    ExpiredOrder {
+                        order_id: "new".into(),
+                        matching_sequence: 8
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            decode(&close(vec![ExchangeOutputEvent::SessionRejected {
+                reason: "AlreadyClosed".into()
+            }]))
+            .unwrap(),
+            CommittedCommand::Other
+        );
+
+        // A gap, a repeated order, or an expiry without its close is not a committed close.
+        for malformed in [
+            vec![closed.clone(), expiry("old", 7), expiry("new", 9)],
+            vec![closed.clone(), expiry("old", 7), expiry("old", 8)],
+            vec![expiry("old", 7)],
+        ] {
+            assert!(decode(&close(malformed)).is_err());
+        }
+    }
+
+    #[test]
+    fn an_open_names_its_day_and_a_refused_open_changes_nothing() {
+        let day = NaiveDate::from_ymd_opt(2026, 10, 6).unwrap();
+        let open = |output| {
+            vec![
+                envelope(
+                    1,
+                    ExchangeEvent::Input(ExchangeInputEvent::MarketOpenRequested {
+                        trading_day: day,
+                    }),
+                ),
+                envelope(2, ExchangeEvent::Output(output)),
+            ]
+        };
+        assert_eq!(
+            decode(&open(ExchangeOutputEvent::MarketOpened {
+                trading_day: day
+            }))
+            .unwrap(),
+            CommittedCommand::MarketOpened { trading_day: day }
+        );
+        assert_eq!(
+            decode(&open(ExchangeOutputEvent::SessionRejected {
+                reason: "AlreadyOpen".into()
+            }))
+            .unwrap(),
+            CommittedCommand::Other
+        );
+        // An open of some other day is not this command's outcome.
+        let other_day = NaiveDate::from_ymd_opt(2026, 10, 7).unwrap();
+        assert!(
+            decode(&open(ExchangeOutputEvent::MarketOpened {
+                trading_day: other_day
+            }))
+            .is_err()
+        );
     }
 
     #[test]

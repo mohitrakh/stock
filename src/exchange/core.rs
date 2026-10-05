@@ -1,7 +1,7 @@
 use crate::{
     sequencer::Sequencer,
     types::{
-        matching_engine::MatchingEngine,
+        matching_engine::{MAX_RESTING_ORDERS, MatchingEngine},
         order_manager::{OrderManager, OrderManagerError, PreparedCancel, PreparedNewOrder},
         types::{
             BalanceView, Execution, ExecutionView, Order, OrderBookView, OrderView, PositionView,
@@ -29,6 +29,18 @@ pub enum SessionError {
     /// Trading days only move forward, so a replayed history can never revisit a day.
     NotAfterLastTradingDay(NaiveDate),
     AlreadyClosed,
+    /// The close's single journal record, with one expiry for each of these resting orders, would
+    /// exceed the record size limit. The resting-order cap prevents this for orders that passed
+    /// the gateway's id check; it remains a safety net for any other entry point.
+    TooManyRestingOrders(usize),
+}
+
+/// The close's expiry of every resting order, planned without changing anything.
+pub(crate) struct PreparedExpiry {
+    /// Every resting order, oldest acceptance first, with the matching sequence its expiry
+    /// consumes, as a cancellation's does.
+    pub(crate) expired: Vec<(String, u64)>,
+    manager: crate::types::order_manager::PreparedExpiry,
 }
 
 pub struct AddOrderOutcome {
@@ -116,8 +128,9 @@ impl ExchangeCore {
         Ok(())
     }
 
-    /// Starts the day: the risk manager's traded usage expires, and quantity still resting counts
-    /// toward the new day.
+    /// Starts the day: the previous day's finished orders and fills leave memory, and daily risk
+    /// usage restarts from zero. Balances, positions, risk limits, and each symbol's book with its
+    /// execution counter stay, so an execution id never repeats.
     pub(crate) fn commit_open_market(&mut self, trading_day: NaiveDate) {
         self.session = Session {
             trading_day: Some(trading_day),
@@ -137,7 +150,37 @@ impl ExchangeCore {
         }
     }
 
-    pub(crate) fn commit_close_market(&mut self) {
+    /// Plans the close's expiry of every resting order. They expire oldest first, by the
+    /// matching sequence that accepted them, because the books live in a hash map whose order
+    /// differs between processes and replay must reproduce the same sequences. The order id breaks
+    /// a tie, which only a damaged snapshot could create. An error means the ledgers disagree with
+    /// the books: an internal fault.
+    pub(crate) fn prepare_expiry(&self) -> Result<PreparedExpiry, String> {
+        let mut resting = self.matching_engine.resting_orders();
+        resting.sort_by(|left, right| {
+            (left.seq_num, &left.order_id).cmp(&(right.seq_num, &right.order_id))
+        });
+        let manager = self
+            .order_manager
+            .prepare_expiry(resting.iter().map(|order| order.order_id.as_str()))
+            .map_err(|error| format!("{:?}", error))?;
+        let expired = resting
+            .into_iter()
+            .zip(self.sequencer.peek()..)
+            .map(|(order, seq_num)| (order.order_id, seq_num))
+            .collect();
+        Ok(PreparedExpiry { expired, manager })
+    }
+
+    /// Closes the market. Every resting order expires and leaves its book.
+    pub(crate) fn commit_close_market(&mut self, expiry: PreparedExpiry) {
+        if let Some(&(_, last_seq)) = expiry.expired.last() {
+            for (_, seq_num) in &expiry.expired {
+                self.sequencer.commit(*seq_num);
+            }
+            self.matching_engine.commit_expire_all(last_seq);
+        }
+        self.order_manager.commit_expiry(expiry.manager);
         self.session.open = false;
     }
 
@@ -151,7 +194,10 @@ impl ExchangeCore {
     #[cfg(test)]
     pub(crate) fn close_market(&mut self) -> Result<NaiveDate, SessionError> {
         let day = self.prepare_close_market()?;
-        self.commit_close_market();
+        let expiry = self
+            .prepare_expiry()
+            .expect("test ledgers agree with the books");
+        self.commit_close_market(expiry);
         Ok(day)
     }
 
@@ -234,9 +280,15 @@ impl ExchangeCore {
         self.set_risk_limit(user_id, symbol, limit);
     }
 
-    pub(crate) fn prepare_add_order(
+    pub(crate) fn prepare_add_order(&self, order: Order) -> Result<PreparedAddOrder, CoreError> {
+        self.prepare_add_order_within(order, MAX_RESTING_ORDERS)
+    }
+
+    /// `max_resting` is `MAX_RESTING_ORDERS`, except in tests that cannot build that many orders.
+    fn prepare_add_order_within(
         &self,
         mut order: Order,
+        max_resting: usize,
     ) -> Result<PreparedAddOrder, CoreError> {
         let seq_num = self.sequencer.peek();
         order.seq_num = seq_num;
@@ -248,6 +300,13 @@ impl ExchangeCore {
             .matching_engine
             .prepare_order(order.clone())
             .map_err(CoreError::Internal)?;
+        // The cap keeps the close's single journal record within its size limit.
+        if self
+            .matching_engine
+            .exceeds_capacity(&matching.plan, max_resting)
+        {
+            return Err(CoreError::Business(OrderManagerError::BookFull));
+        }
         let executions = matching.plan.executions.clone();
         let manager = self
             .order_manager
@@ -404,13 +463,13 @@ impl ExchangeCore {
                 return Err("core snapshot contains a duplicated resting order".to_string());
             }
         }
+        // The close expires every resting order, and none is accepted while closed.
+        if !self.session.open && !resting.is_empty() {
+            return Err("core snapshot has resting orders while the market is closed".to_string());
+        }
 
         for managed in self.order_manager.orders.values() {
-            let is_resting = matches!(
-                managed.state,
-                crate::types::order_manager::OrderState::New
-                    | crate::types::order_manager::OrderState::PartiallyFilled
-            );
+            let is_resting = managed.state.is_resting();
             let book_order = resting.remove(&managed.order.order_id);
             if is_resting != book_order.is_some() {
                 return Err(format!(
@@ -974,34 +1033,186 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 10, day).unwrap()
     }
 
+    /// Every order is a day order: the close expires whatever still rests, and leaves the ledgers
+    /// exactly where cancelling each of those orders would have left them.
     #[test]
-    fn overnight_fills_and_cancellation_cannot_refund_todays_traded_usage() {
+    fn the_close_expires_every_resting_order_exactly_like_a_cancellation() {
+        let trade_then_rest = |core: &mut ExchangeCore| {
+            core.deposit("buyer".to_string(), 1_000).unwrap();
+            core.open_market(day(1)).unwrap();
+            core.add_order(order("sell", "seller", "SELL", 10, 10))
+                .unwrap();
+            // Takes 4 of the sell, which keeps resting with 6.
+            core.add_order(order("buy-filled", "buyer", "BUY", 10, 4))
+                .unwrap();
+            core.add_order(order("buy-resting", "buyer", "BUY", 9, 5))
+                .unwrap();
+            core.add_order(order("alice-sell", "alice", "SELL", 12, 3))
+                .unwrap();
+        };
+        let mut expired = funded_core();
+        trade_then_rest(&mut expired);
+        let mut canceled = funded_core();
+        trade_then_rest(&mut canceled);
+
+        assert_eq!(expired.close_market(), Ok(day(1)));
+        for (order_id, user) in [
+            ("sell", "seller"),
+            ("buy-resting", "buyer"),
+            ("alice-sell", "alice"),
+        ] {
+            canceled.cancel_order_for_user(order_id, user).unwrap();
+        }
+        canceled.close_market().unwrap();
+
+        for user in ["buyer", "seller", "alice"] {
+            assert_eq!(expired.balance_view(user), canceled.balance_view(user));
+            assert_eq!(expired.position_views(user), canceled.position_views(user));
+            assert_eq!(
+                expired.risk_limit_view(user, "AAPL"),
+                canceled.risk_limit_view(user, "AAPL")
+            );
+        }
+        assert_eq!(expired.balance_view("buyer").locked, 0);
+        assert_eq!(expired.position_views("seller")[0].locked, 0);
+        // The fill still counts against the day it traded on; the expired quantity does not.
+        assert_eq!(expired.risk_limit_view("buyer", "AAPL").used_today, 4);
+        assert_eq!(expired.risk_limit_view("seller", "AAPL").used_today, 4);
+
+        assert_eq!(
+            expired.order_manager.get_state("sell"),
+            Some(OrderState::Expired)
+        );
+        assert_eq!(
+            expired.order_manager.get_state("buy-filled"),
+            Some(OrderState::Filled)
+        );
+        let sell = expired.order_view("sell", "seller").unwrap();
+        assert_eq!(
+            (sell.status.as_str(), sell.remaining_quantity),
+            ("expired", 6)
+        );
+        let book = expired.l2_snapshot("AAPL", 10).unwrap();
+        assert!(book.bids.is_empty() && book.asks.is_empty());
+    }
+
+    #[test]
+    fn expiries_take_sequences_oldest_first_and_the_next_day_continues_both_counters() {
         let mut core = funded_core();
-        core.deposit("trader".to_string(), 1_000).unwrap();
-        core.set_risk_limit("trader".to_string(), "AAPL".to_string(), 10);
-
+        core.deposit("buyer".to_string(), 1_000).unwrap();
         core.open_market(day(1)).unwrap();
-        core.add_order(order("overnight", "trader", "BUY", 10, 10))
+        core.add_order(order("first", "seller", "SELL", 12, 2))
             .unwrap();
-        core.close_market().unwrap();
-
-        // Four shares trade on day two. Usage remains ten: four traded today plus six still open.
-        core.open_market(day(2)).unwrap();
-        core.add_order(order("day-two-sell", "seller", "SELL", 10, 4))
+        core.add_order(order("second", "buyer", "BUY", 9, 1))
             .unwrap();
-        assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 10);
+        let trade = core
+            .add_order(order("third", "buyer", "BUY", 12, 1))
+            .unwrap();
+        assert_eq!(trade.executions[0].execution_id, "exec_0");
 
-        core.cancel_order_for_user("overnight", "trader").unwrap();
-        assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 4);
+        // The book holds "second" (a bid) ahead of "first" (an ask). Expiry goes by acceptance,
+        // and each expiry consumes the next matching sequence.
+        let expiry = core.prepare_expiry().unwrap();
+        assert_eq!(
+            expiry.expired,
+            vec![("first".to_string(), 4), ("second".to_string(), 5)]
+        );
+        core.commit_close_market(expiry);
 
         assert!(matches!(
-            core.add_order(order("too-many", "trader", "BUY", 10, 7)),
-            Err(OrderManagerError::RiskRejected(_))
+            core.cancel_order_for_user("first", "seller"),
+            Err(OrderManagerError::InvalidTransition(_))
         ));
+        let restored = ExchangeCore::from_snapshot(core.snapshot()).unwrap();
+        assert_eq!(restored.snapshot(), core.snapshot());
 
-        core.add_order(order("remaining", "trader", "BUY", 10, 6))
+        // The next day continues the matching sequence, and each book's execution ids.
+        core.open_market(day(2)).unwrap();
+        core.add_order(order("ask", "alice", "SELL", 10, 1))
             .unwrap();
-        assert_eq!(core.risk_limit_view("trader", "AAPL").used_today, 10);
+        let next = core.add_order(order("bid", "buyer", "BUY", 10, 1)).unwrap();
+        assert_eq!(next.seq_num, 7);
+        assert_eq!(next.executions[0].execution_id, "exec_2");
+    }
+
+    #[test]
+    fn the_next_open_clears_the_previous_day_and_its_ids_return() {
+        let mut core = funded_core();
+        core.deposit("buyer".to_string(), 1_000).unwrap();
+        core.open_market(day(1)).unwrap();
+        core.add_order(order("sell", "seller", "SELL", 10, 5))
+            .unwrap();
+        core.add_order(order("buy", "buyer", "BUY", 10, 3)).unwrap();
+        core.close_market().unwrap();
+
+        // Until the next open, the day just closed can still be read.
+        assert_eq!(core.order_view("sell", "seller").unwrap().status, "expired");
+        assert_eq!(
+            core.execution_views("buyer", None, None, None, None).len(),
+            1
+        );
+
+        core.open_market(day(2)).unwrap();
+        assert!(core.order_manager.orders.is_empty());
+        assert!(core.order_view("buy", "buyer").is_none());
+        assert!(
+            core.execution_views("buyer", None, None, None, None)
+                .is_empty()
+        );
+        // Cash, shares and each book's execution counter carry over.
+        assert_eq!(core.balance_view("buyer").balance, 970);
+        assert_eq!(core.position_views("buyer")[0].quantity, 3);
+        core.add_order(order("sell", "seller", "SELL", 10, 1))
+            .unwrap();
+        let again = core.add_order(order("buy", "buyer", "BUY", 10, 1)).unwrap();
+        assert_eq!(again.executions[0].execution_id, "exec_2");
+        assert_eq!(
+            ExchangeCore::from_snapshot(core.snapshot())
+                .unwrap()
+                .snapshot(),
+            core.snapshot()
+        );
+    }
+
+    #[test]
+    fn an_order_that_would_rest_beyond_the_cap_is_refused_but_trading_goes_on() {
+        let mut core = funded_core();
+        core.deposit("buyer".to_string(), 1_000).unwrap();
+        // A cap of two resting orders stands in for the real 200,000.
+        let add = |core: &mut ExchangeCore, order: Order| {
+            core.prepare_add_order_within(order, 2)
+                .map(|prepared| core.commit_add_order(prepared))
+        };
+        add(&mut core, order("ask-10", "seller", "SELL", 10, 1)).unwrap();
+        add(&mut core, order("ask-11", "alice", "SELL", 11, 1)).unwrap();
+
+        assert!(matches!(
+            add(&mut core, order("ask-12", "bob", "SELL", 12, 1)),
+            Err(CoreError::Business(OrderManagerError::BookFull))
+        ));
+        assert!(!core.matching_engine.is_resting("ask-12"));
+        // A full book still trades: an order that does not rest is accepted, which frees a place.
+        add(&mut core, order("buy-10", "buyer", "BUY", 10, 1)).unwrap();
+        add(&mut core, order("bid-9", "buyer", "BUY", 9, 1)).unwrap();
+        // Full again. An order that takes a resting order out as it rests keeps the count level.
+        add(&mut core, order("buy-11", "buyer", "BUY", 11, 2)).unwrap();
+        assert!(core.matching_engine.is_resting("buy-11"));
+        assert!(matches!(
+            add(&mut core, order("bid-8", "buyer", "BUY", 8, 1)),
+            Err(CoreError::Business(OrderManagerError::BookFull))
+        ));
+    }
+
+    #[test]
+    fn a_snapshot_cannot_hold_resting_orders_while_the_market_is_closed() {
+        let mut core = funded_core();
+        core.open_market(day(1)).unwrap();
+        core.add_order(order("sell", "seller", "SELL", 10, 1))
+            .unwrap();
+        let mut snapshot = core.snapshot();
+        snapshot.session.open = false;
+
+        assert!(ExchangeCore::from_snapshot(snapshot).is_err());
     }
 
     #[test]
@@ -1363,6 +1574,7 @@ mod tests {
     #[test]
     fn normalized_snapshot_restores_fifo_books_ledgers_and_sequences() {
         let mut core = ExchangeCore::new();
+        core.open_market(day(1)).unwrap();
         core.deposit("buyer".to_string(), 100).unwrap();
         core.deposit_shares("seller-a", "AAPL", 5).unwrap();
         core.deposit_shares("seller-b", "AAPL", 5).unwrap();

@@ -56,9 +56,12 @@ pub struct OrderRequest {
     pub price: u64,
     pub quantity: u32,
     /// Optional client-supplied order id, the FIX `ClOrdID` idea. Supply one and a retry of the
-    /// same request is rejected as a duplicate instead of opening a second order — which matters
-    /// now that the exchange can durably accept an order and still lose the HTTP response. Omit it
-    /// and the server mints a uuid, which is convenient but gives a retry no way to be recognised.
+    /// same request within the same trading day is rejected as a duplicate instead of opening a
+    /// second order — which matters now that the exchange can durably accept an order and still
+    /// lose the HTTP response. Ids are unique per trading day only: after the next open the same id
+    /// opens a new order, so a client that lost a reply should check with `GET` before then rather
+    /// than retry across a close. Omit it and the server mints a uuid, which is convenient but gives
+    /// a retry no way to be recognised.
     pub client_order_id: Option<String>,
 }
 
@@ -165,8 +168,11 @@ pub async fn place_order(
     .await?
     .map_err(|err| {
         // A reused client order id is the retry case, not a malformed request, and a closed
-        // market is the exchange's state, not the request's fault.
-        if err.contains("AlreadyExists") || err == crate::exchange::runtime::MARKET_CLOSED {
+        // market or a full book is the exchange's state, not the request's fault.
+        if err.contains("AlreadyExists")
+            || err == crate::exchange::runtime::MARKET_CLOSED
+            || err == "BookFull"
+        {
             AppError::Conflict(err)
         } else {
             map_exchange_error(err)

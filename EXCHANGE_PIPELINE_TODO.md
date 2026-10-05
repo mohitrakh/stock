@@ -423,8 +423,8 @@ Full write-up: `docs/tasks/16-subscribers-keep-up.md`; measurements in `docs/per
 Selected: milestone 22, Trading Day. The specification is in `PROJECT_DIRECTION.md` ("22. Trading Day"); the write-up is `docs/tasks/17-trading-day.md`. In progress.
 
 - [x] Part 1 (2026-10-02): session commands (`MarketOpenRequested` / `MarketCloseRequested`), the loopback operator port, closed-market rejection in `prepare_input_event`, the risk day from sessions, snapshot version 2.
-- [ ] Part 2: expiry of every resting order at the close (`OrderExpired`, collateral and risk released), through the shared decoder, the MDP and the reporter.
-- [ ] Part 3: clearing the previous day at the next open; client order ids unique per trading day; reporter keys `(trading_day, order_id)` and the third migration; a warm-replica snapshot after each open.
+- [x] Part 2 (2026-10-05): expiry of every resting order at the close (`OrderExpired`, collateral and risk released), through the shared decoder, the MDP and the reporter; at most 200,000 resting orders (`BookFull`), so the close always fits one record.
+- [x] Part 3 (2026-10-05): clearing the previous day at the next open; client order ids unique per trading day; reporter keys `(trading_day, order_id)` and a fourth migration; a warm-replica snapshot after each open.
 - [ ] Part 4: multi-day benchmark (`--bench --days N`) against the milestone 21 binary; `docs/performance/07-*.md`, `docs/tasks/17-trading-day.md`.
 - [ ] Update `PROJECT_DIRECTION.md` after every part; independent review; `cargo fmt -- --check`, `cargo test --locked`, PostgreSQL acceptance tests.
 

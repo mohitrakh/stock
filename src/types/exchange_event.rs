@@ -88,10 +88,18 @@ pub enum ExchangeOutputEvent {
     MarketOpened {
         trading_day: NaiveDate,
     },
+    /// The close of a trading day. Its record also holds one `OrderExpired` for every order still
+    /// resting, oldest first.
     MarketClosed {
         trading_day: NaiveDate,
     },
-    /// An open or close that the session's state does not allow, such as opening an open market.
+    /// A resting order expired at the close. Like a cancellation, it consumes a matching sequence.
+    OrderExpired {
+        order_id: String,
+        seq_num: u64,
+    },
+    /// An open or close the exchange refused, such as opening an open market or a close too large
+    /// for one journal record. Nothing changed.
     SessionRejected {
         reason: String,
     },
@@ -165,10 +173,21 @@ mod tests {
                     trading_day: day,
                 }),
             },
+            EventEnvelope {
+                seq_num: 5,
+                event: ExchangeEvent::Output(ExchangeOutputEvent::OrderExpired {
+                    order_id: "resting".to_string(),
+                    seq_num: 7,
+                }),
+            },
         ];
 
         let bytes = serde_json::to_vec(&batch).unwrap();
-        assert!(String::from_utf8_lossy(&bytes).contains(r#""trading_day":"2026-10-01""#));
+        let json = String::from_utf8_lossy(&bytes);
+        assert!(json.contains(r#""trading_day":"2026-10-01""#));
+        assert!(
+            json.contains(r#"{"kind":"order_expired","data":{"order_id":"resting","seq_num":7}}"#)
+        );
         let recovered: Vec<EventEnvelope> = serde_json::from_slice(&bytes).unwrap();
 
         assert_eq!(recovered, batch);

@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use super::order_book::{MatchPlan, OrderBook, OrderBookSnapshot};
 use super::types::{L2Level, Order, OrderBookView, Price};
 
+/// Most orders the books hold at once, across every symbol. The close expires every resting order
+/// in one journal record, which may not exceed 64 MiB. With the gateway's longest order id (64
+/// bytes, each escaped to two in JSON) and the widest sequence numbers, one expiry takes under 280
+/// bytes there, so a close of this many orders, about 56 MB, always fits.
+pub(crate) const MAX_RESTING_ORDERS: usize = 200_000;
+
 #[derive(Debug)]
 pub struct MatchingEngine {
     order_books: HashMap<String, OrderBook>,
@@ -111,6 +117,16 @@ impl MatchingEngine {
         self.last_seq = prepared.seq_num;
     }
 
+    /// Expires every resting order at the close; `last_seq` is the last sequence the expiries
+    /// consumed. The books stay, empty, so each keeps its execution counter.
+    pub(crate) fn commit_expire_all(&mut self, last_seq: u64) {
+        for book in self.order_books.values_mut() {
+            book.clear();
+        }
+        self.order_location.clear();
+        self.last_seq = last_seq;
+    }
+
     pub fn best_bid_ask(&self, symbol: &str) -> Option<((Price, u64), (Price, u64))> {
         let book = self.order_books.get(symbol)?;
         Some((book.best_bid()?, book.best_ask()?))
@@ -138,6 +154,14 @@ impl MatchingEngine {
 
     pub fn is_resting(&self, order_id: &str) -> bool {
         self.order_location.contains_key(order_id)
+    }
+
+    /// Whether the new order this plan was made for would rest beyond `max_resting` resting
+    /// orders. Orders that trade without resting are never refused, nor is one that takes as many
+    /// resting orders out of the book as it adds.
+    pub(crate) fn exceeds_capacity(&self, plan: &MatchPlan, max_resting: usize) -> bool {
+        plan.remaining > 0
+            && self.order_location.len() + 1 - plan.filled_resting_orders().count() > max_resting
     }
 
     pub(crate) fn snapshot(&self) -> MatchingEngineSnapshot {

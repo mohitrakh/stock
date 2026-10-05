@@ -14,10 +14,13 @@ use std::{
 };
 
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use chrono::NaiveDate;
 use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions};
 
 use super::{
-    committed_batch::{self, CancelOutcome, CommittedCommand, ExecutionPair, NewOrderOutcome},
+    committed_batch::{
+        self, CancelOutcome, CommittedCommand, ExecutionPair, ExpiredOrder, NewOrderOutcome,
+    },
     event_stream::{ReaderCheckpoint, StreamReader},
 };
 use crate::types::types::{Order, Side};
@@ -65,21 +68,26 @@ async fn connect() -> ReporterResult<PgPool> {
         .await?)
 }
 
-async fn load_checkpoint(pool: &PgPool) -> ReporterResult<Option<ReaderCheckpoint>> {
-    let row: Option<(String, String, String, String)> = sqlx::query_as(
-        "SELECT journal_device::text, journal_inode::text, next_sequence::text, byte_offset::text \
-         FROM reporter_checkpoint WHERE singleton = $1",
+/// The reader position after the last applied batch, and the trading day the journal was in there:
+/// orders are keyed by day, and only an open in the journal says which day it is.
+async fn load_checkpoint(
+    pool: &PgPool,
+) -> ReporterResult<Option<(ReaderCheckpoint, Option<NaiveDate>)>> {
+    let row: Option<(String, String, String, String, Option<NaiveDate>)> = sqlx::query_as(
+        "SELECT journal_device::text, journal_inode::text, next_sequence::text, byte_offset::text, \
+         trading_day FROM reporter_checkpoint WHERE singleton = $1",
     )
     .bind(CHECKPOINT_ID)
     .fetch_optional(pool)
     .await?;
-    row.map(|(device, inode, next, offset)| {
-        Ok(StreamReader::checkpoint_from_parts(
+    row.map(|(device, inode, next, offset, trading_day)| {
+        let checkpoint = StreamReader::checkpoint_from_parts(
             parse_number("journal device", device)?,
             parse_number("journal inode", inode)?,
             parse_number("next sequence", next)?,
             parse_number("byte offset", offset)?,
-        ))
+        );
+        Ok((checkpoint, trading_day))
     })
     .transpose()
 }
@@ -105,6 +113,7 @@ async fn ensure_consistent_saved_state(
 async fn save_checkpoint(
     tx: &mut Transaction<'_, Postgres>,
     checkpoint: &ReaderCheckpoint,
+    trading_day: Option<NaiveDate>,
 ) -> ReporterResult<()> {
     // The checkpoint is private to event_stream; serde is not an external database interface.
     let encoded = serde_json::to_value(checkpoint)?;
@@ -118,47 +127,55 @@ async fn save_checkpoint(
     let inode = field("inode")?;
     let next_sequence = field("next_sequence")?;
     let byte_offset = field("byte_offset")?;
-    // report_version 2 is the milestone 21 schema. The column has no default, so a reporter built
-    // before it cannot save a checkpoint into a migrated database.
+    // report_version 4 is the milestone 22 schema, which keys orders by trading day. The column has
+    // no default and accepts only the current version, so an older reporter cannot save a
+    // checkpoint into a migrated database.
     sqlx::query(
-        "INSERT INTO reporter_checkpoint (singleton, report_version, journal_device, journal_inode, next_sequence, byte_offset) \
-         VALUES ($1, 2, $2::numeric, $3::numeric, $4::numeric, $5::numeric) \
+        "INSERT INTO reporter_checkpoint (singleton, report_version, journal_device, journal_inode, next_sequence, byte_offset, trading_day) \
+         VALUES ($1, 4, $2::numeric, $3::numeric, $4::numeric, $5::numeric, $6) \
          ON CONFLICT (singleton) DO UPDATE SET journal_device = EXCLUDED.journal_device, \
-         journal_inode = EXCLUDED.journal_inode, next_sequence = EXCLUDED.next_sequence, byte_offset = EXCLUDED.byte_offset",
+         journal_inode = EXCLUDED.journal_inode, next_sequence = EXCLUDED.next_sequence, byte_offset = EXCLUDED.byte_offset, \
+         trading_day = EXCLUDED.trading_day",
     ).bind(CHECKPOINT_ID).bind(number(device)).bind(number(inode))
-        .bind(number(next_sequence)).bind(number(byte_offset)).execute(&mut **tx).await?;
+        .bind(number(next_sequence)).bind(number(byte_offset)).bind(trading_day)
+        .execute(&mut **tx).await?;
     Ok(())
 }
 
-/// Accepted orders only: the engine never accepts an order id twice, so it can be the key.
+/// Accepted orders only. The engine never accepts an order id twice within a trading day, so the
+/// day and the id together are the key.
 async fn insert_accepted_order(
     tx: &mut Transaction<'_, Postgres>,
+    trading_day: NaiveDate,
     order: &Order,
     acceptance_sequence: u64,
 ) -> ReporterResult<()> {
     let original = quantity(order.quantity)?;
     sqlx::query(
-        "INSERT INTO reported_orders (order_id, user_id, symbol, side, limit_price, original_quantity, filled_quantity, remaining_quantity, status, creation_time, acceptance_sequence) \
-         VALUES ($1, $2, $3, $4, $5::numeric, $6, 0, $6, 'new', $7, $8::numeric)",
-    ).bind(&order.order_id).bind(&order.user_id).bind(&order.symbol).bind(side(&order.side))
-        .bind(number(order.price.minor_units())).bind(original).bind(order.timestamp)
-        .bind(number(acceptance_sequence)).execute(&mut **tx).await?;
+        "INSERT INTO reported_orders (trading_day, order_id, user_id, symbol, side, limit_price, original_quantity, filled_quantity, remaining_quantity, status, creation_time, acceptance_sequence) \
+         VALUES ($1, $2, $3, $4, $5, $6::numeric, $7, 0, $7, 'new', $8, $9::numeric)",
+    ).bind(trading_day).bind(&order.order_id).bind(&order.user_id).bind(&order.symbol)
+        .bind(side(&order.side)).bind(number(order.price.minor_units())).bind(original)
+        .bind(order.timestamp).bind(number(acceptance_sequence)).execute(&mut **tx).await?;
     Ok(())
 }
 
 /// A rejected submission is keyed by the journal sequence of its input, because its order id need
 /// not be unique: a client retry of an existing id, a reused rejected id, or another user's id.
+/// `trading_day` is the day the journal was in, so the refusal can be matched to that day's
+/// order; `None` before the first open.
 async fn insert_rejected_order(
     tx: &mut Transaction<'_, Postgres>,
     input_sequence: u64,
+    trading_day: Option<NaiveDate>,
     order: &Order,
     reason: &str,
 ) -> ReporterResult<()> {
     sqlx::query(
-        "INSERT INTO rejected_orders (input_sequence, order_id, user_id, symbol, side, limit_price, quantity, creation_time, reason) \
-         VALUES ($1::numeric, $2, $3, $4, $5, $6::numeric, $7, $8, $9)",
-    ).bind(number(input_sequence)).bind(&order.order_id).bind(&order.user_id).bind(&order.symbol)
-        .bind(side(&order.side)).bind(number(order.price.minor_units()))
+        "INSERT INTO rejected_orders (input_sequence, trading_day, order_id, user_id, symbol, side, limit_price, quantity, creation_time, reason) \
+         VALUES ($1::numeric, $2, $3, $4, $5, $6, $7::numeric, $8, $9, $10)",
+    ).bind(number(input_sequence)).bind(trading_day).bind(&order.order_id).bind(&order.user_id)
+        .bind(&order.symbol).bind(side(&order.side)).bind(number(order.price.minor_units()))
         .bind(quantity(order.quantity)?).bind(order.timestamp).bind(reason)
         .execute(&mut **tx).await?;
     Ok(())
@@ -169,6 +186,7 @@ async fn insert_rejected_order(
 /// Three statements per trade became one; round trips, not commits, now limit the reporter.
 async fn apply_trade(
     tx: &mut Transaction<'_, Postgres>,
+    trading_day: NaiveDate,
     pair: &ExecutionPair,
 ) -> ReporterResult<()> {
     let execution = &pair.first;
@@ -178,12 +196,12 @@ async fn apply_trade(
         " UPDATE reported_orders SET filled_quantity = filled_quantity + $4,",
         " remaining_quantity = remaining_quantity - $4,",
         " status = CASE WHEN remaining_quantity - $4 = 0 THEN 'filled' ELSE 'partially_filled' END",
-        " WHERE order_id IN ($5, $6) AND status IN ('new', 'partially_filled')",
+        " WHERE trading_day = $10 AND order_id IN ($5, $6) AND status IN ('new', 'partially_filled')",
         " AND remaining_quantity >= $4",
         " RETURNING order_id)",
-        " INSERT INTO reported_trades (trade_sequence, symbol, price, quantity, buy_order_id,",
-        " sell_order_id, first_execution_id, second_execution_id, trade_time)",
-        " SELECT $1::numeric, $2, $3::numeric, $4, $5, $6, $7, $8, $9",
+        " INSERT INTO reported_trades (trade_sequence, trading_day, symbol, price, quantity,",
+        " buy_order_id, sell_order_id, first_execution_id, second_execution_id, trade_time)",
+        " SELECT $1::numeric, $10, $2, $3::numeric, $4, $5, $6, $7, $8, $9",
         " WHERE (SELECT count(*) FROM filled) = 2",
     ))
     .bind(number(pair.first_sequence))
@@ -195,6 +213,7 @@ async fn apply_trade(
     .bind(&pair.first.execution_id)
     .bind(&pair.second.execution_id)
     .bind(execution.timestamp)
+    .bind(trading_day)
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() != 1 {
@@ -207,19 +226,83 @@ async fn apply_trade(
     Ok(())
 }
 
+/// Marks every order a close expired, in ONE statement: a close can expire hundreds of thousands
+/// of orders, and one round trip each would take minutes. The exchange expires everything still
+/// resting, so an order of that day still resting afterwards means the report has drifted.
+async fn expire_orders(
+    tx: &mut Transaction<'_, Postgres>,
+    trading_day: NaiveDate,
+    expired: &[ExpiredOrder],
+) -> ReporterResult<()> {
+    let order_ids: Vec<&str> = expired
+        .iter()
+        .map(|order| order.order_id.as_str())
+        .collect();
+    let sequences: Vec<String> = expired
+        .iter()
+        .map(|order| number(order.matching_sequence))
+        .collect();
+    let updated = sqlx::query(
+        "UPDATE reported_orders SET status = 'expired', expiry_sequence = expiry.sequence::numeric \
+         FROM unnest($1::text[], $2::text[]) AS expiry(order_id, sequence) \
+         WHERE reported_orders.trading_day = $3 AND reported_orders.order_id = expiry.order_id \
+         AND status IN ('new', 'partially_filled')",
+    )
+    .bind(order_ids)
+    .bind(sequences)
+    .bind(trading_day)
+    .execute(&mut **tx)
+    .await?;
+    if updated.rows_affected() != expired.len() as u64 {
+        return Err(invalid("close expires a missing or non-resting order").into());
+    }
+    let still_resting: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM reported_orders \
+         WHERE trading_day = $1 AND status IN ('new', 'partially_filled'))",
+    )
+    .bind(trading_day)
+    .fetch_one(&mut **tx)
+    .await?;
+    if still_resting {
+        return Err(invalid("orders of the closed day are still resting in the report").into());
+    }
+    Ok(())
+}
+
+/// The day an order-changing command belongs to. Orders are accepted, cancelled and expired only
+/// while a day is open, so the journal names that day before any of them.
+fn current_day(trading_day: Option<NaiveDate>) -> ReporterResult<NaiveDate> {
+    trading_day.ok_or_else(|| invalid("an order changed before any trading day opened").into())
+}
+
 /// `input_sequence` is the journal sequence of the command's input: the identity of anything the
-/// report records per command rather than per order.
+/// report records per command rather than per order. `trading_day` is the day the journal is in;
+/// an open moves it forward.
 async fn apply_command(
     tx: &mut Transaction<'_, Postgres>,
     input_sequence: u64,
     command: CommittedCommand,
+    trading_day: &mut Option<NaiveDate>,
 ) -> ReporterResult<()> {
     match command {
         CommittedCommand::Other => Ok(()),
+        CommittedCommand::MarketOpened { trading_day: day } => {
+            *trading_day = Some(day);
+            Ok(())
+        }
+        CommittedCommand::MarketClosed {
+            trading_day: day,
+            expired,
+        } => {
+            if *trading_day != Some(day) {
+                return Err(invalid("close of a trading day the report is not in").into());
+            }
+            expire_orders(tx, day, &expired).await
+        }
         CommittedCommand::NewOrder {
             order,
             outcome: NewOrderOutcome::Rejected { reason },
-        } => insert_rejected_order(tx, input_sequence, &order, &reason).await,
+        } => insert_rejected_order(tx, input_sequence, *trading_day, &order, &reason).await,
         CommittedCommand::NewOrder {
             order,
             outcome:
@@ -228,9 +311,10 @@ async fn apply_command(
                     executions,
                 },
         } => {
-            insert_accepted_order(tx, &order, matching_sequence).await?;
+            let day = current_day(*trading_day)?;
+            insert_accepted_order(tx, day, &order, matching_sequence).await?;
             for pair in &executions {
-                apply_trade(tx, pair).await?;
+                apply_trade(tx, day, pair).await?;
             }
             Ok(())
         }
@@ -241,10 +325,13 @@ async fn apply_command(
         } => {
             // The engine lets only the owner cancel, so checking the owner costs nothing and stops
             // the reporter if the journal and this projection ever disagree.
+            let day = current_day(*trading_day)?;
             let updated = sqlx::query(
                 "UPDATE reported_orders SET status = 'canceled', cancellation_sequence = $1::numeric \
-                 WHERE order_id = $2 AND user_id = $3 AND status IN ('new', 'partially_filled')",
-            ).bind(number(matching_sequence)).bind(order_id).bind(user_id).execute(&mut **tx).await?;
+                 WHERE trading_day = $4 AND order_id = $2 AND user_id = $3 \
+                 AND status IN ('new', 'partially_filled')",
+            ).bind(number(matching_sequence)).bind(order_id).bind(user_id).bind(day)
+                .execute(&mut **tx).await?;
             if updated.rows_affected() != 1 {
                 return Err(
                     invalid("cancellation references a missing or non-resting order").into(),
@@ -258,12 +345,12 @@ async fn apply_command(
             outcome: CancelOutcome::Rejected { reason },
         } => {
             // A refused attempt is a fact about the attempt, not the order: it gets its own row
-            // with who asked, and the order's row stays exactly as it was.
+            // with who asked and the day, and the order's row stays exactly as it was.
             sqlx::query(
-                "INSERT INTO rejected_cancellations (input_sequence, order_id, requested_by, reason) \
-                 VALUES ($1::numeric, $2, $3, $4)",
-            ).bind(number(input_sequence)).bind(order_id).bind(user_id).bind(reason)
-                .execute(&mut **tx).await?;
+                "INSERT INTO rejected_cancellations (input_sequence, trading_day, order_id, requested_by, reason) \
+                 VALUES ($1::numeric, $2, $3, $4, $5)",
+            ).bind(number(input_sequence)).bind(*trading_day).bind(order_id).bind(user_id)
+                .bind(reason).execute(&mut **tx).await?;
             Ok(())
         }
     }
@@ -274,8 +361,13 @@ async fn apply_command(
 /// they represent always move together; returns how many batches were applied. Any error drops
 /// the open transaction, rolling back the whole group, and is terminal: the reader's cursor may
 /// be ahead of the database then, which is harmless only because the reporter stops.
-/// See `docs/performance/06-reporter-batched-transactions.md`.
-async fn apply_available(reader: &mut StreamReader, pool: &PgPool) -> ReporterResult<u64> {
+/// See `docs/performance/06-reporter-batched-transactions.md`. `trading_day` is the day the journal
+/// is in, saved with each checkpoint.
+async fn apply_available(
+    reader: &mut StreamReader,
+    pool: &PgPool,
+    trading_day: &mut Option<NaiveDate>,
+) -> ReporterResult<u64> {
     let mut applied = 0;
     while let Some(first) = reader.next_batch()? {
         let mut tx = pool.begin().await?;
@@ -283,7 +375,7 @@ async fn apply_available(reader: &mut StreamReader, pool: &PgPool) -> ReporterRe
         let mut in_group = 0;
         loop {
             let command = committed_batch::decode(&batch).map_err(invalid)?;
-            apply_command(&mut tx, batch[0].seq_num, command).await?;
+            apply_command(&mut tx, batch[0].seq_num, command, trading_day).await?;
             in_group += 1;
             // Decide after applying, and take the position before reading any further batch.
             let after = reader.checkpoint();
@@ -295,7 +387,7 @@ async fn apply_available(reader: &mut StreamReader, pool: &PgPool) -> ReporterRe
             match next {
                 Some(following) => batch = following,
                 None => {
-                    save_checkpoint(&mut tx, &after).await?;
+                    save_checkpoint(&mut tx, &after, *trading_day).await?;
                     tx.commit().await?;
                     break;
                 }
@@ -311,14 +403,18 @@ async fn persist_initial_checkpoint(
     checkpoint: &ReaderCheckpoint,
 ) -> ReporterResult<()> {
     let mut tx = pool.begin().await?;
-    save_checkpoint(&mut tx, checkpoint).await?;
+    save_checkpoint(&mut tx, checkpoint, None).await?;
     tx.commit().await?;
     Ok(())
 }
 
-async fn follow(mut reader: StreamReader, pool: PgPool) -> ReporterResult<()> {
+async fn follow(
+    mut reader: StreamReader,
+    pool: PgPool,
+    mut trading_day: Option<NaiveDate>,
+) -> ReporterResult<()> {
     loop {
-        if apply_available(&mut reader, &pool).await? == 0 {
+        if apply_available(&mut reader, &pool, &mut trading_day).await? == 0 {
             tokio::time::sleep(IDLE_POLL).await;
         }
     }
@@ -357,11 +453,14 @@ pub async fn run(args: &[String]) -> ReporterResult<()> {
         .unwrap_or(DEFAULT_ADDR)
         .parse()?;
     let pool = connect().await?;
-    let checkpoint = load_checkpoint(&pool).await?;
+    let (checkpoint, mut trading_day) = match load_checkpoint(&pool).await? {
+        Some((checkpoint, trading_day)) => (Some(checkpoint), trading_day),
+        None => (None, None),
+    };
     ensure_consistent_saved_state(&pool, checkpoint.as_ref()).await?;
     let mut reader = StreamReader::open(&args[0], &args[1], checkpoint)?;
     // Catch-up uses the same grouping, so its last group commits before the listener binds.
-    let advanced = apply_available(&mut reader, &pool).await? > 0;
+    let advanced = apply_available(&mut reader, &pool, &mut trading_day).await? > 0;
     if !advanced && load_checkpoint(&pool).await?.is_none() {
         persist_initial_checkpoint(&pool, &reader.checkpoint()).await?;
     }
@@ -378,7 +477,7 @@ pub async fn run(args: &[String]) -> ReporterResult<()> {
                 .build();
             match runtime.and_then(|runtime| {
                 runtime
-                    .block_on(follow(reader, follower_pool))
+                    .block_on(follow(reader, follower_pool, trading_day))
                     .map_err(io::Error::other)
             }) {
                 Ok(()) => {}

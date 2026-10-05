@@ -16,9 +16,10 @@ use serde::{Deserialize, Serialize};
 use super::{core::CoreSnapshot, event_store::crc32};
 
 const MAGIC: &[u8; 8] = b"EXCHSNP1";
-/// 2: the core carries the trading session (milestone 22). A version-1 snapshot is refused, and
-/// startup falls back to replaying the journal.
-const VERSION: u32 = 2;
+/// 4: an open clears the previous day's finished orders and fills (milestone 22, part 3), so a
+/// client order id can return on a later day. An older snapshot could hold orders that replay
+/// would have cleared; it is refused, and startup falls back to replaying the journal.
+const VERSION: u32 = 4;
 const HEADER_LEN: usize = 20; // magic + payload length + CRC-32
 const MAX_PAYLOAD_LEN: u64 = 512 * 1024 * 1024;
 

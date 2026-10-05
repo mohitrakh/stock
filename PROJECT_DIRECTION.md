@@ -78,14 +78,14 @@ same-host warm replica process
 
 Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
 
-Latest verified status on 2026-10-02, on Linux (the office Ubuntu machine; the crate uses Unix-only APIs and does not build on Windows):
+Latest verified status on 2026-10-05, on Linux (the office Ubuntu machine; the crate uses Unix-only APIs and does not build on Windows):
 
 ```text
 cargo fmt -- --check
 cargo test --locked
-147 unit tests + the executable integration tests passed; 0 failed
-2 opt-in Reporter acceptance tests ignored by default (need REPORTER_TEST_DATABASE_URL);
-  both passed against PostgreSQL 16 when run with it
+157 unit tests + the executable integration tests passed; 0 failed
+3 opt-in Reporter acceptance tests ignored by default (need REPORTER_TEST_DATABASE_URL);
+  all passed against PostgreSQL 16 when run with it
 ```
 
 Measured with `--bench` (Docker Desktop VM, release build): about 37,000–39,000 orders/s on disk at
@@ -556,7 +556,7 @@ The migration `20260930000000_reporter_rejections.sql` runs in one transaction. 
 
 ## 22. Trading Day (in progress)
 
-**Status: selected on 2026-10-01; Part 1 complete on 2026-10-02.** Write-up: `docs/tasks/17-trading-day.md`. Decisions confirmed by the owner:
+**Status: selected on 2026-10-01; Part 1 complete on 2026-10-02; Parts 2 and 3 complete on 2026-10-05.** Write-up: `docs/tasks/17-trading-day.md`. Decisions confirmed by the owner:
 - a loopback operator port opens and closes the market;
 - every order still resting at the close expires (day orders only);
 - the previous day is cleared from memory at the next open;
@@ -579,7 +579,7 @@ Give the exchange a trading day (open, trade, close) and bound its memory to one
    - its state becomes `Expired`, and it leaves the book;
    - it consumes a matching sequence, as a cancellation does, and the close's journal record carries one `OrderExpired { order_id, seq_num }` for it.
 
-   One record holds every expiry. A close that would exceed the 64 MiB record limit (about 450,000 resting orders) is rejected before anything changes; closing symbol by symbol would be the later fix.
+   One record holds every expiry. A close that would exceed the 64 MiB record limit (about 450,000 resting orders) is rejected before anything changes; closing symbol by symbol would be the later fix. *(Changed in Part 2 after the independent review: a refused close could leave the market stuck open, so the books now hold at most 200,000 resting orders and the close always fits; see Progress.)*
 4. **The next open clears the previous day.** Finished orders (filled, canceled, expired) and the per-user fills index leave memory. Balances, positions, risk limits, and each symbol's book with its execution counter stay, so execution ids never repeat. Daily risk usage restarts from zero, because nothing rests overnight.
 5. **Ids per trading day.** A client order id must be unique within a trading day (the FIX tag 11 rule), and can be reused on a later day. `GET /exchange/orders/{id}` and `GET /exchange/executions` answer for the current or just-closed day; earlier days are in the reporter's PostgreSQL tables.
 6. **The risk day is the trading day.** The order-timestamp day (`RiskManager::roll_day`) and milestone 13's overnight carry-over are removed.
@@ -607,7 +607,7 @@ Give the exchange a trading day (open, trade, close) and bound its memory to one
 
 ### Compatibility
 
-Existing journals do not replay: their orders were accepted with no session open, so replay reports an `OutputMismatch`. Start a new journal, as milestones 9 and 13 required. Market-data state files and the report are rebuilt from the new journal.
+Existing journals do not replay: their orders were accepted with no session open, so replay reports an `OutputMismatch`. Start a new journal, as milestones 9 and 13 required. Market-data state files and the report are rebuilt from the new journal. Remove the old snapshot file (`EVENT_SNAPSHOT_PATH`) and the market-data state file with the old journal: a snapshot bound to another journal, or of an older format, is preserved for diagnosis and turns snapshot writing off, and a market-data checkpoint for another journal refuses startup.
 
 ### Parts
 
@@ -649,6 +649,23 @@ Verified on Linux: `cargo fmt -- --check`, and `cargo test --locked` with 147 un
 
 The benchmark is unchanged at about 46,000 orders/s on the office Ubuntu machine.
 
+**Part 2, complete (2026-10-05): expiry at the close.**
+- **Day orders.** At the close every resting order expires: its unfilled cash or shares and its risk allowance are released exactly as a cancellation would release them, its state becomes `Expired`, and it leaves the book. Each expiry consumes a matching sequence. Orders expire oldest first, by the matching sequence that accepted them, because the books' hash-map order differs between processes.
+- **One record per close, and a cap that keeps it possible.** The close's record holds `MarketClosed { trading_day }` and then one `OrderExpired { order_id, seq_num }` per resting order. The books hold at most 200,000 resting orders across all symbols: an order that would rest beyond that is refused as `OrderRejected { reason: "BookFull" }` (409), while orders that trade without resting are never refused. With the longest ids the gateway allows, every byte escaped in JSON, such a close takes about 50 MB of the 64 MiB limit. As a safety net for orders that skipped the gateway's id check, a close whose record would still be too large is refused as `SessionRejected { reason: "TooManyRestingOrders(n)" }` and changes nothing; the check counts every envelope sequence at its widest, so replay always reaches the same decision. The first version had only that refusal; the independent review showed it could leave the market stuck open for good, since only owners can cancel orders, and the owner chose the cap.
+- **Risk.** Nothing rests overnight, so milestone 13's open-exposure counter and its fill-time bookkeeping are removed. Usage grows on acceptance, stays on a fill, shrinks by the unfilled quantity on a cancellation or expiry, and restarts from zero at each open.
+- **Subscribers.** The shared decoder yields `MarketClosed { trading_day, expired }` and checks consecutive sequences and unique orders. The MDP removes the expired orders and fails closed if any order is left. The reporter marks them `expired` with their `expiry_sequence` in one statement per close; the migration `20261005000000_reporter_expiry.sql` empties the report for a rebuild and moves `report_version` to 3.
+- **Snapshots** are format version 3 and refuse resting orders while the market is closed.
+
+Verified on Linux: `cargo fmt -- --check`, `cargo test --locked` with 153 unit tests plus the integration tests, and both PostgreSQL acceptance tests. In release, a book of 200,000 resting orders with worst-case 64-byte ids refused the next resting order and closed in one 50.1 MB record (53.0 MB at the widest sequences), prepared in 0.47 s. The independent review found no correctness bug in the expiry path; its other findings were fixed (a size test that could not fail, an expiry order tie-break, a stale comment), except the reporter's "nothing still rests after a close" check, which moves to Part 3 because until rows carry their trading day it would scan the whole report at every close. A live run of the real exchange, MDP and reporter covered a fill and three resting orders (one partly filled), the close, released locks, a refused cancel of an expired order (400), an empty MDP book, `expired` report rows with sequences 5 to 7, a `SIGKILL` restart, and a next day starting with zero risk usage.
+
+**Part 3, complete (2026-10-05): the next open clears the previous day.**
+- **One day in memory.** The open drops the previous day's finished orders and the per-user fills index. Balances, positions, risk limits, and each symbol's (empty) book with its execution counter stay, so execution ids never repeat. Between a close and the next open, the day just closed can still be read.
+- **Ids per trading day.** A client order id must be unique within a trading day and returns on a later day. `GET /exchange/orders/{id}` and `GET /exchange/executions` answer for the current or just-closed day; earlier days are in the reporter's tables.
+- **Snapshots** are format version 4: a version-3 snapshot could hold orders that replay under the new rule would have cleared. The warm replica also writes a snapshot right after each open, when the state is smallest, so a restart replays only the current day.
+- **Reporter.** The decoder yields `MarketOpened { trading_day }`. The reporter follows the day from the journal and keeps it in its checkpoint row. Orders are keyed by `(trading_day, order_id)`, trades carry the day of the two orders they fill, and rejected orders and cancellations record the day the journal was in (NULL before the first open), so a refusal can be matched to its day's order. After a close the reporter checks that nothing from that day still rests in the report. The migration `20261005100000_reporter_trading_days.sql` empties the report for a rebuild and moves `report_version` to 4. Part 2's migration is kept as its own step so that each part can be committed on its own, which makes this a fourth migration rather than the planned single third one.
+
+Verified on Linux: `cargo fmt -- --check`, `cargo test --locked` with 157 unit tests plus the integration tests, and all three PostgreSQL acceptance tests: the lifecycle journal now runs two days with an id reused on the second, and a new test shows that a close leaving an order resting in the report stops the reporter. A live run of the real exchange, MDP, reporter and warm replica over two days covered: a same-day id reuse refused (409); the closed day readable until the next open; after the open, the old id 404 and no fills, with balances carried over; both ids accepted again and trading with execution id `exec_2`; per-day report rows and trades, with the checkpoint on the new day; one warm snapshot right after each open (the last 653 bytes, at the second open, despite an interval of 1,000); and a `SIGKILL` restart from it. The independent review found no high-severity bug, and its findings were fixed: rejected orders and cancellations now record their day, the open simply drops every order instead of claiming a safety net it was not, the client-order-id comment and API advice now say ids are per day, a test now snapshots before an open, and stale docs and two operational notes (removing an old snapshot with an old journal, and empty books kept per symbol) were updated.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -658,19 +675,21 @@ The benchmark is unchanged at about 46,000 orders/s on the office Ubuntu machine
 - short selling is not supported at all: a sell must be fully backed by shares held, with no borrow model
 - settlement is instant at match; there is no T+1/T+2 settlement cycle or pending-position concept
 - share deposits let anyone credit themselves any quantity, exactly as cash deposits do; both are placeholders for real custody
-- there is no product/instrument registry, so orders, share deposits and risk limits accept any symbol of 1-64 bytes without control characters
+- there is no product/instrument registry, so orders, share deposits and risk limits accept any symbol of 1-64 bytes without control characters; every symbol ever traded keeps an empty book (with its execution counter) in memory and in every snapshot, so a client can grow the state without bound by using new symbols
 - self-trade prevention skips the aggressor's own orders but cannot stop a user crossing against themselves; that needs engine-generated cancellations
 - `Order.leaves_qty` and `ManagedOrder.remaining_quantity` are separate sources of truth for the same number
 - one global minor-unit price scale is assumed; per-product currency and tick-size metadata are not modeled
 - wallet balance credits are checked for overflow before commit
 - the event log is one file that grows without bound; snapshots reduce exchange-core replay work but do not compact or retain less journal history; startup reads the part of the journal it replays (all of it without a usable snapshot or on warm promotion, the suffix with one) into memory in one piece rather than streaming it
-- order records, the per-user execution index, and price-level node slots still grow with every order
+- order records and the per-user execution index hold one trading day; the open replaces both maps, releasing their memory, while the matching engine's order-location map and risk usage keep the capacity of the largest day, and a price level's node slots are freed only when the level empties, which the close guarantees once a day
+- the books hold at most 200,000 resting orders across all symbols, so that the close's one journal record always fits; beyond that an order that would rest is refused (409 `BookFull`) until orders trade, are cancelled, or expire at the close, and one user can fill the book, as there is no per-user share; there is no close spread across several records
+- a single command whose record would exceed 64 MiB still halts the worker instead of being refused; one order filling against more than roughly 60,000 to 140,000 resting orders (depending on id lengths) can do it, and since the command is not journaled, a restart recovers
 - one journal `sync_all` per group of queued commands; the worker waits during it (no pipelined journaler thread yet), and p99 cannot beat the disk's own sync latency
-- the core snapshot serializes the whole exchange state (every order and execution ever), so its cost grows with history; it now runs on the warm replica, which falls behind at full load, and only at primary startup on the primary
+- the core snapshot serializes the whole exchange state, which since milestone 22 holds one trading day; its cost grows through the day, it runs on the warm replica (every interval and right after each open), which falls behind at full load, and only at primary startup on the primary
 - without a running warm replica no periodic snapshots are written; a restart then replays everything since the primary's last startup snapshot
 - the warm replica's snapshot writes share the host's disk with the journal's syncs
 - after a failed journal sync the in-memory core is ahead of the disk; it is never used again, the worker halts, and the process must be restarted to recover from the journal
-- a `client_order_id` is unique forever, never reusable after its order is terminal as FIX permits
+- a `client_order_id` is unique within its trading day, including after its order finished; earlier days' orders are only in the reporter's tables, and there is no reporting API to read them
 - snapshots rely on the journal file identity and committed boundary; an invalid snapshot falls back to full replay and is retained for diagnosis
 - event-log sequencing and matching-input sequencing remain distinct concepts
 - live HTTP replies still use `oneshot`

@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     candles::{Candle, CandleProjection},
-    committed_batch::{self, CancelOutcome, CommittedCommand, NewOrderOutcome},
+    committed_batch::{self, CancelOutcome, CommittedCommand, ExpiredOrder, NewOrderOutcome},
     event_stream::{ReaderCheckpoint, StreamReader},
 };
 use crate::types::{
@@ -212,8 +212,24 @@ impl MarketDataProjection {
             CommittedCommand::Cancellation {
                 order_id, outcome, ..
             } => self.apply_cancellation(&order_id, outcome),
-            CommittedCommand::Other => Ok(()),
+            CommittedCommand::MarketClosed { expired, .. } => self.apply_close(&expired),
+            CommittedCommand::MarketOpened { .. } | CommittedCommand::Other => Ok(()),
         }
+    }
+
+    /// The exchange expires every resting order at the close, so an order the projection still
+    /// holds afterwards means it has drifted from the exchange.
+    fn apply_close(&mut self, expired: &[ExpiredOrder]) -> Result<(), String> {
+        for order in expired {
+            self.cancel_order(&order.order_id)?;
+        }
+        if !self.orders.is_empty() {
+            return Err(format!(
+                "{} projected orders are still resting after the close",
+                self.orders.len()
+            ));
+        }
+        Ok(())
     }
 
     fn apply_new_order(&mut self, order: &Order, outcome: NewOrderOutcome) -> Result<(), String> {
@@ -877,6 +893,45 @@ mod tests {
         );
         projection.apply_batch(&cancel_rejected).unwrap();
         assert_eq!(projection.orders.len(), 1);
+    }
+
+    fn closed(expired: &[(&str, u64)]) -> Vec<EventEnvelope> {
+        let mut outputs = vec![ExchangeOutputEvent::MarketClosed {
+            trading_day: chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
+        }];
+        outputs.extend(expired.iter().map(|(order_id, seq_num)| {
+            ExchangeOutputEvent::OrderExpired {
+                order_id: order_id.to_string(),
+                seq_num: *seq_num,
+            }
+        }));
+        envelopes(ExchangeInputEvent::MarketCloseRequested, outputs)
+    }
+
+    #[test]
+    fn the_close_removes_every_expired_order_and_refuses_to_leave_one_behind() {
+        let mut projection = MarketDataProjection::default();
+        for resting in [
+            order("bid", "buyer", "BUY", 99, 2),
+            order("ask", "seller", "SELL", 101, 5),
+        ] {
+            projection.apply_batch(&accepted(resting, vec![])).unwrap();
+        }
+        let mut drifted = projection.clone();
+
+        projection
+            .apply_batch(&closed(&[("bid", 3), ("ask", 4)]))
+            .unwrap();
+        assert!(projection.orders.is_empty());
+        assert!(projection.view("AAPL", 10).is_none());
+
+        // An exchange close expires everything; a close that misses an order means drift.
+        assert!(
+            drifted
+                .apply_batch(&closed(&[("bid", 3)]))
+                .unwrap_err()
+                .contains("still resting")
+        );
     }
 
     #[test]
@@ -1609,5 +1664,98 @@ mod tests {
 
         drop(tx);
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn the_exchange_close_empties_the_projection() {
+        let fixture = Fixture::new();
+        let (tx, rx) = mpsc::channel(16);
+        let runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let worker = thread::spawn(move || runtime.run());
+        open_market(&tx);
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::DepositShares {
+                user_id: "seller".into(),
+                symbol: "AAPL".into(),
+                quantity: 10,
+                respond_to,
+            },
+        );
+        reply.blocking_recv().unwrap().unwrap();
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::Deposit {
+                user_id: "buyer".into(),
+                amount: 1_000,
+                respond_to,
+            },
+        );
+        reply.blocking_recv().unwrap().unwrap();
+        for (id, user, side, price, quantity) in [
+            ("sell-1", "seller", "SELL", 101, 5),
+            ("sell-2", "seller", "SELL", 102, 5),
+            ("buy-1", "buyer", "BUY", 101, 2),
+            ("buy-2", "buyer", "BUY", 99, 3),
+        ] {
+            let (respond_to, reply) = oneshot::channel();
+            send(
+                &tx,
+                ExchangeCommand::PlaceOrder {
+                    order: order(id, user, side, price, quantity),
+                    respond_to,
+                },
+            );
+            reply.blocking_recv().unwrap().unwrap();
+        }
+        let (respond_to, reply) = oneshot::channel();
+        send(&tx, ExchangeCommand::CloseMarket { respond_to });
+        assert!(!reply.blocking_recv().unwrap().unwrap().open);
+
+        let mut reader = StreamReader::open(&fixture.log, &fixture.bus, None).unwrap();
+        let mut projection = MarketDataProjection::default();
+        let mut last = None;
+        while let Some(batch) = reader.next_batch().unwrap() {
+            projection.apply_batch(&batch).unwrap();
+            last = Some(batch);
+        }
+        // Three orders were resting, one of them partly filled; the close expired all three.
+        assert_eq!(last.unwrap().len(), 5);
+        assert!(projection.orders.is_empty());
+        assert!(projection.view("AAPL", 10).is_none());
+
+        // The next day accepts an id from the first day again, and the projection follows.
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::OpenMarket {
+                trading_day: chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(),
+                respond_to,
+            },
+        );
+        reply.blocking_recv().unwrap().unwrap();
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::PlaceOrder {
+                order: order("sell-1", "seller", "SELL", 105, 4),
+                respond_to,
+            },
+        );
+        reply.blocking_recv().unwrap().unwrap();
+        drop(tx);
+        worker.join().unwrap();
+        while let Some(batch) = reader.next_batch().unwrap() {
+            projection.apply_batch(&batch).unwrap();
+        }
+        assert_eq!(
+            projection.view("AAPL", 10).unwrap().asks,
+            vec![L2Level {
+                price: 105,
+                quantity: 4,
+            }]
+        );
     }
 }

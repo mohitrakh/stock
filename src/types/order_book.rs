@@ -390,6 +390,14 @@ impl OrderBook {
         self.order_map.contains_key(order_id)
     }
 
+    /// Removes every resting order, at the close. The execution counter stays, so an execution id
+    /// never repeats on a later day.
+    pub(crate) fn clear(&mut self) {
+        self.buy_levels.clear();
+        self.sell_levels.clear();
+        self.order_map.clear();
+    }
+
     pub(crate) fn snapshot(&self) -> OrderBookSnapshot {
         let snapshot_level = |price: Price, level: &PriceLevel| PriceLevelSnapshot {
             price,

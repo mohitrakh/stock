@@ -8,8 +8,9 @@
 //!
 //! It is also the exchange's snapshot writer. It reads every batch from the durable journal (the
 //! mmap stream supplies only the committed watermark), checks each one by deterministic replay, and
-//! every `snapshot_every` commands writes the journal-bound core snapshot the primary loads on
-//! restart. The primary's trading thread therefore never stops to serialize its whole state.
+//! every `snapshot_every` commands, and right after each open, writes the journal-bound core
+//! snapshot the primary loads on restart. The primary's trading thread therefore never stops to
+//! serialize its whole state.
 
 use std::{
     error::Error,
@@ -44,7 +45,7 @@ use super::{
     runtime::{ReplayError, ReplicaCore},
     snapshot::{self, SnapshotBoundary},
 };
-use crate::types::exchange_event::EventEnvelope;
+use crate::types::exchange_event::{EventEnvelope, ExchangeEvent, ExchangeOutputEvent};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:4003";
 const IDLE_POLL: Duration = Duration::from_millis(10);
@@ -186,15 +187,17 @@ impl WarmReplica {
         })
     }
 
-    /// Counts one applied command and, every `every_commands`, writes the snapshot at exactly the
-    /// applied checkpoint: the state and the journal position it matches are taken together. A
-    /// failed write keeps the previous snapshot and is retried after another full interval.
-    fn maybe_write_snapshot(&mut self) {
+    /// Counts one applied command and, every `every_commands` or right after an open, writes the
+    /// snapshot at exactly the applied checkpoint: the state and the journal position it matches
+    /// are taken together. An open has just cleared the previous day, so the snapshot is at its
+    /// smallest and a restart replays only the new day. A failed write keeps the previous snapshot
+    /// and is retried after another full interval.
+    fn maybe_write_snapshot(&mut self, opened: bool) {
         let (Some(writer), Some(replica)) = (self.snapshots.as_mut(), self.replica.as_ref()) else {
             return;
         };
         writer.commands_since += 1;
-        if writer.commands_since < writer.every_commands {
+        if !opened && writer.commands_since < writer.every_commands {
             return;
         }
         writer.commands_since = 0;
@@ -257,7 +260,13 @@ impl WarmReplica {
             .as_ref()
             .expect("reader exists while follower is active")
             .checkpoint();
-        self.maybe_write_snapshot();
+        let opened = matches!(
+            batch.get(1).map(|envelope| &envelope.event),
+            Some(ExchangeEvent::Output(
+                ExchangeOutputEvent::MarketOpened { .. }
+            ))
+        );
+        self.maybe_write_snapshot(opened);
         Ok(true)
     }
 
@@ -482,7 +491,7 @@ fn follow(
 /// Runs a local, read-only warm replica until an operator POSTs `/promote`. The returned hand-off
 /// has already fenced the prior writer; `main` must immediately build the normal primary runtime
 /// from it. This function never opens PostgreSQL or the customer-facing exchange routes. While it
-/// follows, it writes a core snapshot every `snapshot_every` commands.
+/// follows, it writes a core snapshot every `snapshot_every` commands and right after each open.
 pub async fn run(args: &[String], snapshot_every: u64) -> WarmResult<WarmPromotion> {
     if !(3..=4).contains(&args.len()) {
         return Err(
@@ -1024,6 +1033,10 @@ mod tests {
                 user_id: "buyer".into(),
                 amount: 7,
             },
+            ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 9,
+            },
         ] {
             primary.record_input_for_test(input).unwrap();
         }
@@ -1033,8 +1046,8 @@ mod tests {
         let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 2).unwrap();
         warm.catch_up().unwrap();
 
-        // Seven commands with a snapshot every two: the last one was written after the sixth (the
-        // close), at exactly the warm's applied position at that moment.
+        // Eight commands: a snapshot right after the open, then one every two commands after it,
+        // so the last was written after the seventh, at exactly the warm's applied position then.
         let loaded = snapshot::load(&snapshot, &fixture.log).unwrap().unwrap();
         let last_command_envelopes = 2;
         assert_eq!(
@@ -1051,6 +1064,59 @@ mod tests {
         // The restart loaded the warm's snapshot, closed session included, and replayed only the
         // last command.
         assert_eq!(restarted.event_log().len(), last_command_envelopes as usize);
+        assert_eq!(restarted.core_snapshot_for_test(), live);
+    }
+
+    #[test]
+    fn warm_replica_writes_a_snapshot_right_after_each_open() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.dir.join("events.snapshot");
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut primary =
+            recover_runtime_with_stream_and_snapshot(rx, &fixture.log, &fixture.bus, &snapshot)
+                .unwrap();
+        for input in [
+            open_market(),
+            ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 100,
+            },
+            ExchangeInputEvent::SharesDepositRequested {
+                user_id: "seller".into(),
+                symbol: "AAPL".into(),
+                quantity: 5,
+            },
+            ExchangeInputEvent::NewOrderRequested {
+                order: order("sell", "seller", "SELL", 10, 5),
+            },
+            ExchangeInputEvent::NewOrderRequested {
+                order: order("buy", "buyer", "BUY", 10, 3),
+            },
+            ExchangeInputEvent::MarketCloseRequested,
+            ExchangeInputEvent::MarketOpenRequested {
+                trading_day: chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(),
+            },
+        ] {
+            primary.record_input_for_test(input).unwrap();
+        }
+
+        // Seven commands against an interval of 1,000, yet the second open left a snapshot.
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 1_000).unwrap();
+        warm.catch_up().unwrap();
+        let loaded = snapshot::load(&snapshot, &fixture.log).unwrap().unwrap();
+        assert_eq!(
+            loaded.boundary.next_event_sequence,
+            primary.next_event_sequence()
+        );
+
+        // A restart from it replays nothing and holds the same, cleared state.
+        let live = primary.core_snapshot_for_test();
+        drop(primary);
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let restarted =
+            recover_runtime_with_stream_and_snapshot(rx, &fixture.log, &fixture.bus, &snapshot)
+                .unwrap();
+        assert!(restarted.event_log().is_empty());
         assert_eq!(restarted.core_snapshot_for_test(), live);
     }
 

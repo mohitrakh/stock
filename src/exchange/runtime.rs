@@ -2,8 +2,11 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     exchange::{
-        core::{CoreError, ExchangeCore, PreparedAddOrder, PreparedCancelOrder},
-        event_store::{EventStore, EventStoreError, encode_record},
+        core::{
+            CoreError, ExchangeCore, PreparedAddOrder, PreparedCancelOrder, PreparedExpiry,
+            SessionError,
+        },
+        event_store::{EventStore, EventStoreError, MAX_RECORD_LEN, encode_record},
         event_stream::{DEFAULT_CAPACITY, StreamWriter},
         snapshot::{self, SnapshotBoundary},
     },
@@ -106,7 +109,7 @@ enum PreparedCommit {
     AddOrder(Box<PreparedAddOrder>),
     CancelOrder(Box<PreparedCancelOrder>),
     OpenMarket(chrono::NaiveDate),
-    CloseMarket,
+    CloseMarket(Box<PreparedExpiry>),
 }
 
 struct PreparedInput {
@@ -234,7 +237,7 @@ impl InputEventResult {
 }
 
 /// A refused open or close changes nothing; the refusal is journaled like any business rejection.
-fn rejected_session(error: crate::exchange::core::SessionError) -> PreparedInput {
+fn rejected_session(error: SessionError) -> PreparedInput {
     let reason = format!("{:?}", error);
     PreparedInput {
         result: InputEventResult::Session(Err(reason.clone())),
@@ -417,19 +420,69 @@ fn prepare_input_event(
                 Err(error) => rejected_session(error),
             })
         }
-        ExchangeInputEvent::MarketCloseRequested => Ok(match core.prepare_close_market() {
-            Ok(trading_day) => PreparedInput {
-                result: InputEventResult::Session(Ok(SessionView {
-                    trading_day: Some(trading_day),
-                    open: false,
-                })),
-                output_events: vec![ExchangeOutputEvent::MarketClosed { trading_day }],
-                commit: PreparedCommit::CloseMarket,
-                executions: Vec::new(),
-            },
-            Err(error) => rejected_session(error),
-        }),
+        ExchangeInputEvent::MarketCloseRequested => prepare_close(core, MAX_RECORD_LEN as usize),
     }
+}
+
+/// The close: every resting order expires, all in one record of at most `record_limit` payload
+/// bytes (the journal's limit, except in tests).
+fn prepare_close(core: &ExchangeCore, record_limit: usize) -> Result<PreparedInput, CoreError> {
+    let trading_day = match core.prepare_close_market() {
+        Ok(trading_day) => trading_day,
+        Err(error) => return Ok(rejected_session(error)),
+    };
+    let expiry = core.prepare_expiry().map_err(CoreError::Internal)?;
+    let mut output_events = Vec::with_capacity(1 + expiry.expired.len());
+    output_events.push(ExchangeOutputEvent::MarketClosed { trading_day });
+    output_events.extend(expiry.expired.iter().map(|(order_id, seq_num)| {
+        ExchangeOutputEvent::OrderExpired {
+            order_id: order_id.clone(),
+            seq_num: *seq_num,
+        }
+    }));
+    // The resting-order cap keeps the record small enough for orders with gateway-checked ids.
+    // Should an order from any other entry point make it too large anyway, the close is refused
+    // while nothing has changed, rather than halting the worker when the record cannot be written.
+    if !fits_one_record(
+        &ExchangeInputEvent::MarketCloseRequested,
+        &output_events,
+        record_limit,
+    ) {
+        return Ok(rejected_session(SessionError::TooManyRestingOrders(
+            expiry.expired.len(),
+        )));
+    }
+    Ok(PreparedInput {
+        result: InputEventResult::Session(Ok(SessionView {
+            trading_day: Some(trading_day),
+            open: false,
+        })),
+        output_events,
+        commit: PreparedCommit::CloseMarket(Box::new(expiry)),
+        executions: Vec::new(),
+    })
+}
+
+/// Whether a command's whole journal record fits in `limit` payload bytes. Every envelope's
+/// sequence number is counted at its widest, so the answer depends only on the command, never on
+/// where in the journal it lands, and replay always reaches the same decision.
+fn fits_one_record(
+    input: &ExchangeInputEvent,
+    outputs: &[ExchangeOutputEvent],
+    limit: usize,
+) -> bool {
+    let widest = |event| EventEnvelope {
+        seq_num: u64::MAX,
+        event,
+    };
+    let batch: Vec<_> = std::iter::once(widest(ExchangeEvent::Input(input.clone())))
+        .chain(
+            outputs
+                .iter()
+                .map(|output| widest(ExchangeEvent::Output(output.clone()))),
+        )
+        .collect();
+    serde_json::to_vec(&batch).is_ok_and(|payload| payload.len() <= limit)
 }
 
 impl PreparedInput {
@@ -454,7 +507,7 @@ impl PreparedInput {
             PreparedCommit::AddOrder(prepared) => core.commit_add_order(*prepared),
             PreparedCommit::CancelOrder(prepared) => core.commit_cancel_order(*prepared),
             PreparedCommit::OpenMarket(trading_day) => core.commit_open_market(trading_day),
-            PreparedCommit::CloseMarket => core.commit_close_market(),
+            PreparedCommit::CloseMarket(expiry) => core.commit_close_market(*expiry),
         }
         (self.result, executions)
     }
@@ -2549,8 +2602,8 @@ mod tests {
     }
 
     #[test]
-    fn overnight_risk_usage_replays_and_continues_after_restart() {
-        let path = temp_log_path("overnight-risk");
+    fn the_close_expires_resting_orders_and_a_restart_continues_the_next_day() {
+        let path = temp_log_path("close-expiry");
 
         {
             let (_tx, rx) = tokio::sync::mpsc::channel(1);
@@ -2568,64 +2621,270 @@ mod tests {
                 share_deposit("seller", 10),
                 open_market(),
                 ExchangeInputEvent::NewOrderRequested {
-                    order: order("overnight", "buyer", "BUY", 10, 10),
-                },
-                ExchangeInputEvent::MarketCloseRequested,
-                ExchangeInputEvent::MarketOpenRequested {
-                    trading_day: trading_day(2),
+                    order: order("resting-buy", "buyer", "BUY", 10, 10),
                 },
                 ExchangeInputEvent::NewOrderRequested {
-                    order: order("day-two-sell", "seller", "SELL", 10, 4),
+                    order: order("partial-sell", "seller", "SELL", 10, 4),
                 },
-                ExchangeInputEvent::CancelOrderRequested {
-                    order_id: "overnight".to_string(),
-                    user_id: "buyer".to_string(),
-                },
+                ExchangeInputEvent::MarketCloseRequested,
             ] {
                 runtime.record_and_process_input_event(command).unwrap();
             }
+
+            // The close's record: the close, then the buy's unfilled six expiring with the next
+            // matching sequence after the two orders.
+            let close = runtime.event_log().len() - 3;
+            let outputs = outputs_of(&runtime);
+            assert_eq!(
+                outputs[outputs.len() - 2..],
+                [
+                    ExchangeOutputEvent::MarketClosed {
+                        trading_day: trading_day(1)
+                    },
+                    ExchangeOutputEvent::OrderExpired {
+                        order_id: "resting-buy".into(),
+                        seq_num: 3
+                    },
+                ]
+            );
+            assert!(matches!(
+                runtime.event_log()[close].event,
+                ExchangeEvent::Input(ExchangeInputEvent::MarketCloseRequested)
+            ));
+            // Its collateral is free, and only the four that traded still count for the day.
+            assert_eq!(runtime.core.balance_view("buyer").locked, 0);
             assert_eq!(runtime.core.risk_limit_view("buyer", "AAPL").used_today, 4);
         }
 
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let mut restarted = recover_runtime(rx, &path).unwrap();
+        let expired = restarted.core.order_view("resting-buy", "buyer").unwrap();
         assert_eq!(
-            restarted.core.risk_limit_view("buyer", "AAPL").used_today,
-            4
+            (expired.status.as_str(), expired.remaining_quantity),
+            ("expired", 6)
         );
-
-        let rejected = restarted
-            .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
-                order: order("too-many", "buyer", "BUY", 10, 7),
+        let refused = restarted
+            .record_and_process_input_event(ExchangeInputEvent::CancelOrderRequested {
+                order_id: "resting-buy".to_string(),
+                user_id: "buyer".to_string(),
             })
             .unwrap()
-            .into_place_order_result();
-        assert!(rejected.unwrap_err().contains("RiskRejected"));
+            .into_cancel_order_result();
+        assert!(refused.unwrap_err().contains("already Expired"));
 
+        // The next day starts with the whole allowance and continues the matching sequence.
+        restarted
+            .record_and_process_input_event(ExchangeInputEvent::MarketOpenRequested {
+                trading_day: trading_day(2),
+            })
+            .unwrap();
+        assert_eq!(
+            restarted.core.risk_limit_view("buyer", "AAPL").used_today,
+            0
+        );
         restarted
             .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested {
-                order: order("remaining", "buyer", "BUY", 10, 6),
+                order: order("next-day", "buyer", "BUY", 10, 10),
             })
             .unwrap()
             .into_place_order_result()
             .unwrap();
         assert_eq!(
-            restarted.core.risk_limit_view("buyer", "AAPL").used_today,
-            10
+            outputs_of(&restarted).last(),
+            Some(&ExchangeOutputEvent::OrderAccepted {
+                order_id: "next-day".into(),
+                seq_num: 4
+            })
         );
+        let live = restarted.core_snapshot_for_test();
         drop(restarted);
 
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let recovered_again = recover_runtime(rx, &path).unwrap();
-        assert_eq!(
-            recovered_again
-                .core
-                .risk_limit_view("buyer", "AAPL")
-                .used_today,
-            10
-        );
+        assert_eq!(recovered_again.core_snapshot_for_test(), live);
         drop(recovered_again);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The journal-format size of a close's record, payload only, with every envelope sequence
+    /// either at its widest or numbered from 1.
+    fn close_record_len(outputs: &[ExchangeOutputEvent], widest: bool) -> usize {
+        let batch: Vec<_> = std::iter::once(ExchangeEvent::Input(
+            ExchangeInputEvent::MarketCloseRequested,
+        ))
+        .chain(outputs.iter().cloned().map(ExchangeEvent::Output))
+        .enumerate()
+        .map(|(index, event)| EventEnvelope {
+            seq_num: if widest { u64::MAX } else { 1 + index as u64 },
+            event,
+        })
+        .collect();
+        encode_record(&batch).unwrap().len() - 8
+    }
+
+    #[test]
+    fn a_client_order_id_returns_on_the_next_day_and_every_recovery_agrees() {
+        let path = temp_log_path("ids-per-day");
+        let stream = path.with_extension("mmap");
+        let snapshot = path.with_extension("snapshot");
+        let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(&snapshot);
+        let place = |runtime: &mut ExchangeRuntime, order: Order| {
+            runtime
+                .record_and_process_input_event(ExchangeInputEvent::NewOrderRequested { order })
+                .unwrap()
+                .into_place_order_result()
+        };
+
+        {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            let mut runtime =
+                recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot).unwrap();
+            for input in [
+                open_market(),
+                ExchangeInputEvent::FundsDepositRequested {
+                    user_id: "buyer".into(),
+                    amount: 1_000,
+                },
+                share_deposit("seller", 10),
+            ] {
+                runtime.record_and_process_input_event(input).unwrap();
+            }
+            place(&mut runtime, order("same", "seller", "SELL", 10, 5)).unwrap();
+            place(&mut runtime, order("buy", "buyer", "BUY", 10, 5)).unwrap();
+            // Within the day the id is taken, even though its order has finished.
+            let retry = place(&mut runtime, order("same", "seller", "SELL", 10, 1));
+            assert!(retry.unwrap_err().contains("AlreadyExists"));
+
+            runtime
+                .record_and_process_input_event(ExchangeInputEvent::MarketCloseRequested)
+                .unwrap();
+            // A snapshot of the closed day: it still holds that day's orders, which the open
+            // replayed after it must clear.
+            runtime.write_snapshot(&snapshot, &stream).unwrap();
+            runtime
+                .record_and_process_input_event(ExchangeInputEvent::MarketOpenRequested {
+                    trading_day: trading_day(2),
+                })
+                .unwrap();
+            // On the next day it is free again.
+            assert_eq!(
+                place(&mut runtime, order("same", "seller", "SELL", 11, 1))
+                    .unwrap()
+                    .status,
+                "new"
+            );
+            runtime
+                .record_and_process_input_event(ExchangeInputEvent::CancelOrderRequested {
+                    order_id: "same".into(),
+                    user_id: "seller".into(),
+                })
+                .unwrap()
+                .into_cancel_order_result()
+                .unwrap();
+        }
+
+        // A restart from the snapshot replays only the open, the reused id and the cancellation,
+        // and reaches the same state as replaying the whole journal.
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let from_snapshot =
+            recover_runtime_with_stream_and_snapshot(rx, &path, &stream, &snapshot).unwrap();
+        assert_eq!(from_snapshot.event_log().len(), 6);
+        let restored = from_snapshot.core_snapshot_for_test();
+        drop(from_snapshot);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let replayed = recover_runtime(rx, &path).unwrap();
+        assert_eq!(replayed.core_snapshot_for_test(), restored);
+        assert_eq!(
+            replayed.core.order_view("same", "seller").unwrap().status,
+            "canceled"
+        );
+        assert!(replayed.core.order_view("buy", "buyer").is_none());
+
+        drop(replayed);
+        let _ = std::fs::remove_file(&snapshot);
+        let _ = std::fs::remove_file(&stream);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_close_too_large_for_one_record_is_refused_and_changes_nothing() {
+        let mut core = ExchangeCore::new();
+        core.open_market(trading_day(1)).unwrap();
+        core.deposit_shares("seller", "AAPL", 3).unwrap();
+        for id in ["a", "b", "c"] {
+            core.add_order(order(id, "seller", "SELL", 10, 1)).unwrap();
+        }
+        let limit = MAX_RECORD_LEN as usize;
+        let outputs = prepare_close(&core, limit).unwrap().output_events;
+        assert_eq!(outputs.len(), 4);
+        let widest = close_record_len(&outputs, true);
+
+        // The check is exact at the widest sequences, and a real record is always smaller, so a
+        // close that passes it can be written wherever it lands in the journal.
+        assert!(close_record_len(&outputs, false) < widest);
+        assert!(matches!(
+            prepare_close(&core, widest).unwrap().commit,
+            PreparedCommit::CloseMarket(_)
+        ));
+        let refused = prepare_close(&core, widest - 1).unwrap();
+        assert_eq!(
+            refused.output_events,
+            [ExchangeOutputEvent::SessionRejected {
+                reason: "TooManyRestingOrders(3)".into()
+            }]
+        );
+        let before = core.snapshot();
+        assert_eq!(
+            refused.commit(&mut core).0.into_session_result(),
+            Err("TooManyRestingOrders(3)".into())
+        );
+        assert_eq!(core.snapshot(), before);
+        assert!(core.is_market_open());
+    }
+
+    /// The cap's promise at full scale: a book full of the longest ids the gateway allows, every
+    /// byte of them escaped in JSON, still closes in one record. Heavy; run it in release:
+    /// `cargo test --release --bin stock -- --ignored full_book`.
+    #[test]
+    #[ignore = "builds 200,000 resting orders; run in release"]
+    fn a_full_book_of_the_longest_ids_closes_in_one_record() {
+        use crate::types::{matching_engine::MAX_RESTING_ORDERS, order_manager::OrderManagerError};
+
+        // 64 characters, each `"` or `\`, so each takes two bytes in JSON; the bits make it unique.
+        let id = |n: usize| -> String {
+            (0..64)
+                .map(|bit| if (n >> bit) & 1 == 1 { '\\' } else { '"' })
+                .collect()
+        };
+        let mut core = ExchangeCore::new();
+        core.open_market(trading_day(1)).unwrap();
+        core.deposit_shares("seller", "AAPL", MAX_RESTING_ORDERS as u64 + 1)
+            .unwrap();
+        for n in 0..MAX_RESTING_ORDERS {
+            core.add_order(order(&id(n), "seller", "SELL", 10, 1))
+                .unwrap();
+        }
+        assert!(matches!(
+            core.add_order(order(&id(MAX_RESTING_ORDERS), "seller", "SELL", 10, 1)),
+            Err(OrderManagerError::BookFull)
+        ));
+
+        let started = std::time::Instant::now();
+        let prepared =
+            prepare_input_event(&core, ExchangeInputEvent::MarketCloseRequested).unwrap();
+        let prepared_in = started.elapsed();
+        assert_eq!(prepared.output_events.len(), MAX_RESTING_ORDERS + 1);
+        let real = close_record_len(&prepared.output_events, false);
+        let widest = close_record_len(&prepared.output_events, true);
+        println!(
+            "close of {MAX_RESTING_ORDERS} worst-case orders: prepared in {prepared_in:?}, record {real} bytes ({widest} at the widest sequences, limit {MAX_RECORD_LEN})"
+        );
+        assert!(widest <= MAX_RECORD_LEN as usize);
+
+        let _ = prepared.commit(&mut core);
+        assert!(!core.is_market_open());
+        assert!(core.l2_snapshot("AAPL", 1).unwrap().asks.is_empty());
     }
 
     #[test]
@@ -2782,16 +3041,22 @@ mod tests {
             order_id: id.into(),
             reason: MARKET_CLOSED.into(),
         };
-        // Deposited, refused, opened, accepted, closed, refused.
+        // Deposited, refused, opened, accepted, closed with the accepted order expiring, refused.
         let outputs = outputs_of(&runtime);
         assert_eq!(outputs[1], refused("early"));
         assert_eq!(
-            outputs[4],
-            ExchangeOutputEvent::MarketClosed {
-                trading_day: trading_day(1)
-            }
+            outputs[4..6],
+            [
+                ExchangeOutputEvent::MarketClosed {
+                    trading_day: trading_day(1)
+                },
+                ExchangeOutputEvent::OrderExpired {
+                    order_id: "during".into(),
+                    seq_num: 2
+                },
+            ]
         );
-        assert_eq!(outputs[5], refused("late"));
+        assert_eq!(outputs[6], refused("late"));
 
         // The refusals are history: replay regenerates exactly the same outcomes and state.
         let replayed = replay_event_log(runtime.event_log()).unwrap();

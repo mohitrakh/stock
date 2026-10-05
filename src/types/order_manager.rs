@@ -16,6 +16,8 @@ pub enum OrderState {
     PartiallyFilled,
     Filled,
     Canceled,
+    /// Still resting when its trading day closed. Every order is a day order.
+    Expired,
 }
 
 impl OrderState {
@@ -25,7 +27,12 @@ impl OrderState {
             Self::PartiallyFilled => "partially_filled",
             Self::Filled => "filled",
             Self::Canceled => "canceled",
+            Self::Expired => "expired",
         }
+    }
+
+    pub(crate) fn is_resting(self) -> bool {
+        matches!(self, Self::New | Self::PartiallyFilled)
     }
 }
 
@@ -40,6 +47,8 @@ pub enum OrderManagerError {
     WalletRejected(String),
     /// The seller does not hold enough unreserved shares to back the order.
     PositionRejected(String),
+    /// The order would rest while the books already hold their maximum number of resting orders.
+    BookFull,
     MatchingRejected(String),
     Internal(String),
 }
@@ -55,7 +64,8 @@ pub struct OrderManager {
     pub risk_manager: RiskManager,
     pub wallet: Wallet,
     pub positions: Positions,
-    /// Every fill each user was a party to, in the order they happened. Built as settlement runs
+    /// Every fill each user was a party to on the current or just-closed trading day, in the order
+    /// they happened. Built as settlement runs
     /// rather than scanned out of the event log on each request, because this layer already knows
     /// which side of the trade each party was on.
     executions: HashMap<String, Vec<ExecutionView>>,
@@ -94,14 +104,7 @@ pub(crate) struct PreparedSettlement {
     pub(crate) wallet: Vec<WalletSettlement>,
     pub(crate) positions: Vec<PositionSettlement>,
     pub(crate) order_fills: HashMap<String, u32>,
-    pub(crate) risk_fills: Vec<RiskFill>,
     pub(crate) execution_views: Vec<(String, ExecutionView)>,
-}
-
-pub(crate) struct RiskFill {
-    pub(crate) user_id: String,
-    pub(crate) symbol: String,
-    pub(crate) quantity: u64,
 }
 
 pub(crate) struct PreparedNewOrder {
@@ -116,6 +119,12 @@ pub(crate) struct PreparedCancel {
     pub(crate) side: Side,
     pub(crate) price: Price,
     pub(crate) remaining: u32,
+}
+
+/// The close's expiry of every resting order. Each one is released exactly as its cancellation
+/// would be; only the final state differs.
+pub(crate) struct PreparedExpiry {
+    orders: Vec<PreparedCancel>,
 }
 
 #[derive(Default)]
@@ -252,8 +261,8 @@ impl OrderManager {
                 || seller_symbol != execution.symbol
                 || buyer_side != Side::Buy
                 || seller_side != Side::Sell
-                || matches!(buyer_state, OrderState::Filled | OrderState::Canceled)
-                || matches!(seller_state, OrderState::Filled | OrderState::Canceled)
+                || !buyer_state.is_resting()
+                || !seller_state.is_resting()
             {
                 return Err(OrderManagerError::Internal(
                     "execution references an invalid order state".to_string(),
@@ -448,46 +457,10 @@ impl OrderManager {
             })
             .collect::<Result<Vec<_>, OrderManagerError>>()?;
 
-        // Risk usage means "traded today plus still open". A fill therefore leaves total usage
-        // unchanged but must remove the quantity from open exposure so it expires on the next day
-        // roll. Aggregate both sides of every match before validating the infallible commit.
-        let mut risk_fills: HashMap<(String, String), u64> = HashMap::new();
-        for (order_id, filled_quantity) in &order_fills {
-            let (user_id, symbol, _, _, _, _) = self.context(order_id, candidate)?;
-            let quantity = risk_fills.entry((user_id, symbol)).or_default();
-            *quantity = quantity
-                .checked_add(*filled_quantity as u64)
-                .ok_or_else(|| OrderManagerError::Internal("risk fill overflow".to_string()))?;
-        }
-        let risk_fills = risk_fills
-            .into_iter()
-            .map(|((user_id, symbol), quantity)| {
-                let candidate_addition = candidate
-                    .filter(|order| order.user_id == user_id && order.symbol == symbol)
-                    .map(|order| order.quantity as u64)
-                    .unwrap_or(0);
-                if !self
-                    .risk_manager
-                    .validate_fill(&user_id, &symbol, candidate_addition, quantity)
-                {
-                    return Err(OrderManagerError::Internal(format!(
-                        "risk open quantity invalid for {} {}",
-                        user_id, symbol
-                    )));
-                }
-                Ok(RiskFill {
-                    user_id,
-                    symbol,
-                    quantity,
-                })
-            })
-            .collect::<Result<Vec<_>, OrderManagerError>>()?;
-
         Ok(PreparedSettlement {
             wallet,
             positions,
             order_fills,
-            risk_fills,
             execution_views,
         })
     }
@@ -571,10 +544,11 @@ impl OrderManager {
                 )
                 .map_err(|err| OrderManagerError::Internal(format!("{:?}", err)))?,
         }
-        if !self
-            .risk_manager
-            .validate_release(&managed.order, remaining)
-        {
+        if !self.risk_manager.validate_release(
+            &managed.order.user_id,
+            &managed.order.symbol,
+            remaining as u64,
+        ) {
             return Err(OrderManagerError::Internal(format!(
                 "risk release invalid for order {}",
                 order_id
@@ -592,25 +566,110 @@ impl OrderManager {
     }
 
     pub(crate) fn commit_cancel_plan(&mut self, prepared: PreparedCancel) {
-        match prepared.side {
-            Side::Buy => self.wallet.commit_unlock(
-                &prepared.user_id,
-                prepared.price,
-                prepared.remaining as u64,
-            ),
-            Side::Sell => self.positions.commit_unlock(
-                &prepared.user_id,
-                &prepared.symbol,
-                prepared.remaining as u64,
-            ),
+        self.retire(prepared, OrderState::Canceled);
+    }
+
+    /// Plans the expiry of `order_ids`, the orders resting in the book at the close. Per-order
+    /// checks cannot prove the commit safe when one user has several orders, so the releases are
+    /// summed per ledger entry and checked against what is actually reserved. An error means the
+    /// ledgers disagree with the book: an internal fault.
+    pub(crate) fn prepare_expiry<'a>(
+        &self,
+        order_ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<PreparedExpiry, OrderManagerError> {
+        let overflow = || OrderManagerError::Internal("expiry release overflow".to_string());
+        let mut cash: HashMap<&str, u64> = HashMap::new();
+        let mut shares: HashMap<(&str, &str), u64> = HashMap::new();
+        let mut risk: HashMap<(&str, &str), u64> = HashMap::new();
+        let mut orders = Vec::new();
+
+        for order_id in order_ids {
+            let managed = self
+                .orders
+                .get(order_id)
+                .filter(|managed| managed.state.is_resting())
+                .ok_or_else(|| {
+                    OrderManagerError::Internal(format!(
+                        "resting order {} is not open in order management",
+                        order_id
+                    ))
+                })?;
+            let order = &managed.order;
+            let remaining = managed.remaining_quantity as u64;
+            let key = (order.user_id.as_str(), order.symbol.as_str());
+            match order.side {
+                Side::Buy => {
+                    let notional = order
+                        .price
+                        .checked_notional(remaining)
+                        .ok_or_else(overflow)?;
+                    let total = cash.entry(&order.user_id).or_default();
+                    *total = total.checked_add(notional).ok_or_else(overflow)?;
+                }
+                Side::Sell => {
+                    let total = shares.entry(key).or_default();
+                    *total = total.checked_add(remaining).ok_or_else(overflow)?;
+                }
+            }
+            let total = risk.entry(key).or_default();
+            *total = total.checked_add(remaining).ok_or_else(overflow)?;
+            orders.push(PreparedCancel {
+                order_id: order_id.to_string(),
+                user_id: order.user_id.clone(),
+                symbol: order.symbol.clone(),
+                side: order.side.clone(),
+                price: order.price,
+                remaining: managed.remaining_quantity,
+            });
         }
 
-        if let Some(managed) = self.orders.get(&prepared.order_id) {
-            self.risk_manager
-                .release(&managed.order, prepared.remaining);
+        let invalid = |what: &str, user_id: &str| {
+            OrderManagerError::Internal(format!("expiry {} release invalid for {}", what, user_id))
+        };
+        for (user_id, amount) in cash {
+            if self.wallet.locked(user_id) < amount {
+                return Err(invalid("cash", user_id));
+            }
         }
+        for ((user_id, symbol), quantity) in shares {
+            if self.positions.locked(user_id, symbol) < quantity {
+                return Err(invalid("share", user_id));
+            }
+        }
+        for ((user_id, symbol), quantity) in risk {
+            if !self
+                .risk_manager
+                .validate_release(user_id, symbol, quantity)
+            {
+                return Err(invalid("risk", user_id));
+            }
+        }
+        Ok(PreparedExpiry { orders })
+    }
+
+    pub(crate) fn commit_expiry(&mut self, prepared: PreparedExpiry) {
+        for order in prepared.orders {
+            self.retire(order, OrderState::Expired);
+        }
+    }
+
+    /// Takes a resting order out of trading: its unfilled collateral and risk allowance are
+    /// released, and it ends in `state`, canceled or expired.
+    fn retire(&mut self, prepared: PreparedCancel, state: OrderState) {
+        let remaining = prepared.remaining as u64;
+        match prepared.side {
+            Side::Buy => self
+                .wallet
+                .commit_unlock(&prepared.user_id, prepared.price, remaining),
+            Side::Sell => {
+                self.positions
+                    .commit_unlock(&prepared.user_id, &prepared.symbol, remaining)
+            }
+        }
+        self.risk_manager
+            .release(&prepared.user_id, &prepared.symbol, remaining);
         if let Some(managed) = self.orders.get_mut(&prepared.order_id) {
-            managed.state = OrderState::Canceled;
+            managed.state = state;
         }
     }
 
@@ -638,10 +697,6 @@ impl OrderManager {
             } else {
                 OrderState::PartiallyFilled
             };
-        }
-        for fill in prepared.risk_fills {
-            self.risk_manager
-                .record_fill(&fill.user_id, &fill.symbol, fill.quantity);
         }
         for (user_id, view) in prepared.execution_views {
             self.executions.entry(user_id).or_default().push(view);
@@ -681,8 +736,14 @@ impl OrderManager {
         self.risk_manager.set_limit(user_id, symbol, limit);
     }
 
-    /// A trading day opened: daily risk usage starts again.
+    /// A trading day opened. The previous day's orders and its fills leave memory: a client order
+    /// id must be unique within a trading day only, and earlier days are in the reporter's
+    /// database. Every one of those orders has finished: the close expired whatever rested, and a
+    /// snapshot that holds a resting order while the market is closed is refused. Daily risk usage
+    /// starts again.
     pub(crate) fn start_trading_day(&mut self) {
+        self.orders = HashMap::new();
+        self.executions = HashMap::new();
         self.risk_manager.start_day();
     }
     pub(crate) fn register_order(&mut self, order: Order) {
@@ -729,7 +790,13 @@ impl OrderManager {
                     order_id
                 )));
             }
-            _ => {}
+            OrderState::Expired => {
+                return Err(OrderManagerError::InvalidTransition(format!(
+                    "order {} is already Expired",
+                    order_id
+                )));
+            }
+            OrderState::New | OrderState::PartiallyFilled => {}
         }
 
         Ok(())
@@ -894,7 +961,7 @@ impl OrderManager {
                     && managed.remaining_quantity < managed.order.quantity
             }
             OrderState::Filled => managed.remaining_quantity == 0,
-            OrderState::Canceled => managed.remaining_quantity > 0,
+            OrderState::Canceled | OrderState::Expired => managed.remaining_quantity > 0,
         };
         if !state_matches_remaining {
             return Err(format!(
@@ -910,7 +977,7 @@ impl OrderManager {
         let mut expected_shares = HashMap::<(String, String), u64>::new();
 
         for managed in self.orders.values() {
-            if !matches!(managed.state, OrderState::New | OrderState::PartiallyFilled) {
+            if !managed.state.is_resting() {
                 continue;
             }
             match managed.order.side {
