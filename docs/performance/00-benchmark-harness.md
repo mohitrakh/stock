@@ -18,10 +18,13 @@ an after, and the next thing to fix is whatever the numbers say is slowest.
 ## What it drives
 
 ```sh
-cargo run --release -- --bench EMPTY_DIR [--orders N] [--rate ORDERS_PER_SEC|0]
+cargo run --release -- --bench EMPTY_DIR [--orders N_PER_DAY] [--days N]
+                                         [--rate ORDERS_PER_SEC|0]
                                          [--symbols N] [--users N]
                                          [--depth RESTING_ORDERS_PER_SYMBOL]
 ```
+
+(`--days` arrived with milestone 22's trading days. See "Trading days" below.)
 
 (`--snapshot-every` existed during milestone 19 and was removed in milestone 20, when the primary
 stopped writing periodic snapshots. See "The snapshot switch" below.)
@@ -127,6 +130,34 @@ bench: 200000 orders, rate max, 100 symbols, 100 users, depth 0 per symbol, snap
   the end, plus the histogram and the generator. Compare memory only between runs with the same
   `--orders`.
 
+## Trading days
+
+Since milestone 22 the market opens and closes, and orders are accepted only while it is open. Each
+run is one or more trading days:
+1. The first day opens before the setup deposits.
+2. Each day places the optional depth orders (untimed), runs `--orders` measured orders, then
+   closes the market. The close expires every order still resting.
+3. The next day opens on the next calendar date and reuses the same order ids, which a new day
+   allows.
+
+Each day prints one line:
+
+```text
+  day 3 2026-01-04: 24880 orders/s; close 250 ms, 5282 KB journaled; VmHWM: 295788 kB, VmRSS: 263180 kB
+```
+
+- **orders/s**: that day's measured orders over the time from its first send to its last reply.
+- **close**: the time for the close's reply, and the journal bytes its one record took (one
+  `OrderExpired` per order still resting).
+- **memory**: at the end of the day, after the close. The previous day leaves memory at the next
+  open.
+
+The summary's throughput, syncs and journal bytes cover the measured order phases only, not the
+opens, closes or depth setup, so they keep their earlier meaning. The latency histogram covers every
+measured order of every day. The header line now reads `bench: N orders a day for D day(s), ...`.
+`07-trading-days-bound-the-state.md` uses `--days` to compare five trading days with the milestone 21
+binary on the same order volume.
+
 ## The snapshot switch
 
 Production writes a snapshot of the whole exchange state every 10,000 commands, and
@@ -162,8 +193,8 @@ results (which step dominates, and what changes when it is removed) is what thes
 ## What it does not measure
 
 HTTP and authentication, network round trips, the market-data and reporter subscribers, recovery
-time, and power-loss durability. Subscriber throughput is the first measured candidate for the next milestone; none is
-selected yet.
+time, and power-loss durability. The subscribers were measured separately (`05`, `06`), and recovery
+time with trading days in `07`.
 
 ## Baseline: the exchange before any optimization
 

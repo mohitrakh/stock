@@ -5,6 +5,10 @@
 //! the exchange rather than the web framework. Periodic core snapshots are the warm replica's job
 //! (a separate process), so to measure them run `--warm-replica` beside the benchmark.
 //!
+//! A run is one or more trading days (`--days`): the market opens, the measured orders run, and
+//! the market closes, expiring whatever still rests. Each day reuses the same order ids, and prints
+//! its own throughput, close time and memory, so growth from one day to the next shows directly.
+//!
 //! Latency is measured from each order's *intended* send time, not from when it was actually
 //! sent. When the exchange stalls, the generator does not politely wait before "starting the
 //! clock" on the next order; the stall shows up in every order scheduled during it. This is the
@@ -24,10 +28,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     exchange::{event_store::JOURNAL_SYNCS, runtime::recover_runtime_with_stream_and_snapshot},
-    types::types::{ExchangeCommand, Order},
+    types::types::{ExchangeCommand, Order, SessionView},
 };
 
-const USAGE: &str = "usage: stock --bench EMPTY_DIR [--orders N] [--rate ORDERS_PER_SEC|0] [--symbols N] [--users N] [--depth RESTING_ORDERS_PER_SYMBOL]";
+const USAGE: &str = "usage: stock --bench EMPTY_DIR [--orders N_PER_DAY] [--days N] [--rate ORDERS_PER_SEC|0] [--symbols N] [--users N] [--depth RESTING_ORDERS_PER_SYMBOL]";
 
 /// Every measured order is priced inside this band, so roughly half of them cross.
 const BAND_LOW: u64 = 1_000;
@@ -37,7 +41,10 @@ const DEPTH_PRICE: u64 = 1_000_000;
 
 struct Config {
     dir: PathBuf,
+    /// Measured orders on each trading day.
     orders: u64,
+    /// Trading days, each one an open, the measured orders and a close.
+    days: u64,
     /// Orders per second, or 0 for "as fast as the exchange accepts them".
     rate: u64,
     symbols: u64,
@@ -51,6 +58,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
     let mut config = Config {
         dir,
         orders: 100_000,
+        days: 1,
         rate: 0,
         symbols: 100,
         users: 100,
@@ -63,6 +71,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
             .ok_or_else(|| format!("{flag} needs a whole number\n{USAGE}"))?;
         match flag.as_str() {
             "--orders" => config.orders = value,
+            "--days" => config.days = value.max(1),
             "--rate" => config.rate = value,
             "--symbols" => config.symbols = value.max(1),
             "--users" => config.users = value.max(2),
@@ -108,6 +117,19 @@ async fn expect_ok<T>(replies: Vec<Reply<T>>) -> Result<(), String> {
             .map_err(|reason| format!("setup command rejected: {reason}"))?;
     }
     Ok(())
+}
+
+/// Sends an open or a close and waits for it, failing on a refusal: the days run in order.
+async fn session(
+    tx: &mpsc::Sender<ExchangeCommand>,
+    make: impl FnOnce(oneshot::Sender<Result<SessionView, String>>) -> ExchangeCommand,
+) -> Result<(), String> {
+    send(tx, make)
+        .await?
+        .await
+        .map_err(|_| "exchange worker stopped".to_string())?
+        .map(|_| ())
+        .map_err(|reason| format!("session change refused: {reason}"))
 }
 
 fn order(
@@ -172,17 +194,14 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     let users: Vec<String> = (0..config.users).map(|u| format!("u{u}")).collect();
     let symbols: Vec<String> = (0..config.symbols).map(|s| format!("S{s:03}")).collect();
 
-    // Setup, untimed: open a trading day (a fixed date, so every run journals the same history),
-    // then cash for every user and shares in every symbol.
-    let trading_day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("a valid date");
-    send(&tx, |respond_to| ExchangeCommand::OpenMarket {
-        trading_day,
+    // Setup, untimed: open the first trading day (a fixed date, so every run journals the same
+    // history), then cash for every user and shares in every symbol.
+    let first_day = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("a valid date");
+    session(&tx, |respond_to| ExchangeCommand::OpenMarket {
+        trading_day: first_day,
         respond_to,
     })
-    .await?
-    .await
-    .map_err(|_| "exchange worker stopped".to_string())?
-    .map_err(|reason| format!("could not open the market: {reason}"))?;
+    .await?;
     let mut funded = Vec::new();
     let mut shares = Vec::new();
     for user in &users {
@@ -209,95 +228,130 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     expect_ok(funded).await?;
     expect_ok(shares).await?;
 
-    // Optional resting depth, also untimed.
-    let mut resting = Vec::new();
-    for d in 0..config.depth {
-        for symbol in &symbols {
-            let user = &users[(d % config.users) as usize];
-            let price = DEPTH_PRICE + d % 1_000;
-            let order = order(
-                format!("depth-{symbol}-{d}"),
-                user,
-                symbol,
-                "SELL",
-                price,
-                1,
-                now,
-            );
-            resting.push(
-                send(&tx, |respond_to| ExchangeCommand::PlaceOrder {
-                    order,
-                    respond_to,
-                })
-                .await?,
-            );
-        }
-    }
-    expect_ok(resting).await?;
-
-    // Measured phase.
-    let syncs_before = JOURNAL_SYNCS.load(Ordering::Relaxed);
-    let journal_before = std::fs::metadata(&journal)
-        .map_err(|e| e.to_string())?
-        .len();
-    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-    let mut pending = Vec::with_capacity(config.orders as usize);
-    let start = Instant::now();
-    for i in 0..config.orders {
-        let intended = if config.rate == 0 {
-            Instant::now()
-        } else {
-            start + Duration::from_nanos(i * 1_000_000_000 / config.rate)
-        };
-        if config.rate > 0 {
-            tokio::time::sleep_until(intended.into()).await;
-        }
-        let user = &users[rng.below(config.users) as usize];
-        let symbol = &symbols[rng.below(config.symbols) as usize];
-        let side = if rng.below(2) == 0 { "BUY" } else { "SELL" };
-        let price = BAND_LOW + rng.below(BAND_TICKS);
-        let qty = 1 + rng.below(10) as u32;
-        let order = order(format!("o{i}"), user, symbol, side, price, qty, now);
-        let reply = send(&tx, |respond_to| ExchangeCommand::PlaceOrder {
-            order,
-            respond_to,
-        })
-        .await?;
-        pending.push(tokio::spawn(async move {
-            let accepted = matches!(reply.await, Ok(Ok(_)));
-            (accepted, intended, Instant::now())
-        }));
-    }
-
-    let mut latency = Histogram::<u64>::new(3).map_err(|e| e.to_string())?;
-    let mut last_reply = start;
-    let mut rejected = 0u64;
-    for task in pending {
-        let (accepted, intended, replied) = task.await.map_err(|e| e.to_string())?;
-        rejected += u64::from(!accepted);
-        latency
-            .record(replied.duration_since(intended).as_micros() as u64)
-            .map_err(|e| e.to_string())?;
-        last_reply = last_reply.max(replied);
-    }
-    let elapsed = last_reply.duration_since(start).as_secs_f64();
-    let syncs = JOURNAL_SYNCS.load(Ordering::Relaxed) - syncs_before;
-    let journal_bytes = std::fs::metadata(&journal)
-        .map_err(|e| e.to_string())?
-        .len()
-        - journal_before;
-
     let rate = match config.rate {
         0 => "max".to_string(),
         rate => format!("{rate}/s"),
     };
     println!(
-        "bench: {} orders, rate {rate}, {} symbols, {} users, depth {} per symbol",
-        config.orders, config.symbols, config.users, config.depth
+        "bench: {} orders a day for {} day(s), rate {rate}, {} symbols, {} users, depth {} per symbol",
+        config.orders, config.days, config.symbols, config.users, config.depth
     );
+    let journal_len = || {
+        std::fs::metadata(&journal)
+            .map(|metadata| metadata.len())
+            .map_err(|e| e.to_string())
+    };
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let mut latency = Histogram::<u64>::new(3).map_err(|e| e.to_string())?;
+    let mut rejected = 0u64;
+    // Totals over the measured order phases only: no open, close or depth setup.
+    let mut elapsed = 0.0;
+    let mut syncs = 0;
+    let mut journal_bytes = 0;
+    for day in 0..config.days {
+        let trading_day = first_day
+            .checked_add_days(chrono::Days::new(day))
+            .ok_or("trading day out of range")?;
+        if day > 0 {
+            session(&tx, |respond_to| ExchangeCommand::OpenMarket {
+                trading_day,
+                respond_to,
+            })
+            .await?;
+        }
+
+        // Optional resting depth, untimed. Like any order it expires at the close, so each day
+        // places it again, under the same ids.
+        let mut resting = Vec::new();
+        for d in 0..config.depth {
+            for symbol in &symbols {
+                let user = &users[(d % config.users) as usize];
+                let price = DEPTH_PRICE + d % 1_000;
+                let order = order(
+                    format!("depth-{symbol}-{d}"),
+                    user,
+                    symbol,
+                    "SELL",
+                    price,
+                    1,
+                    now,
+                );
+                resting.push(
+                    send(&tx, |respond_to| ExchangeCommand::PlaceOrder {
+                        order,
+                        respond_to,
+                    })
+                    .await?,
+                );
+            }
+        }
+        expect_ok(resting).await?;
+
+        // Measured phase. Each day reuses the same order ids, which a new day allows.
+        let syncs_before = JOURNAL_SYNCS.load(Ordering::Relaxed);
+        let journal_before = journal_len()?;
+        let mut pending = Vec::with_capacity(config.orders as usize);
+        let start = Instant::now();
+        for i in 0..config.orders {
+            let intended = if config.rate == 0 {
+                Instant::now()
+            } else {
+                start + Duration::from_nanos(i * 1_000_000_000 / config.rate)
+            };
+            if config.rate > 0 {
+                tokio::time::sleep_until(intended.into()).await;
+            }
+            let user = &users[rng.below(config.users) as usize];
+            let symbol = &symbols[rng.below(config.symbols) as usize];
+            let side = if rng.below(2) == 0 { "BUY" } else { "SELL" };
+            let price = BAND_LOW + rng.below(BAND_TICKS);
+            let qty = 1 + rng.below(10) as u32;
+            let order = order(format!("o{i}"), user, symbol, side, price, qty, now);
+            let reply = send(&tx, |respond_to| ExchangeCommand::PlaceOrder {
+                order,
+                respond_to,
+            })
+            .await?;
+            pending.push(tokio::spawn(async move {
+                let accepted = matches!(reply.await, Ok(Ok(_)));
+                (accepted, intended, Instant::now())
+            }));
+        }
+        let mut last_reply = start;
+        for task in pending {
+            let (accepted, intended, replied) = task.await.map_err(|e| e.to_string())?;
+            rejected += u64::from(!accepted);
+            latency
+                .record(replied.duration_since(intended).as_micros() as u64)
+                .map_err(|e| e.to_string())?;
+            last_reply = last_reply.max(replied);
+        }
+        let day_seconds = last_reply.duration_since(start).as_secs_f64();
+        elapsed += day_seconds;
+        syncs += JOURNAL_SYNCS.load(Ordering::Relaxed) - syncs_before;
+        journal_bytes += journal_len()? - journal_before;
+
+        // The close, timed on its own: one record expiring every order still resting.
+        let journal_before_close = journal_len()?;
+        let close_started = Instant::now();
+        session(&tx, |respond_to| ExchangeCommand::CloseMarket {
+            respond_to,
+        })
+        .await?;
+        println!(
+            "  day {} {trading_day}: {:.0} orders/s; close {} ms, {} KB journaled; {}",
+            day + 1,
+            config.orders as f64 / day_seconds,
+            close_started.elapsed().as_millis(),
+            (journal_len()? - journal_before_close) / 1024,
+            memory()
+        );
+    }
+
+    let orders = config.orders * config.days;
     println!(
         "  throughput : {:.0} orders/s over {elapsed:.3} s",
-        config.orders as f64 / elapsed
+        orders as f64 / elapsed
     );
     // At "max" the generator keeps the queue full, so latency there is mostly time spent
     // waiting in a 10,000-deep queue. Read latency from fixed-rate runs.
@@ -316,11 +370,11 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     );
     println!(
         "  syncs      : {syncs} ({:.1} orders per sync)",
-        config.orders as f64 / syncs.max(1) as f64
+        orders as f64 / syncs.max(1) as f64
     );
     println!(
         "  journal    : {:.0} bytes per order",
-        journal_bytes as f64 / config.orders as f64
+        journal_bytes as f64 / orders as f64
     );
     println!("  rejected   : {rejected}");
     println!("  memory     : {}", memory());

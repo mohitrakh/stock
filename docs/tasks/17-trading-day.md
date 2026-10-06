@@ -489,8 +489,83 @@ The review also noted a growth that predates this milestone: every symbol ever t
 empty book with its execution counter, in memory and in every snapshot. There is no instrument
 registry to limit symbols, so this is recorded as a known limitation.
 
-## What is left
+## Part 4 - Measurement
 
-- **Part 4:** a multi-day benchmark, before and after. Measure memory, snapshot size and write
-  time, warm-replica lag and restart time per day, against the milestone 21 binary on the same
-  order volume.
+### What changed
+
+- **`--bench --days N`.** Each day opens the market on the next calendar date, places any
+  `--depth` orders, runs `--orders` measured orders, and closes. Each day reuses the same order
+  ids. The benchmark prints one line per day: its throughput, the close's time and journal bytes,
+  and memory after the close. The summary's throughput, syncs and journal bytes still cover only
+  the measured orders. With the default of one day, a run now ends with a close.
+- **The measurement.** The full write-up is `docs/performance/07-trading-days-bound-the-state.md`,
+  and the raw output is `docs/performance/results/results-m22.txt`.
+  - It ran on the office Ubuntu machine.
+  - Both binaries ran the same 1,000,000 orders, each with a warm replica beside it: milestone 21
+    in one run, and this milestone as five trading days of 200,000.
+
+### Results
+
+| | Milestone 21, one run | Milestone 22, 5 days |
+|---|---|---|
+| Exchange memory at the end (RSS) | 1,234 MB | 263 MB |
+| Warm replica peak memory | 2,121 MB | 506 MB |
+| Largest snapshot | 422 MB | 85 MB |
+| Slowest snapshot write | 10.5 s | 1.9 s |
+| Snapshot writing in total | 375 s | 81 s |
+| Warm replica caught up after the benchmark | 365 s | 78 s |
+| Restart at the end of the run | 11.7 s | 2.4 s |
+
+**Memory.** After each day's close, memory stayed at 256 to 263 MB on every one of the five days.
+
+**Restart.** It took 2.4 s after one day and 2.4 s after five. That is at the end of a day, when
+the state is biggest. Early in a day, from the 667 KB snapshot the warm replica wrote right after
+the open, a restart took 49 ms.
+
+**Cost.**
+- Each close took 250 to 380 ms and expired about 41,700 orders.
+- Throughput without a warm replica is unchanged within noise: 40,000 to 45,000 orders/s on both
+  binaries.
+
+### Decisions
+
+**Measure the worst point of a day.** Each restart ran just after a close, when the day's orders
+are all still in memory. That is the largest state a day reaches, so the 2.4 s is a bound, not an
+average. The early-in-a-day restart shows the other end.
+
+**Maximum rate, with the warm replica beside it.** At a moderate rate both warm replicas keep up
+for longer, which hides how their work grows. At maximum rate the old warm replica's snapshot work
+grows with history and the new one's only with the length of the run, which shows in minutes.
+
+**The same order volume, not the same number of days.** The old binary has no days. Sending it the
+same 1,000,000 orders in one run is the fair comparison: it is exactly the history the old design
+would have to carry.
+
+### What it showed that is still open
+
+- **The warm replica falls behind at maximum rate.** It snapshots every 10,000 commands, writing
+  81 s of snapshots during 31 s of trading. Snapshotting less often within a day would let it keep
+  up.
+- **A restart at the end of a day spends most of its 2.4 s on snapshots.** It loads the day's
+  snapshot, then writes a fresh one.
+- **The journal is one growing file.** It reached 788 MB after five days, and a promotion still
+  replays all of it.
+
+## Milestone complete
+
+Milestone 22 was completed on 2026-10-05. Every completion criterion in `PROJECT_DIRECTION.md`
+holds:
+- orders are refused before the first open and after a close, and deposits work at any time;
+- after a close every book is empty, and the ledgers equal what cancelling each resting order
+  would have given;
+- after the next open the previous day is gone from memory, client order ids return, and no
+  execution id repeats;
+- replay, snapshot recovery and warm-replica following agree across open, close and open, and a
+  promoted warm replica serves the operator port, because it starts the same way;
+- the market-data book is empty after a close, and the reporter records expiries and per-day keys
+  and restarts without duplicates;
+- memory, snapshot size and restart time stay flat across days.
+
+`cargo fmt -- --check`, `cargo test --locked` (157 unit tests and the integration tests) and the
+three PostgreSQL acceptance tests pass. The independent reviews of Parts 2 and 3 found no remaining
+issue after their findings were fixed.
