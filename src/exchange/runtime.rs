@@ -253,7 +253,7 @@ fn prepare_input_event(
 ) -> Result<PreparedInput, CoreError> {
     match event {
         ExchangeInputEvent::FundsDepositRequested { user_id, amount } => {
-            match core.validate_deposit(&user_id, amount) {
+            match core.validate_deposit(amount) {
                 Ok(()) => Ok(PreparedInput {
                     result: InputEventResult::Deposit(Ok(())),
                     output_events: vec![ExchangeOutputEvent::FundsDeposited {
@@ -299,7 +299,7 @@ fn prepare_input_event(
             user_id,
             symbol,
             quantity,
-        } => match core.validate_share_deposit(&user_id, &symbol, quantity) {
+        } => match core.validate_share_deposit(&symbol, quantity) {
             Ok(()) => Ok(PreparedInput {
                 result: InputEventResult::DepositShares(Ok(())),
                 output_events: vec![ExchangeOutputEvent::SharesDeposited {
@@ -2487,10 +2487,6 @@ mod tests {
         for input in [
             open_market(),
             ExchangeInputEvent::FundsDepositRequested {
-                user_id: "seller".into(),
-                amount: u64::MAX,
-            },
-            ExchangeInputEvent::FundsDepositRequested {
                 user_id: "buyer".into(),
                 amount: 10,
             },
@@ -2501,20 +2497,25 @@ mod tests {
         ] {
             runtime.record_and_process_input_event(input).unwrap();
         }
+        // No command can reach a balance that a fill overflows, so the live core is forced there.
+        // The total cash is then past its limit, so the group's other commands deposit shares.
+        runtime.core.force_balance_for_test("seller", u64::MAX);
         let mut group = Vec::new();
-        let before = queue(&mut group, |respond_to| ExchangeCommand::Deposit {
+        let before = queue(&mut group, |respond_to| ExchangeCommand::DepositShares {
             user_id: "other".into(),
-            amount: 7,
+            symbol: "AAPL".into(),
+            quantity: 7,
             respond_to,
         });
-        // Crediting a seller who already holds u64::MAX is an internal fault, not a rejection.
+        // Crediting a seller who holds u64::MAX is an internal fault, not a rejection.
         let faulting = queue(&mut group, |respond_to| ExchangeCommand::PlaceOrder {
             order: order("buy-1", "buyer", "BUY", 10, 1),
             respond_to,
         });
-        let after = queue(&mut group, |respond_to| ExchangeCommand::Deposit {
+        let after = queue(&mut group, |respond_to| ExchangeCommand::DepositShares {
             user_id: "late".into(),
-            amount: 3,
+            symbol: "AAPL".into(),
+            quantity: 3,
             respond_to,
         });
 
@@ -2535,8 +2536,8 @@ mod tests {
         drop(runtime);
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let recovered = recover_runtime(rx, &path).unwrap();
-        assert_eq!(recovered.core.balance_view("other").balance, 7);
-        assert_eq!(recovered.core.balance_view("late").balance, 0);
+        assert_eq!(recovered.core.position_views("other")[0].quantity, 7);
+        assert!(recovered.core.position_views("late").is_empty());
         assert!(recovered.core.order_view("buy-1", "buyer").is_none());
         drop(recovered);
         std::fs::remove_file(path).unwrap();
@@ -2706,20 +2707,23 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// The journal-format size of a close's record, payload only, with every envelope sequence
-    /// either at its widest or numbered from 1.
-    fn close_record_len(outputs: &[ExchangeOutputEvent], widest: bool) -> usize {
-        let batch: Vec<_> = std::iter::once(ExchangeEvent::Input(
-            ExchangeInputEvent::MarketCloseRequested,
-        ))
-        .chain(outputs.iter().cloned().map(ExchangeEvent::Output))
-        .enumerate()
-        .map(|(index, event)| EventEnvelope {
-            seq_num: if widest { u64::MAX } else { 1 + index as u64 },
-            event,
-        })
-        .collect();
-        encode_record(&batch).unwrap().len() - 8
+    /// The size of a command's record payload in the journal's format, with every envelope sequence
+    /// either at its widest or numbered from 1. It serializes directly rather than through
+    /// `encode_record`, which refuses a payload over the limit, so a size test can see one.
+    fn record_len(
+        input: &ExchangeInputEvent,
+        outputs: &[ExchangeOutputEvent],
+        widest: bool,
+    ) -> usize {
+        let batch: Vec<_> = std::iter::once(ExchangeEvent::Input(input.clone()))
+            .chain(outputs.iter().cloned().map(ExchangeEvent::Output))
+            .enumerate()
+            .map(|(index, event)| EventEnvelope {
+                seq_num: if widest { u64::MAX } else { 1 + index as u64 },
+                event,
+            })
+            .collect();
+        serde_json::to_vec(&batch).unwrap().len()
     }
 
     #[test]
@@ -2818,11 +2822,12 @@ mod tests {
         let limit = MAX_RECORD_LEN as usize;
         let outputs = prepare_close(&core, limit).unwrap().output_events;
         assert_eq!(outputs.len(), 4);
-        let widest = close_record_len(&outputs, true);
+        let close = ExchangeInputEvent::MarketCloseRequested;
+        let widest = record_len(&close, &outputs, true);
 
         // The check is exact at the widest sequences, and a real record is always smaller, so a
         // close that passes it can be written wherever it lands in the journal.
-        assert!(close_record_len(&outputs, false) < widest);
+        assert!(record_len(&close, &outputs, false) < widest);
         assert!(matches!(
             prepare_close(&core, widest).unwrap().commit,
             PreparedCommit::CloseMarket(_)
@@ -2875,8 +2880,9 @@ mod tests {
             prepare_input_event(&core, ExchangeInputEvent::MarketCloseRequested).unwrap();
         let prepared_in = started.elapsed();
         assert_eq!(prepared.output_events.len(), MAX_RESTING_ORDERS + 1);
-        let real = close_record_len(&prepared.output_events, false);
-        let widest = close_record_len(&prepared.output_events, true);
+        let close = ExchangeInputEvent::MarketCloseRequested;
+        let real = record_len(&close, &prepared.output_events, false);
+        let widest = record_len(&close, &prepared.output_events, true);
         println!(
             "close of {MAX_RESTING_ORDERS} worst-case orders: prepared in {prepared_in:?}, record {real} bytes ({widest} at the widest sequences, limit {MAX_RECORD_LEN})"
         );
@@ -2885,6 +2891,102 @@ mod tests {
         let _ = prepared.commit(&mut core);
         assert!(!core.is_market_open());
         assert!(core.l2_snapshot("AAPL", 1).unwrap().asks.is_empty());
+    }
+
+    /// The fill cap's promise: an order that trades against `MAX_FILLS_PER_ORDER` resting orders,
+    /// with every field at its widest (the gateway's longest ids and symbol, every byte escaped in
+    /// JSON, and the largest numbers), still fits in one record.
+    #[test]
+    fn the_largest_order_the_fill_cap_allows_fits_in_one_record() {
+        use crate::types::{
+            matching_engine::MAX_FILLS_PER_ORDER,
+            types::{Execution, Price, Side},
+        };
+
+        // 64 characters that JSON escapes to two bytes each: the longest id the gateway lets in.
+        let widest_id = "\"".repeat(64);
+        let price = Price::new(u64::MAX).unwrap();
+        // The longest number JSON prints for an `f64`.
+        let timestamp = -f64::MIN_POSITIVE;
+        let input = ExchangeInputEvent::NewOrderRequested {
+            order: Order {
+                order_id: widest_id.clone(),
+                user_id: widest_id.clone(),
+                symbol: widest_id.clone(),
+                side: Side::Sell,
+                price,
+                quantity: u32::MAX,
+                leaves_qty: u32::MAX,
+                timestamp,
+                seq_num: u64::MAX,
+            },
+        };
+        let accepted = ExchangeOutputEvent::OrderAccepted {
+            order_id: widest_id.clone(),
+            seq_num: u64::MAX,
+        };
+        let execution = ExchangeOutputEvent::ExecutionCreated {
+            execution: Execution {
+                execution_id: format!("exec_{}", u64::MAX),
+                buy_order_id: widest_id.clone(),
+                sell_order_id: widest_id.clone(),
+                symbol: widest_id,
+                price,
+                quantity: u32::MAX,
+                timestamp,
+            },
+        };
+        let outputs: Vec<_> = std::iter::once(accepted)
+            .chain(std::iter::repeat_n(execution, 2 * MAX_FILLS_PER_ORDER))
+            .collect();
+
+        let widest = record_len(&input, &outputs, true);
+        let one_trade = (widest - record_len(&input, &outputs[..1], true)) / MAX_FILLS_PER_ORDER;
+        println!(
+            "{MAX_FILLS_PER_ORDER} trades at the widest: record {widest} bytes, {one_trade} per trade (limit {MAX_RECORD_LEN})"
+        );
+        assert!(widest <= MAX_RECORD_LEN as usize);
+    }
+
+    /// Through the input path that live trading, replay and the warm replica share: an order that
+    /// would take one resting order more than the cap is an ordinary rejection, recorded like any
+    /// other, and changes nothing; an order at the cap trades.
+    #[test]
+    fn an_order_beyond_the_fill_cap_is_an_ordinary_rejection_and_changes_nothing() {
+        use crate::types::matching_engine::MAX_FILLS_PER_ORDER;
+
+        let resting = MAX_FILLS_PER_ORDER + 1;
+        let mut core = ExchangeCore::new();
+        core.open_market(trading_day(1)).unwrap();
+        core.deposit_shares("seller", "AAPL", resting as u64)
+            .unwrap();
+        core.deposit("buyer".to_string(), 10 * resting as u64)
+            .unwrap();
+        for n in 0..resting {
+            core.add_order(order(&format!("ask-{n}"), "seller", "SELL", 10, 1))
+                .unwrap();
+        }
+        let before = core.snapshot();
+        let buy = |id: &str, quantity: usize| ExchangeInputEvent::NewOrderRequested {
+            order: order(id, "buyer", "BUY", 10, quantity as u32),
+        };
+
+        let refused = prepare_input_event(&core, buy("sweep", resting)).unwrap();
+        assert_eq!(
+            refused.output_events,
+            [ExchangeOutputEvent::OrderRejected {
+                order_id: "sweep".into(),
+                reason: "TooManyFills".into()
+            }]
+        );
+        assert_eq!(
+            refused.commit(&mut core).0.into_place_order_result(),
+            Err("TooManyFills".into())
+        );
+        assert_eq!(core.snapshot(), before);
+
+        let at_cap = prepare_input_event(&core, buy("at-cap", MAX_FILLS_PER_ORDER)).unwrap();
+        assert_eq!(at_cap.output_events.len(), 1 + 2 * MAX_FILLS_PER_ORDER);
     }
 
     #[test]

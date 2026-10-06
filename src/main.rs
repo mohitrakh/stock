@@ -73,6 +73,9 @@ async fn main() {
         return;
     }
     if args.first().is_some_and(|arg| arg == "--warm-replica") {
+        // A promoted warm replica checks login tokens: refuse now, not after it has fenced the
+        // old primary.
+        require_jwt_secret();
         let promotion = exchange::warm_replica::run(&args[1..], snapshot_interval_or_exit())
             .await
             .unwrap_or_else(|error| {
@@ -116,6 +119,7 @@ async fn main() {
         );
         std::process::exit(1);
     }
+    require_jwt_secret();
 
     let event_log_path =
         std::env::var("EVENT_LOG_PATH").unwrap_or_else(|_| DEFAULT_EVENT_LOG_PATH.to_string());
@@ -149,6 +153,15 @@ async fn main() {
         runtime.next_event_sequence().saturating_sub(1)
     );
     serve_primary(runtime, tx).await;
+}
+
+/// The primary signs and checks login tokens with `JWT_SECRET`. Without it, refuse to start, before
+/// the journal is opened, rather than check tokens against a guessable key.
+fn require_jwt_secret() {
+    if middleware::auth_middleware::jwt_secret().is_none() {
+        eprintln!("JWT_SECRET must be set to a non-empty secret: it signs and checks login tokens");
+        std::process::exit(1);
+    }
 }
 
 /// Commands between the snapshots the warm replica writes. The primary no longer snapshots while

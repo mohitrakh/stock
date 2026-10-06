@@ -41,6 +41,9 @@ pub(crate) struct MatchPlan {
     pub(crate) executions: Vec<Execution>,
     /// Quantity the new order still has after matching. Above zero, it rests.
     pub(crate) remaining: u32,
+    /// The order would trade against more resting orders than the cap planning was given. Nothing
+    /// else in the plan was built, and the order must be refused.
+    pub(crate) too_many_fills: bool,
 }
 
 impl MatchPlan {
@@ -132,11 +135,15 @@ impl OrderBook {
     /// command before it is allowed to change anything, and this lets it do that by reading the
     /// live book instead of copying it: the cost is the orders the new order actually reaches, not
     /// the size of the book. See `docs/performance/02-match-without-copying-the-book.md`.
-    pub(crate) fn plan_order(&self, order: &Order) -> MatchPlan {
+    ///
+    /// An order that would trade against more than `max_fills` resting orders gets a plan marked
+    /// `too_many_fills`, found before anything is built for it, and is refused.
+    pub(crate) fn plan_order(&self, order: &Order, max_fills: usize) -> MatchPlan {
         let mut plan = MatchPlan {
             fills: Vec::new(),
             executions: Vec::new(),
             remaining: order.leaves_qty,
+            too_many_fills: false,
         };
         // Best price first, and only the levels the order's limit price crosses.
         match order.side {
@@ -145,6 +152,7 @@ impl OrderBook {
                 self.sell_levels
                     .range(..=order.price)
                     .map(|(_, level)| level),
+                max_fills,
                 &mut plan,
             ),
             Side::Sell => self.plan_against(
@@ -152,6 +160,7 @@ impl OrderBook {
                 self.buy_levels
                     .range(..=Reverse(order.price))
                     .map(|(_, level)| level),
+                max_fills,
                 &mut plan,
             ),
         }
@@ -162,45 +171,57 @@ impl OrderBook {
         &self,
         order: &Order,
         levels: impl Iterator<Item = &'a PriceLevel>,
+        max_fills: usize,
         plan: &mut MatchPlan,
     ) {
-        let mut exec_counter = self.exec_counter;
-        for level in levels {
+        // First find the resting orders it trades with, by reference only, so that an order beyond
+        // the cap is refused before anything is built for it.
+        let mut trades = Vec::new();
+        'levels: for level in levels {
             // Price/time priority: within a level, oldest first.
             for resting in level.iter() {
                 if plan.remaining == 0 {
-                    return;
+                    break 'levels;
                 }
                 // Self-trade prevention walks past the aggressor's own orders, so a resting
                 // self-order can never hide a valid counterparty queued behind it.
                 if resting.user_id == order.user_id {
                     continue;
                 }
+                if trades.len() == max_fills {
+                    plan.too_many_fills = true;
+                    return;
+                }
                 let quantity = plan.remaining.min(resting.leaves_qty);
                 plan.remaining -= quantity;
-                plan.fills.push(Fill {
-                    order_id: resting.order_id.clone(),
+                trades.push((resting, quantity));
+            }
+        }
+
+        let mut exec_counter = self.exec_counter;
+        for (resting, quantity) in trades {
+            plan.fills.push(Fill {
+                order_id: resting.order_id.clone(),
+                price: resting.price,
+                quantity,
+                fills_resting_order: quantity == resting.leaves_qty,
+            });
+            let (buy_order_id, sell_order_id) = match order.side {
+                Side::Buy => (order.order_id.clone(), resting.order_id.clone()),
+                Side::Sell => (resting.order_id.clone(), order.order_id.clone()),
+            };
+            // One match produces two fills: one for the buy side, one for the sell side.
+            for _ in 0..2 {
+                plan.executions.push(Execution {
+                    execution_id: format!("exec_{exec_counter}"),
+                    buy_order_id: buy_order_id.clone(),
+                    sell_order_id: sell_order_id.clone(),
+                    symbol: self.symbol.clone(),
                     price: resting.price,
                     quantity,
-                    fills_resting_order: quantity == resting.leaves_qty,
+                    timestamp: order.timestamp.max(resting.timestamp),
                 });
-                let (buy_order_id, sell_order_id) = match order.side {
-                    Side::Buy => (order.order_id.clone(), resting.order_id.clone()),
-                    Side::Sell => (resting.order_id.clone(), order.order_id.clone()),
-                };
-                // One match produces two fills: one for the buy side, one for the sell side.
-                for _ in 0..2 {
-                    plan.executions.push(Execution {
-                        execution_id: format!("exec_{exec_counter}"),
-                        buy_order_id: buy_order_id.clone(),
-                        sell_order_id: sell_order_id.clone(),
-                        symbol: self.symbol.clone(),
-                        price: resting.price,
-                        quantity,
-                        timestamp: order.timestamp.max(resting.timestamp),
-                    });
-                    exec_counter += 1;
-                }
+                exec_counter += 1;
             }
         }
     }
@@ -274,7 +295,7 @@ impl OrderBook {
     /// Plan and apply in one step, for tests and tools that are not preparing a command.
     #[cfg(test)]
     pub fn place_order(&mut self, order: Order) -> Vec<Execution> {
-        let plan = self.plan_order(&order);
+        let plan = self.plan_order(&order, usize::MAX);
         self.apply_plan(order, &plan);
         plan.executions
     }
@@ -597,11 +618,45 @@ mod tests {
         book.place_order(order("s2", "bob", "SELL", 101, 5));
         let before = book.snapshot();
 
-        let plan = book.plan_order(&order("b1", "carol", "BUY", 101, 8));
+        let plan = book.plan_order(&order("b1", "carol", "BUY", 101, 8), usize::MAX);
 
         assert_eq!(book.snapshot(), before);
         assert_eq!(plan.executions.len(), 4);
         assert_eq!(plan.remaining, 0);
         assert_eq!(plan.filled_resting_orders().collect::<Vec<_>>(), ["s1"]);
+    }
+
+    #[test]
+    fn an_order_beyond_the_fill_cap_is_marked_before_anything_is_built() {
+        let mut book = OrderBook::new("AAPL".into());
+        let order = |id: &str, user: &str, side: &str, quantity: u32| {
+            Order::new(
+                id.into(),
+                user.into(),
+                "AAPL".into(),
+                side,
+                100,
+                quantity,
+                None,
+                1.0,
+                1,
+            )
+            .unwrap()
+        };
+        for id in ["s1", "s2", "s3", "s4"] {
+            book.place_order(order(id, "alice", "SELL", 1));
+        }
+        let sweep = order("b1", "carol", "BUY", 4);
+
+        // Exactly at the cap: complete.
+        let plan = book.plan_order(&sweep, 4);
+        assert!(!plan.too_many_fills);
+        assert_eq!(plan.executions.len(), 8);
+        assert_eq!(plan.remaining, 0);
+        // Beyond it: refused at the third resting order, with nothing built.
+        let plan = book.plan_order(&sweep, 2);
+        assert!(plan.too_many_fills);
+        assert!(plan.executions.is_empty());
+        assert_eq!(plan.filled_resting_orders().count(), 0);
     }
 }

@@ -49,6 +49,8 @@ pub enum OrderManagerError {
     PositionRejected(String),
     /// The order would rest while the books already hold their maximum number of resting orders.
     BookFull,
+    /// The order would trade against more resting orders than one journal record can hold.
+    TooManyFills,
     MatchingRejected(String),
     Internal(String),
 }

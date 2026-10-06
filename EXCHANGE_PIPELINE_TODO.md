@@ -418,14 +418,23 @@ Full write-up: `docs/tasks/16-subscribers-keep-up.md`; measurements in `docs/per
 - Client-supplied order ids and symbols are limited to 1-64 bytes with no control characters at the gateway, so no journaled value can stop the reporter.
 - `cargo fmt -- --check` clean; `cargo test --locked` passes 142 unit tests and the integration tests; both PostgreSQL acceptance tests pass.
 
-## Next Milestone
+## Completed Milestone - Trading Day
 
-Selected: milestone 22, Trading Day. The specification is in `PROJECT_DIRECTION.md` ("22. Trading Day"); the write-up is `docs/tasks/17-trading-day.md`. In progress.
+Milestone 22, complete on 2026-10-05. The specification is in `PROJECT_DIRECTION.md` ("22. Trading Day"); the write-up is `docs/tasks/17-trading-day.md`, and the measurement `docs/performance/07-trading-days-bound-the-state.md`.
 
 - [x] Part 1 (2026-10-02): session commands (`MarketOpenRequested` / `MarketCloseRequested`), the loopback operator port, closed-market rejection in `prepare_input_event`, the risk day from sessions, snapshot version 2.
 - [x] Part 2 (2026-10-05): expiry of every resting order at the close (`OrderExpired`, collateral and risk released), through the shared decoder, the MDP and the reporter; at most 200,000 resting orders (`BookFull`), so the close always fits one record.
 - [x] Part 3 (2026-10-05): clearing the previous day at the next open; client order ids unique per trading day; reporter keys `(trading_day, order_id)` and a fourth migration; a warm-replica snapshot after each open.
-- [ ] Part 4: multi-day benchmark (`--bench --days N`) against the milestone 21 binary; `docs/performance/07-*.md`, `docs/tasks/17-trading-day.md`.
-- [ ] Update `PROJECT_DIRECTION.md` after every part; independent review; `cargo fmt -- --check`, `cargo test --locked`, PostgreSQL acceptance tests.
+- [x] Part 4 (2026-10-05): multi-day benchmark (`--bench --days N`) against the milestone 21 binary on the same 1,000,000 orders; memory, snapshot size and restart time stay flat across days (`docs/performance/07-trading-days-bound-the-state.md`).
+- [x] `PROJECT_DIRECTION.md` updated after every part; independent reviews of parts 2 and 3 with every finding fixed; `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests.
 
-After it: journal replication to a second machine. Smaller follow-ups: a pipelined journal sync with per-group mmap publication, promotion from the warm replica's own snapshot, and set-based reporter writes.
+## Next Milestone
+
+Selected on 2026-10-05: milestone 23, Two Machines. The specification, with the owner's decisions, is in `PROJECT_DIRECTION.md` ("23. Two Machines"). Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` (Part 1), then `docs/tasks/19-two-machines.md`.
+
+- [x] Part 1 (2026-10-05): refuse an order that would trade against more than 10,000 resting orders (`TooManyFills`) and a deposit that would take the exchange's total cash or a symbol's total shares past `u64::MAX`, so no command can stop the worker; refuse to start without `JWT_SECRET`. Live: the milestone 22 binary halted on a 55,000-order sweep and on a fill crediting a `u64::MAX` balance; the new one refused both as ordinary rejections. Independent review done, findings fixed.
+- [ ] Part 2: a journal id in the header instead of device/inode; checkpoint checks that skip history; promotion from the warm replica's core; bounded warm-replica lag. Measure promotion and restart times before and after.
+- [ ] Part 3: replication over TCP; the primary replies and publishes only after the replica confirms; the pause and "run alone".
+- [ ] Part 4: epoch-fenced promotion on the second machine; the old primary rejoins as the replica; the reporter continues from its checkpoint.
+- [ ] Part 5: measurement and failure tests; `docs/performance/08-*.md`.
+- [ ] `PROJECT_DIRECTION.md` updated after every part; an independent review of each part; `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests.

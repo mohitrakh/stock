@@ -7,6 +7,11 @@ use super::types::{Price, WalletError};
 pub struct Wallet {
     balances: HashMap<String, u64>,
     locked: HashMap<String, u64>,
+    /// All the cash the exchange holds, across every user. Fills only move cash between users, so
+    /// only a deposit changes it, and `validate_deposit` keeps it within `u64::MAX`. A balance can
+    /// never exceed it, so no fill can overflow a balance: before this rule, a client could deposit
+    /// `u64::MAX`, sell one share, and halt the worker with the overflow its fill caused.
+    total: u64,
 }
 
 /// Normalized on-disk form of the cash ledger. The runtime maps are intentionally kept private
@@ -28,28 +33,31 @@ impl Wallet {
         Self {
             balances: HashMap::new(),
             locked: HashMap::new(),
+            total: 0,
         }
     }
 
-    /// Credits cash. Reports overflow rather than wrapping — previously this was a bare `+=`, which
-    /// would have panicked in debug and silently wrapped a balance to near zero in release.
+    /// Credits cash, unless it would take the exchange's total cash past `u64::MAX`.
     pub fn deposit(&mut self, user_id: String, amount: u64) -> Result<(), WalletError> {
-        let current = self.balances.get(&user_id).copied().unwrap_or(0);
-        let updated = current.checked_add(amount).ok_or(WalletError::Overflow)?;
-
-        self.balances.insert(user_id, updated);
-
+        self.validate_deposit(amount)?;
+        self.commit_deposit(user_id, amount);
         Ok(())
     }
 
-    pub fn validate_deposit(&self, user_id: &str, amount: u64) -> Result<(), WalletError> {
-        self.balance(user_id)
+    /// A deposit must keep the exchange's total cash within `u64::MAX`. That also keeps the
+    /// depositor's own balance in range, since no balance exceeds the total.
+    pub fn validate_deposit(&self, amount: u64) -> Result<(), WalletError> {
+        self.total
             .checked_add(amount)
             .ok_or(WalletError::Overflow)
             .map(|_| ())
     }
 
     pub(crate) fn commit_deposit(&mut self, user_id: String, amount: u64) {
+        self.total = self
+            .total
+            .checked_add(amount)
+            .expect("prepared wallet deposit must remain valid");
         let updated = self
             .balance(&user_id)
             .checked_add(amount)
@@ -214,6 +222,8 @@ impl Wallet {
         self.locked.insert(user_id.to_string(), updated);
     }
 
+    /// A fill's new balance and lock for one party. The fill moves cash between its parties, so
+    /// the total does not change.
     pub(crate) fn commit_settlement(&mut self, user_id: String, balance: u64, locked: u64) {
         self.balances.insert(user_id.clone(), balance);
         self.locked.insert(user_id, locked);
@@ -263,7 +273,42 @@ impl Wallet {
             }
             locked.insert(entry.user_id, entry.locked);
         }
+        let total = balances
+            .values()
+            .try_fold(0u64, |total, balance| total.checked_add(*balance))
+            .ok_or_else(|| {
+                "wallet snapshot holds more than u64::MAX of cash in total".to_string()
+            })?;
 
-        Ok(Self { balances, locked })
+        Ok(Self {
+            balances,
+            locked,
+            total,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_deposit_is_refused_once_total_cash_would_pass_u64_max() {
+        let mut wallet = Wallet::new();
+        wallet.deposit("whale".into(), u64::MAX - 1).unwrap();
+        wallet.deposit("minnow".into(), 1).unwrap();
+
+        // Nobody may deposit now, though the minnow's own balance is tiny.
+        assert_eq!(
+            wallet.deposit("minnow".into(), 1),
+            Err(WalletError::Overflow)
+        );
+        assert_eq!(wallet.balance("minnow"), 1);
+        let snapshot = wallet.snapshot();
+        assert!(Wallet::from_snapshot(snapshot.clone()).is_ok());
+
+        let mut beyond = snapshot;
+        beyond.entries[0].balance += 1;
+        assert!(Wallet::from_snapshot(beyond).is_err());
     }
 }

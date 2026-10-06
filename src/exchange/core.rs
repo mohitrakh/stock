@@ -1,7 +1,7 @@
 use crate::{
     sequencer::Sequencer,
     types::{
-        matching_engine::{MAX_RESTING_ORDERS, MatchingEngine},
+        matching_engine::{MAX_FILLS_PER_ORDER, MAX_RESTING_ORDERS, MatchingEngine},
         order_manager::{OrderManager, OrderManagerError, PreparedCancel, PreparedNewOrder},
         types::{
             BalanceView, Execution, ExecutionView, Order, OrderBookView, OrderView, PositionView,
@@ -205,14 +205,12 @@ impl ExchangeCore {
         self.order_manager.deposit_funds(user_id, amount)
     }
 
-    pub(crate) fn validate_deposit(
-        &self,
-        user_id: &str,
-        amount: u64,
-    ) -> Result<(), OrderManagerError> {
+    /// A deposit is refused if it would take the exchange's total cash past `u64::MAX`, so that no
+    /// fill can ever overflow a balance.
+    pub(crate) fn validate_deposit(&self, amount: u64) -> Result<(), OrderManagerError> {
         self.order_manager
             .wallet
-            .validate_deposit(user_id, amount)
+            .validate_deposit(amount)
             .map_err(|err| OrderManagerError::WalletRejected(format!("{:?}", err)))
     }
 
@@ -249,6 +247,16 @@ impl ExchangeCore {
         self.order_manager.subscribe(callback);
     }
 
+    /// Forces a balance that no command can reach, so a test can make settlement fail with an
+    /// internal fault: deposits keep the total cash within `u64::MAX`, so a fill alone never can.
+    #[cfg(test)]
+    pub(crate) fn force_balance_for_test(&mut self, user_id: &str, balance: u64) {
+        let locked = self.order_manager.wallet.locked(user_id);
+        self.order_manager
+            .wallet
+            .commit_settlement(user_id.to_string(), balance, locked);
+    }
+
     pub fn deposit_shares(
         &mut self,
         user_id: &str,
@@ -258,15 +266,16 @@ impl ExchangeCore {
         self.order_manager.deposit_shares(user_id, symbol, quantity)
     }
 
+    /// A share deposit is refused if it would take the exchange's total of the symbol past
+    /// `u64::MAX`, so that no fill can ever overflow a holding.
     pub(crate) fn validate_share_deposit(
         &self,
-        user_id: &str,
         symbol: &str,
         quantity: u64,
     ) -> Result<(), OrderManagerError> {
         self.order_manager
             .positions
-            .validate_credit(user_id, symbol, quantity)
+            .validate_credit(symbol, quantity)
             .map_err(|err| OrderManagerError::PositionRejected(format!("{:?}", err)))
     }
 
@@ -281,14 +290,16 @@ impl ExchangeCore {
     }
 
     pub(crate) fn prepare_add_order(&self, order: Order) -> Result<PreparedAddOrder, CoreError> {
-        self.prepare_add_order_within(order, MAX_RESTING_ORDERS)
+        self.prepare_add_order_within(order, MAX_RESTING_ORDERS, MAX_FILLS_PER_ORDER)
     }
 
-    /// `max_resting` is `MAX_RESTING_ORDERS`, except in tests that cannot build that many orders.
+    /// `max_resting` and `max_fills` are `MAX_RESTING_ORDERS` and `MAX_FILLS_PER_ORDER`, except in
+    /// tests that cannot build that many orders.
     fn prepare_add_order_within(
         &self,
         mut order: Order,
         max_resting: usize,
+        max_fills: usize,
     ) -> Result<PreparedAddOrder, CoreError> {
         let seq_num = self.sequencer.peek();
         order.seq_num = seq_num;
@@ -298,9 +309,14 @@ impl ExchangeCore {
 
         let matching = self
             .matching_engine
-            .prepare_order(order.clone())
+            .prepare_order(order.clone(), max_fills)
             .map_err(CoreError::Internal)?;
-        // The cap keeps the close's single journal record within its size limit.
+        // Both caps keep a journal record within its size limit: this one keeps the order's own,
+        // and it comes first because such a plan is incomplete.
+        if matching.plan.too_many_fills {
+            return Err(CoreError::Business(OrderManagerError::TooManyFills));
+        }
+        // This one keeps the close's single record within it.
         if self
             .matching_engine
             .exceeds_capacity(&matching.plan, max_resting)
@@ -1180,7 +1196,7 @@ mod tests {
         core.deposit("buyer".to_string(), 1_000).unwrap();
         // A cap of two resting orders stands in for the real 200,000.
         let add = |core: &mut ExchangeCore, order: Order| {
-            core.prepare_add_order_within(order, 2)
+            core.prepare_add_order_within(order, 2, MAX_FILLS_PER_ORDER)
                 .map(|prepared| core.commit_add_order(prepared))
         };
         add(&mut core, order("ask-10", "seller", "SELL", 10, 1)).unwrap();
@@ -1201,6 +1217,31 @@ mod tests {
             add(&mut core, order("bid-8", "buyer", "BUY", 8, 1)),
             Err(CoreError::Business(OrderManagerError::BookFull))
         ));
+    }
+
+    #[test]
+    fn an_order_that_would_trade_against_too_many_resting_orders_is_refused_and_changes_nothing() {
+        let mut core = funded_core();
+        core.deposit("buyer".to_string(), 1_000).unwrap();
+        // A cap of two fills stands in for the real 10,000.
+        let add = |core: &mut ExchangeCore, order: Order| {
+            core.prepare_add_order_within(order, MAX_RESTING_ORDERS, 2)
+                .map(|prepared| core.commit_add_order(prepared))
+        };
+        for id in ["ask-1", "ask-2", "ask-3"] {
+            add(&mut core, order(id, "seller", "SELL", 10, 1)).unwrap();
+        }
+        let before = core.snapshot();
+
+        assert!(matches!(
+            add(&mut core, order("sweep", "buyer", "BUY", 10, 3)),
+            Err(CoreError::Business(OrderManagerError::TooManyFills))
+        ));
+        assert_eq!(core.snapshot(), before);
+        // An order within the cap trades as usual.
+        add(&mut core, order("two", "buyer", "BUY", 10, 2)).unwrap();
+        assert_eq!(core.order_view("two", "buyer").unwrap().status, "filled");
+        assert!(core.matching_engine.is_resting("ask-3"));
     }
 
     #[test]
@@ -1480,11 +1521,59 @@ mod tests {
         assert_eq!(outcome.executions[0].price.minor_units(), 101);
     }
 
+    /// Fills only move cash and shares between users, so capping the exchange's totals at each
+    /// deposit keeps every credit a fill makes within range. A client can no longer make settlement
+    /// overflow, an internal fault that halts the worker.
+    #[test]
+    fn deposits_that_could_make_a_fill_overflow_are_refused() {
+        let mut core = ExchangeCore::new();
+        core.deposit("seller".to_string(), u64::MAX - 10).unwrap();
+        core.deposit("buyer".to_string(), 10).unwrap();
+        core.deposit_shares("buyer", "AAPL", u64::MAX - 1).unwrap();
+        core.deposit_shares("seller", "AAPL", 1).unwrap();
+
+        // The exchange holds u64::MAX of cash and of AAPL: one more unit is refused, whoever
+        // deposits it. Another symbol has its own total.
+        assert!(matches!(
+            core.deposit("newcomer".to_string(), 1),
+            Err(OrderManagerError::WalletRejected(reason)) if reason == "Overflow"
+        ));
+        assert!(matches!(
+            core.deposit_shares("newcomer", "AAPL", 1),
+            Err(OrderManagerError::PositionRejected(reason)) if reason == "Overflow"
+        ));
+        core.deposit_shares("newcomer", "MSFT", 1).unwrap();
+
+        // A trade still settles with both totals at the limit.
+        core.add_order(order("sell", "seller", "SELL", 10, 1))
+            .unwrap();
+        let outcome = core.add_order(order("buy", "buyer", "BUY", 10, 1)).unwrap();
+        assert_eq!(outcome.view.status, "filled");
+        assert_eq!(core.balance_view("seller").balance, u64::MAX);
+        assert_eq!(
+            core.order_manager.positions.holding("buyer", "AAPL"),
+            u64::MAX
+        );
+
+        // The trade moved cash and shares without changing the totals, and a restored core
+        // rebuilds them from its snapshot.
+        let mut restored = ExchangeCore::from_snapshot(core.snapshot()).unwrap();
+        for core in [&mut core, &mut restored] {
+            assert!(core.deposit("newcomer".to_string(), 1).is_err());
+            assert!(core.deposit_shares("newcomer", "AAPL", 1).is_err());
+        }
+    }
+
+    /// Deposits can no longer reach a balance a fill would overflow (see above), so this test and
+    /// the next two force the ledger into such a state, to check that the internal fault still
+    /// leaves the whole command uncommitted.
     #[test]
     fn late_seller_credit_overflow_leaves_the_command_uncommitted() {
         let mut core = funded_core();
-        core.deposit("seller".to_string(), u64::MAX).unwrap();
         core.deposit("buyer".to_string(), 10).unwrap();
+        core.order_manager
+            .wallet
+            .commit_settlement("seller".to_string(), u64::MAX, 0);
         core.add_order(order("sell-1", "seller", "SELL", 10, 1))
             .unwrap();
 
@@ -1507,8 +1596,13 @@ mod tests {
     fn buyer_position_overflow_leaves_the_command_uncommitted() {
         let mut core = ExchangeCore::new();
         core.deposit("buyer".to_string(), 10).unwrap();
-        core.deposit_shares("buyer", "AAPL", u64::MAX).unwrap();
         core.deposit_shares("seller", "AAPL", 1).unwrap();
+        core.order_manager.positions.commit_settlement(
+            "buyer".to_string(),
+            "AAPL".to_string(),
+            u64::MAX,
+            0,
+        );
         core.add_order(order("sell-1", "seller", "SELL", 10, 1))
             .unwrap();
 
@@ -1528,9 +1622,14 @@ mod tests {
     fn later_fill_failure_does_not_commit_earlier_fills() {
         let mut core = ExchangeCore::new();
         core.deposit("buyer".to_string(), 20).unwrap();
-        core.deposit_shares("buyer", "AAPL", u64::MAX - 1).unwrap();
         core.deposit_shares("seller-a", "AAPL", 1).unwrap();
         core.deposit_shares("seller-b", "AAPL", 1).unwrap();
+        core.order_manager.positions.commit_settlement(
+            "buyer".to_string(),
+            "AAPL".to_string(),
+            u64::MAX - 1,
+            0,
+        );
         core.add_order(order("sell-a", "seller-a", "SELL", 10, 1))
             .unwrap();
         core.add_order(order("sell-b", "seller-b", "SELL", 10, 1))

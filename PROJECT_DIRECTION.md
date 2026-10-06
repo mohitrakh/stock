@@ -1,4 +1,4 @@
-# Project Direction - Milestone 22 (Trading Day) In Progress
+# Project Direction - Milestone 23 (Two Machines) In Progress
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -83,7 +83,7 @@ Latest verified status on 2026-10-05, on Linux (the office Ubuntu machine; the c
 ```text
 cargo fmt -- --check
 cargo test --locked
-157 unit tests + the executable integration tests passed; 0 failed
+164 unit tests + the executable integration tests passed; 0 failed
 3 opt-in Reporter acceptance tests ignored by default (need REPORTER_TEST_DATABASE_URL);
   all passed against PostgreSQL 16 when run with it
 ```
@@ -93,6 +93,12 @@ maximum rate over 20,000 orders, 43,000 in memory; p99 about 20–30 ms at 1,000
 snapshots every 10,000 commands, 200,000 orders run at about 21,900 orders/s now that the warm
 replica writes them, up from about 8,300 when the trading thread did. See
 `docs/tasks/14-critical-path-performance-v1.md` and `docs/tasks/15-snapshots-by-the-warm-replica.md`.
+
+On the office Ubuntu machine, milestone 22's trading days keep the state to one day. Five days of
+200,000 orders end with 263 MB of exchange memory, an 85 MB largest snapshot and a 2.4 s restart.
+The milestone 21 binary, on the same 1,000,000 orders, ends with 1,234 MB, 422 MB and 11.7 s.
+Throughput is unchanged (40,000 to 45,000 orders/s with no warm replica). See
+`docs/performance/07-trading-days-bound-the-state.md`.
 
 Warm Replica v1 was additionally verified by a live run of the real primary and warm executables against PostgreSQL: a refused promotion while the primary ran, live following, a `SIGKILL` of the primary, a successful promotion, identical balances, positions, and order state on the promoted primary, a new trade there, and one contiguous journal across the hand-off.
 
@@ -554,9 +560,9 @@ Goal: make the two subscribers follow the exchange at its own speed, and fix the
 
 The migration `20260930000000_reporter_rejections.sql` runs in one transaction. It empties the report so the reporter rebuilds it from sequence 1, and adds a required `report_version` column so a reporter from before it cannot save a checkpoint. Measured on the office Ubuntu machine, the fixed reporter catches up at about 2,100 commands/s on both the 1-symbol and the 10-symbol journal. The Part 2 code does 1,400–1,900 there, depending on database state, so the fixes cost nothing. `cargo test` passes 142 unit tests and the integration tests; both PostgreSQL acceptance tests pass.
 
-## 22. Trading Day (in progress)
+## 22. Trading Day
 
-**Status: selected on 2026-10-01; Part 1 complete on 2026-10-02; Parts 2 and 3 complete on 2026-10-05.** Write-up: `docs/tasks/17-trading-day.md`. Decisions confirmed by the owner:
+**Status: completed on 2026-10-05** (selected on 2026-10-01; Part 1 complete on 2026-10-02; Parts 2 to 4 on 2026-10-05). Measurement: `docs/performance/07-trading-days-bound-the-state.md`. Write-up: `docs/tasks/17-trading-day.md`. Decisions confirmed by the owner:
 - a loopback operator port opens and closes the market;
 - every order still resting at the close expires (day orders only);
 - the previous day is cleared from memory at the next open;
@@ -666,6 +672,130 @@ Verified on Linux: `cargo fmt -- --check`, `cargo test --locked` with 153 unit t
 
 Verified on Linux: `cargo fmt -- --check`, `cargo test --locked` with 157 unit tests plus the integration tests, and all three PostgreSQL acceptance tests: the lifecycle journal now runs two days with an id reused on the second, and a new test shows that a close leaving an order resting in the report stops the reporter. A live run of the real exchange, MDP, reporter and warm replica over two days covered: a same-day id reuse refused (409); the closed day readable until the next open; after the open, the old id 404 and no fills, with balances carried over; both ids accepted again and trading with execution id `exec_2`; per-day report rows and trades, with the checkpoint on the new day; one warm snapshot right after each open (the last 653 bytes, at the second open, despite an interval of 1,000); and a `SIGKILL` restart from it. The independent review found no high-severity bug, and its findings were fixed: rejected orders and cancellations now record their day, the open simply drops every order instead of claiming a safety net it was not, the client-order-id comment and API advice now say ids are per day, a test now snapshots before an open, and stale docs and two operational notes (removing an old snapshot with an old journal, and empty books kept per symbol) were updated.
 
+**Part 4, complete (2026-10-05): measurement.** Write-up: `docs/performance/07-trading-days-bound-the-state.md`; raw output `docs/performance/results/results-m22.txt`. The benchmark gained `--days N`: each day opens, runs `--orders` measured orders, and closes, printing its own throughput, close time and memory. On the office Ubuntu machine, the same 1,000,000 orders with a warm replica beside the exchange, milestone 21 in one run against milestone 22 as five days of 200,000:
+- exchange memory at the end 1,234 MB against 263 MB, and after each close 256 to 263 MB on every day;
+- warm replica peak memory 2,121 MB against 506 MB;
+- largest snapshot 422 MB against 85 MB, back to 0.7 MB right after each open; slowest snapshot write 10.5 s against 1.9 s, and snapshot writing in total 375 s against 81 s;
+- warm replica caught up 365 s against 78 s after the benchmark;
+- restart at the end of the run 11.7 s against 2.4 s, the same 2.4 s as after one day; early in a day (snapshot of 667 KB right after the open) 49 ms.
+
+Each close took 250 to 380 ms and expired about 41,700 orders. Throughput without a warm replica is unchanged within noise (40,000 to 45,000 orders/s on both binaries). The warm replica still falls behind at maximum rate, but its snapshot work now grows with the run's length rather than with history.
+
+**Milestone 22 complete (2026-10-05).** Every completion criterion above holds:
+- orders are refused before the first open and after a close;
+- a close leaves the ledgers exactly where cancellations would;
+- the next open clears the day, and its client order ids return;
+- replay, snapshot recovery and the warm replica agree across days;
+- the MDP and the reporter follow the expiries and the per-day keys;
+- memory, snapshot size and restart time stay flat across days.
+
+Both independent reviews' findings were fixed (parts 2 and 3).
+
+## 23. Two Machines
+
+**Status: selected on 2026-10-05; Part 1 complete on 2026-10-05.** Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` for Part 1, then `docs/tasks/19-two-machines.md`. Decisions confirmed by the owner:
+- the primary waits for the replica: a command is answered, and becomes visible to anyone, only once it is on both machines' disks;
+- if the replica cannot be reached, the primary pauses until an operator either promotes the replica or tells the primary to run alone;
+- the machines talk over TCP;
+- for this milestone the second machine is a second container on the office Ubuntu machine, with its own volume and network address. It shares the CPU and the disk, and every measurement must say so.
+
+### Goal
+
+Survive the loss of a machine without losing an acknowledged command, and resume trading on the other machine in seconds. The design asks for 99.99% availability, a recovery point of zero ("data loss is not acceptable") and a recovery time of seconds. When the milestone was selected:
+- one disk holds the only journal, so losing that machine loses every balance, position and order;
+- promotion replays the whole journal, so it takes longer every day: a full replay of 200,000 orders took 25.2 s in milestone 20;
+- the journal is identified by its file's device and inode, which a copy on another machine does not share, so every snapshot and subscriber checkpoint would be refused there;
+- a reader that restarts (the warm replica, the MDP, the reporter) re-reads the journal from its first record, whatever its checkpoint says;
+- one client order could stop the exchange, and a second machine would stop on the same order. The design names this risk: bugs can bring down the primary and the backup alike.
+
+### Behaviour
+
+1. **No command can stop the exchange (Part 1).**
+   - An order that would trade against more than 10,000 resting orders is refused while it is prepared, as a journaled `OrderRejected { reason: "TooManyFills" }` (409). Its record therefore always fits the 64 MiB limit, and replay reaches the same decision. Before, such an order made a record too large to write, and the worker halted. The order was never journaled, so a restart worked, and the client could send it again.
+   - A deposit is refused if it would take the exchange's total cash, or a symbol's total shares, past `u64::MAX`. Fills only move cash and shares between users, so no fill can then overflow a balance or a holding. Before, one deposit of `u64::MAX` and a one-share trade halted the worker the same way. The independent review of Part 1 found this.
+   - The exchange and the warm replica refuse to start without `JWT_SECRET`. Before, the token check fell back to the key `"secret"` when it was unset.
+2. **The journal names itself (Part 2).** A new journal starts with a random journal id in its header. Snapshots, reader checkpoints, the stream header, the MDP state and the reporter checkpoint bind to that id instead of the device and inode, so a byte-identical copy on another machine is the same journal.
+3. **Restarts cost the day, not history (Part 2).**
+   - A reader checks its checkpoint by reading the record there, not every record before it.
+   - Promotion reuses the warm replica's core, which it built from the journal and checked output by output, and replays only the records after it. Nothing on the promotion path grows with history.
+   - The warm replica's lag stays bounded at the exchange's full rate. Today it grows through the day because of its snapshots, and a promotion would have to replay that backlog first.
+4. **Every acknowledged command is on both machines (Part 3).**
+   - The primary sends each group's records to the replica over TCP while it syncs its own journal.
+   - The replica checks them, appends exactly those bytes to its own journal, syncs, and confirms.
+   - The primary publishes, runs callbacks and replies only once both syncs are done. Nothing that exists on one machine only is ever visible to a client or a subscriber.
+   - A replica that starts behind first catches up from the primary's journal.
+5. **Pause, never guess (Part 3).** If the replica stops confirming, the primary stops committing: commands wait in its queue and nothing is acknowledged. The operator port shows the pause and offers "run alone": the primary continues without a replica, and the recovery point of zero no longer holds until a replica has caught up again. The operator must never both promote the replica and tell the primary to run alone.
+6. **Fenced promotion on the second machine (Part 4).**
+   - Promotion is manual.
+   - Each primary term has an epoch number, journaled at its start. The promoted replica raises the epoch and refuses the old primary. The old primary can no longer get a confirmation, so it can no longer acknowledge anything.
+   - When the old machine returns, it rejoins as the replica. It drops the end of its journal that was never confirmed, and so was never acknowledged or published, then follows the new primary.
+7. **Subscribers continue (Part 4).** The reporter, whose checkpoint is in PostgreSQL, resumes against the new primary's journal without a rebuild, because it is the same journal. The MDP starts on the new primary's machine like any MDP: from its state file when one is there, otherwise from the journal.
+
+### Parts
+
+1. No command can stop the exchange: the fill cap and the deposit totals; `JWT_SECRET` required at startup.
+2. On one machine: the journal id, checkpoint checks that skip history, promotion from the warm replica's core, and a warm replica whose lag stays bounded. Measure promotion and restart times before and after on a multi-day journal.
+3. Replication over TCP with the primary waiting for the replica; the pause and "run alone".
+4. Epoch-fenced promotion on the second machine; the old primary rejoining as the replica; subscribers continuing.
+5. Measurement and failure tests:
+   - throughput and p99 with and without replication;
+   - killing the primary under load loses no acknowledged command;
+   - recovery time, from the promote request to the first accepted order;
+   - the replica killed, the network cut, and the old primary returning with an unconfirmed tail.
+
+### Completion criteria
+
+- An order that would take more than 10,000 resting orders is refused and journaled. The largest order still accepted fits in one record with the gateway's longest ids. No deposit can take the exchange's total cash or a symbol's total shares past `u64::MAX`. The exchange and the warm replica refuse to start without `JWT_SECRET`.
+- Promotion time and reader restart time no longer grow with the journal, measured on a multi-day journal against the current code.
+- With replication on, killing the primary at any moment under load loses no acknowledged command over repeated runs, and the replica's journal is a byte-identical prefix of the primary's.
+- With the replica unreachable, the primary acknowledges nothing until the operator acts.
+- After a promotion, the old primary acknowledges nothing. When it returns, it drops its unconfirmed tail and follows the new primary.
+- The reporter continues after a failover from its checkpoint, without a rebuild.
+- Throughput, latency and recovery time with replication are measured and written up.
+- `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests and an independent review of each part all pass.
+
+Not in this milestone:
+- automatic failover, or promotion on missed heartbeats;
+- leader election or Raft, and more than one replica;
+- reliable UDP or multicast, and a second data center;
+- replicating PostgreSQL: users and the report stay on one database;
+- an authenticated or encrypted replication link: private network only;
+- journal files per day or archiving;
+- a pipelined journal sync.
+
+### Progress
+
+**Part 1, complete (2026-10-05): no command can stop the exchange.** Write-up: `docs/tasks/18-one-order-cannot-stop-the-exchange.md`.
+- **The fill cap.**
+  - One new order may trade against at most 10,000 resting orders (`MAX_FILLS_PER_ORDER`). Beyond that it is refused while it is prepared, as a journaled `OrderRejected { reason: "TooManyFills" }` (409), and replay reaches the same decision.
+  - Planning first walks the resting orders the order would trade with, by reference only. It builds fills and executions only within the cap, so a refused sweep costs one walk of at most 10,001 orders.
+  - At the widest values one trade takes 1,376 bytes of the record, so 10,000 take 13.8 MB of the 64 MiB limit.
+- **The deposit totals.**
+  - A deposit is refused (`Overflow`) if it would take the exchange's total cash, or a symbol's total shares, past `u64::MAX`.
+  - Fills only move cash and shares between users, so no fill can overflow a balance or holding.
+  - The totals are running sums: deposits add to them, fills leave them alone, and snapshots rebuild them and are refused beyond them.
+  - Found by the independent review: one deposit of `u64::MAX` and a one-share trade halted the worker.
+  - Not fixed: nothing withdraws, so one client can deposit up to the limit and refuse every later deposit. Operator-only deposits (the gateway milestone) remove this.
+- **No fallback key.** The exchange and the warm replica refuse to start without a non-empty `JWT_SECRET`, the warm replica before it follows anything. The token check never falls back to `"secret"` any more.
+- **Compatibility.** A journal holding an accepted order with more than 10,000 fills, or deposits beyond the totals, no longer replays; none of this project's journals has either. A primary and a warm replica must run the same version.
+
+Verified on Linux: `cargo fmt -- --check`, and `cargo test --locked` with 164 unit tests plus the integration tests, including a new process test of both refusals to start. Live runs of the real binary:
+- **The sweep.** 55,000 resting sells with the gateway's longest ids, then one buy that sweeps them:
+  - the milestone 22 binary halted ("record exceeds size limit"), recovered on restart with the book intact, and halted again on the same order;
+  - the new binary refused it with 409 in 0.02 s, then filled an order taking exactly 10,000 (a 12.4 MB record) and kept trading.
+- **The overflow.** A deposits `u64::MAX` and sells one share; B deposits 1 and buys it:
+  - the milestone 22 binary halted ("wallet balance invalid");
+  - the new binary refused B's deposit, so the buy was an ordinary insufficient-funds rejection; a share deposit beyond the AAPL total was refused too.
+
+The independent review's other findings were fixed:
+- the write-up was missing from `.gitignore`'s exceptions;
+- a size test's final check could never fail;
+- a test name overstated what it checks;
+- a refused sweep built every execution before being refused;
+- three wording errors in the write-up.
+
+Its re-check of the fixes confirmed the conservation argument and the two-step planner. It found that the first version of the deposit check scanned every holding of every symbol on each share deposit, which any client could make slow; the totals are now running sums. It also found the deposit limit that one client can use up, recorded above as not fixed.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -679,13 +809,13 @@ Verified on Linux: `cargo fmt -- --check`, `cargo test --locked` with 157 unit t
 - self-trade prevention skips the aggressor's own orders but cannot stop a user crossing against themselves; that needs engine-generated cancellations
 - `Order.leaves_qty` and `ManagedOrder.remaining_quantity` are separate sources of truth for the same number
 - one global minor-unit price scale is assumed; per-product currency and tick-size metadata are not modeled
-- wallet balance credits are checked for overflow before commit
+- a deposit is refused if it would take the exchange's total cash, or a symbol's total shares, past `u64::MAX`, so no fill can overflow a balance or holding; nothing withdraws, so one client can deposit up to that limit and refuse every later deposit by anyone, until deposits become operator actions
 - the event log is one file that grows without bound; snapshots reduce exchange-core replay work but do not compact or retain less journal history; startup reads the part of the journal it replays (all of it without a usable snapshot or on warm promotion, the suffix with one) into memory in one piece rather than streaming it
 - order records and the per-user execution index hold one trading day; the open replaces both maps, releasing their memory, while the matching engine's order-location map and risk usage keep the capacity of the largest day, and a price level's node slots are freed only when the level empties, which the close guarantees once a day
 - the books hold at most 200,000 resting orders across all symbols, so that the close's one journal record always fits; beyond that an order that would rest is refused (409 `BookFull`) until orders trade, are cancelled, or expire at the close, and one user can fill the book, as there is no per-user share; there is no close spread across several records
-- a single command whose record would exceed 64 MiB still halts the worker instead of being refused; one order filling against more than roughly 60,000 to 140,000 resting orders (depending on id lengths) can do it, and since the command is not journaled, a restart recovers
+- one order may trade against at most 10,000 resting orders (`TooManyFills`, 409), so that its record always fits the 64 MiB limit; a client that wants more must split its order
 - one journal `sync_all` per group of queued commands; the worker waits during it (no pipelined journaler thread yet), and p99 cannot beat the disk's own sync latency
-- the core snapshot serializes the whole exchange state, which since milestone 22 holds one trading day; its cost grows through the day, it runs on the warm replica (every interval and right after each open), which falls behind at full load, and only at primary startup on the primary
+- the core snapshot serializes the whole exchange state, which since milestone 22 holds one trading day: at 200,000 orders a day it grows to about 85 MB and 2 s by the close, and falls to under 1 MB at the next open. It runs on the warm replica (every interval and right after each open), which still falls behind at full load because it snapshots every 10,000 commands, and only at primary startup on the primary
 - without a running warm replica no periodic snapshots are written; a restart then replays everything since the primary's last startup snapshot
 - the warm replica's snapshot writes share the host's disk with the journal's syncs
 - after a failed journal sync the in-memory core is ahead of the disk; it is never used again, the worker halts, and the process must be restarted to recover from the journal
@@ -706,11 +836,16 @@ Verified on Linux: `cargo fmt -- --check`, `cargo test --locked` with 157 unit t
 - the warm replica's management API is unauthenticated and loopback-only; `202` from `/promote` means the old writer is fenced, not that the customer listener is ready
 - the crate uses Unix-only APIs (advisory file locks, device/inode journal identity, mmap) and builds and tests on Linux only
 - the reporter applies about 1,600 commands/s: it keeps up at 1,000 orders/s but falls behind a sustained faster exchange and catches up afterwards; set-based writes or `COPY` are the next lever
-- the report keys accepted orders by `order_id` and trades' execution ids by symbol, which is correct only while ids are never reused; a trading-day boundary must revisit both first (`DEFERRED_ITEMS.md`)
 
 ## What Not To Work On Yet
 
-Milestone 22, the trading day, is selected; its specification is the section above. After it comes journal replication to a second machine with manual, epoch-fenced promotion and measured RPO/RTO. The trading day must change the report keys recorded in `DEFERRED_ITEMS.md` before it lets an order id be reused. A pipelined journal sync with per-group mmap publication, promotion from the warm replica's own snapshot, and set-based reporter writes are smaller follow-ups. Do not grow the completed warm replica into automatic failover, heartbeats, leader election, cross-host replication, reliable UDP, or Raft except as a milestone selected for that purpose: each needs its own failure model, fencing rules, and RTO/RPO targets. The same applies to tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, Crossbeam, lock-free ring buffers, CPU pinning, new trading-component threads, per-symbol workers, and FIX/SBE. The committed mmap reader remains the input for all independent subscribers and for the warm follower; inbound commands remain on the existing bounded Tokio queue.
+Milestone 23, two machines, is selected; its specification is the section above. Do not grow it into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it. After milestone 23, the recorded candidates in order are:
+1. the gateway and trust boundary: risk limits and deposits set by the operator only, a product list so that only listed symbols trade, and per-user rate limiting;
+2. set-based reporter writes or `COPY`;
+3. pushed updates (WebSocket) of a user's own fills and the L2 book;
+4. latency: a binary record format instead of JSON, a pipelined journal sync, and CPU pinning.
+
+The same restraint applies to tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, Crossbeam, lock-free ring buffers, new trading-component threads, per-symbol workers, and FIX/SBE. The committed mmap reader remains the input for all independent subscribers and for the warm follower; inbound commands remain on the existing bounded Tokio queue.
 
 ## Rule For Future Sessions
 

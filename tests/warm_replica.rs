@@ -67,6 +67,7 @@ impl Fixture {
         let child = Command::new(env!("CARGO_BIN_EXE_stock"))
             .current_dir(&self.dir)
             .env_remove("DATABASE_URL")
+            .env("JWT_SECRET", "warm-replica-test")
             .args([
                 "--warm-replica",
                 self.journal.to_str().unwrap(),

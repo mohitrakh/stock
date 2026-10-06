@@ -1,5 +1,6 @@
 use crate::{
     error::app_error::AppError,
+    middleware::auth_middleware::jwt_secret,
     models::user::{Claims, LoginRequest, RegisterRequest, User},
     state::AppState,
 };
@@ -107,8 +108,8 @@ pub async fn login(
                 &Header::default(),
                 &claims,
                 &EncodingKey::from_secret(
-                    std::env::var("JWT_SECRET")
-                        .expect("JWT_SECRET not set")
+                    jwt_secret()
+                        .expect("JWT_SECRET is checked at startup")
                         .as_bytes(),
                 ),
             )

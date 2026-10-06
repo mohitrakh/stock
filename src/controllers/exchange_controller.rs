@@ -168,10 +168,12 @@ pub async fn place_order(
     .await?
     .map_err(|err| {
         // A reused client order id is the retry case, not a malformed request, and a closed
-        // market or a full book is the exchange's state, not the request's fault.
+        // market, a full book or a sweep through too many resting orders depends on the
+        // exchange's state, not on the request alone.
         if err.contains("AlreadyExists")
             || err == crate::exchange::runtime::MARKET_CLOSED
             || err == "BookFull"
+            || err == "TooManyFills"
         {
             AppError::Conflict(err)
         } else {

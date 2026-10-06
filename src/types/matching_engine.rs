@@ -11,6 +11,14 @@ use super::types::{L2Level, Order, OrderBookView, Price};
 /// bytes there, so a close of this many orders, about 56 MB, always fits.
 pub(crate) const MAX_RESTING_ORDERS: usize = 200_000;
 
+/// Most resting orders one new order may trade against. Each trade adds two executions to the
+/// order's journal record, which may not exceed 64 MiB. At the widest values (the gateway's longest
+/// ids and symbol, each byte escaped to two in JSON, and the largest numbers) one trade takes 1,376
+/// bytes there, so an order with this many, 13.8 MB, always fits. An order that would trade against
+/// more is refused before anything changes; without the cap its record could not be written, and
+/// the worker would halt.
+pub(crate) const MAX_FILLS_PER_ORDER: usize = 10_000;
+
 #[derive(Debug)]
 pub struct MatchingEngine {
     order_books: HashMap<String, OrderBook>,
@@ -45,7 +53,14 @@ impl MatchingEngine {
         }
     }
 
-    pub(crate) fn prepare_order(&self, order: Order) -> Result<PreparedOrder, String> {
+    /// Plans the order against the live book. An order that would trade against more than
+    /// `max_fills` resting orders gets a plan marked `MatchPlan::too_many_fills`, which the caller
+    /// refuses.
+    pub(crate) fn prepare_order(
+        &self,
+        order: Order,
+        max_fills: usize,
+    ) -> Result<PreparedOrder, String> {
         if order.seq_num <= self.last_seq {
             return Err(format!(
                 "Sequence violation: received seq {} but last was {}",
@@ -55,8 +70,8 @@ impl MatchingEngine {
 
         // Read the live book; never copy it. A symbol with no book yet has nothing to match.
         let plan = match self.order_books.get(&order.symbol) {
-            Some(book) => book.plan_order(&order),
-            None => OrderBook::new(order.symbol.clone()).plan_order(&order),
+            Some(book) => book.plan_order(&order, max_fills),
+            None => OrderBook::new(order.symbol.clone()).plan_order(&order, max_fills),
         };
         Ok(PreparedOrder { order, plan })
     }

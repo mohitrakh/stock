@@ -19,6 +19,11 @@ pub enum PositionError {
 pub struct Positions {
     holdings: HashMap<(String, String), u64>,
     locked: HashMap<(String, String), u64>,
+    /// Each symbol's shares the exchange holds, across every user. Fills only move shares between
+    /// users, so only a deposit changes a total, and `validate_credit` keeps each within
+    /// `u64::MAX`. A holding can never exceed its total, so no fill can overflow the buyer's
+    /// holding, an internal fault that would halt the worker.
+    totals: HashMap<String, u64>,
 }
 
 /// Normalized snapshot rows avoid relying on JSON object-key encoding for `(user, symbol)`.
@@ -40,6 +45,7 @@ impl Positions {
         Self {
             holdings: HashMap::new(),
             locked: HashMap::new(),
+            totals: HashMap::new(),
         }
     }
 
@@ -47,40 +53,36 @@ impl Positions {
         (user_id.to_string(), symbol.to_string())
     }
 
-    /// Adds shares: an external deposit, or the buyer's side of a fill.
-    ///
-    /// Unlike `Wallet::deposit` this reports overflow rather than panicking in debug and wrapping in
-    /// release. The wallet's silent credit is a known gap; there was no reason to copy it here.
+    /// Adds deposited shares, unless they would take the exchange's total of the symbol past
+    /// `u64::MAX`. A fill's shares move through `commit_settlement` instead.
     pub fn credit(
         &mut self,
         user_id: &str,
         symbol: &str,
         quantity: u64,
     ) -> Result<(), PositionError> {
-        let key = Self::key(user_id, symbol);
-        let current = self.holdings.get(&key).copied().unwrap_or(0);
-        let updated = current
-            .checked_add(quantity)
-            .ok_or(PositionError::Overflow)?;
-
-        self.holdings.insert(key, updated);
-
+        self.validate_credit(symbol, quantity)?;
+        self.commit_credit(user_id, symbol, quantity);
         Ok(())
     }
 
-    pub fn validate_credit(
-        &self,
-        user_id: &str,
-        symbol: &str,
-        quantity: u64,
-    ) -> Result<(), PositionError> {
-        self.holding(user_id, symbol)
+    /// A deposit must keep the exchange's total of the symbol within `u64::MAX`. That also keeps
+    /// the depositor's own holding in range, since no holding exceeds the total.
+    pub fn validate_credit(&self, symbol: &str, quantity: u64) -> Result<(), PositionError> {
+        self.totals
+            .get(symbol)
+            .copied()
+            .unwrap_or(0)
             .checked_add(quantity)
             .ok_or(PositionError::Overflow)
             .map(|_| ())
     }
 
     pub(crate) fn commit_credit(&mut self, user_id: &str, symbol: &str, quantity: u64) {
+        let total = self.totals.entry(symbol.to_string()).or_default();
+        *total = total
+            .checked_add(quantity)
+            .expect("prepared position credit must remain valid");
         let key = Self::key(user_id, symbol);
         let updated = self
             .holding(user_id, symbol)
@@ -220,6 +222,8 @@ impl Positions {
         self.locked.insert(key, updated);
     }
 
+    /// A fill's new holding and lock for one party. The fill moves shares between its parties, so
+    /// the symbol's total does not change.
     pub(crate) fn commit_settlement(
         &mut self,
         user_id: String,
@@ -292,8 +296,19 @@ impl Positions {
             }
             locked.insert(key, entry.locked);
         }
+        let mut totals: HashMap<String, u64> = HashMap::new();
+        for ((_, symbol), holding) in &holdings {
+            let total = totals.entry(symbol.clone()).or_default();
+            *total = total.checked_add(*holding).ok_or_else(|| {
+                format!("position snapshot holds more than u64::MAX shares of {symbol} in total")
+            })?;
+        }
 
-        Ok(Self { holdings, locked })
+        Ok(Self {
+            holdings,
+            locked,
+            totals,
+        })
     }
 }
 
@@ -384,5 +399,26 @@ mod tests {
             Err(PositionError::Overflow)
         );
         assert_eq!(positions.holding("whale", "AAPL"), u64::MAX);
+    }
+
+    #[test]
+    fn a_deposit_is_refused_once_the_symbols_total_would_pass_u64_max() {
+        let mut positions = Positions::new();
+        positions.credit("whale", "AAPL", u64::MAX - 1).unwrap();
+        positions.credit("minnow", "AAPL", 1).unwrap();
+
+        // Nobody may add a share of AAPL now, though the minnow's own holding is tiny.
+        assert_eq!(
+            positions.credit("minnow", "AAPL", 1),
+            Err(PositionError::Overflow)
+        );
+        // Each symbol has its own total.
+        positions.credit("minnow", "MSFT", u64::MAX).unwrap();
+        let snapshot = positions.snapshot();
+        assert!(Positions::from_snapshot(snapshot.clone()).is_ok());
+
+        let mut beyond = snapshot;
+        beyond.entries[0].holding += 1;
+        assert!(Positions::from_snapshot(beyond).is_err());
     }
 }

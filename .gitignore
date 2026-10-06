@@ -1,5 +1,6 @@
 /target
 AGENTS.md
+TESTING_NOTES.md
 *.md
 !DEFERRED_ITEMS.md
 exchange-events.log
@@ -15,3 +16,4 @@ exchange-events.log
 !docs/tasks/15-snapshots-by-the-warm-replica.md
 !docs/tasks/16-subscribers-keep-up.md
 !docs/tasks/17-trading-day.md
+!docs/tasks/18-one-order-cannot-stop-the-exchange.md
