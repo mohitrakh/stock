@@ -12,21 +12,24 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use super::{core::CoreSnapshot, event_store::crc32};
+use super::{
+    core::CoreSnapshot,
+    event_store::{JOURNAL_HEADER_LEN, crc32, journal_id_of},
+};
 
 const MAGIC: &[u8; 8] = b"EXCHSNP1";
-/// 4: an open clears the previous day's finished orders and fills (milestone 22, part 3), so a
-/// client order id can return on a later day. An older snapshot could hold orders that replay
-/// would have cleared; it is refused, and startup falls back to replaying the journal.
-const VERSION: u32 = 4;
+/// 5: a snapshot names its journal by the journal's id rather than its file's device and inode
+/// (milestone 23, part 2), so it stays valid on a byte-identical copy of the journal. An older
+/// snapshot is refused, and startup falls back to replaying the journal.
+const VERSION: u32 = 5;
 const HEADER_LEN: usize = 20; // magic + payload length + CRC-32
 const MAX_PAYLOAD_LEN: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SnapshotBoundary {
-    pub(crate) journal_device: u64,
-    pub(crate) journal_inode: u64,
+    pub(crate) journal_id: Uuid,
     /// The first byte of the next complete command record in the durable journal.
     pub(crate) byte_offset: u64,
     /// The first envelope sequence that is not represented by `core`.
@@ -103,20 +106,29 @@ pub(crate) fn load(
     if crc32(payload_bytes) != expected_crc {
         return Err(invalid("snapshot checksum mismatch"));
     }
-    let payload: SnapshotPayload = serde_json::from_slice(payload_bytes)
-        .map_err(|error| format!("snapshot contains invalid JSON: {error}"))?;
-    if payload.version != VERSION {
+    // The version first, so an older snapshot is refused for its version rather than for
+    // whichever of its fields no longer parses.
+    #[derive(Deserialize)]
+    struct Version {
+        version: u32,
+    }
+    let version = serde_json::from_slice::<Version>(payload_bytes)
+        .map_err(|error| format!("snapshot contains invalid JSON: {error}"))?
+        .version;
+    if version != VERSION {
         return Err(format!(
-            "snapshot format version {} is not supported",
-            payload.version
+            "snapshot format version {version} is not supported"
         ));
     }
-    if payload.boundary.journal_device != journal_meta.dev()
-        || payload.boundary.journal_inode != journal_meta.ino()
-    {
+    let payload: SnapshotPayload = serde_json::from_slice(payload_bytes)
+        .map_err(|error| format!("snapshot contains invalid JSON: {error}"))?;
+    let journal_id = File::open(journal_path)
+        .and_then(|journal| journal_id_of(&journal))
+        .map_err(|error| format!("could not read the journal id for snapshot: {error}"))?;
+    if payload.boundary.journal_id != journal_id {
         return Err(invalid("snapshot belongs to a different journal"));
     }
-    if payload.boundary.byte_offset < 8
+    if payload.boundary.byte_offset < JOURNAL_HEADER_LEN as u64
         || payload.boundary.byte_offset > journal_meta.len()
         || payload.boundary.next_event_sequence == 0
     {
@@ -155,9 +167,10 @@ fn write_inner(
     let journal_meta = journal
         .metadata()
         .map_err(|error| format!("could not inspect journal for snapshot: {error}"))?;
-    if boundary.journal_device != journal_meta.dev()
-        || boundary.journal_inode != journal_meta.ino()
-        || boundary.byte_offset < 8
+    let journal_id = journal_id_of(journal)
+        .map_err(|error| format!("could not read the journal id for snapshot: {error}"))?;
+    if boundary.journal_id != journal_id
+        || boundary.byte_offset < JOURNAL_HEADER_LEN as u64
         || boundary.byte_offset > journal_meta.len()
         || boundary.next_event_sequence == 0
     {
@@ -254,11 +267,9 @@ mod tests {
     }
 
     fn boundary(store: &EventStore) -> SnapshotBoundary {
-        let meta = store.file().metadata().unwrap();
         SnapshotBoundary {
-            journal_device: meta.dev(),
-            journal_inode: meta.ino(),
-            byte_offset: meta.len(),
+            journal_id: store.journal_id(),
+            byte_offset: store.file().metadata().unwrap().len(),
             next_event_sequence: 1,
         }
     }
@@ -304,7 +315,27 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_is_bound_to_its_exact_journal_identity() {
+    fn an_older_snapshot_is_refused_for_its_version() {
+        let (dir, journal, _stream, snapshot) = paths("old-version");
+        let (store, _) = EventStore::open(&journal).unwrap();
+        // A version 4 snapshot named its journal by device and inode.
+        let payload = br#"{"version":4,"boundary":{"journal_device":1,"journal_inode":2,"byte_offset":8,"next_event_sequence":1},"core":{}}"#;
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&crc32(payload).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        fs::write(&snapshot, bytes).unwrap();
+
+        assert_eq!(
+            load(&snapshot, &journal).unwrap_err(),
+            "snapshot format version 4 is not supported"
+        );
+        drop(store);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn snapshot_is_bound_to_its_journal_id_which_a_copy_keeps() {
         let (dir, journal, stream, snapshot) = paths("journal-identity");
         fs::write(&stream, b"stream").unwrap();
         let (store, _) = EventStore::open(&journal).unwrap();
@@ -320,6 +351,14 @@ mod tests {
         let other_journal = dir.join("other.log");
         let (other_store, _) = EventStore::open(&other_journal).unwrap();
         assert!(load(&snapshot, &other_journal).is_err());
+
+        // A byte-identical copy of the journal, as on another machine, is the same journal.
+        let copy = dir.join("copy.log");
+        fs::copy(&journal, &copy).unwrap();
+        assert_eq!(
+            load(&snapshot, &copy).unwrap().unwrap().boundary,
+            boundary(&store)
+        );
 
         drop(other_store);
         drop(store);

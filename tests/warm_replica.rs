@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    os::unix::{fs::MetadataExt, process::ExitStatusExt},
+    os::unix::process::ExitStatusExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -50,7 +50,9 @@ impl Fixture {
                 }}
             }
         ]));
-        let mut journal = b"EXCHLOG1".to_vec();
+        // The journal header is the magic and a 16-byte journal id; the stream names the same id.
+        let mut journal = b"EXCHLOG2".to_vec();
+        journal.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
         journal.extend_from_slice(&record);
         fs::write(&self.journal, &journal).unwrap();
         create_stream(
@@ -58,7 +60,7 @@ impl Fixture {
             &self.stream,
             journal.len() as u64,
             2,
-            8,
+            24,
             &record,
         );
     }
@@ -150,11 +152,9 @@ fn create_stream(
     cache_start: u64,
     cache: &[u8],
 ) {
-    let meta = fs::metadata(journal).unwrap();
-    let mut header = b"EXCHBUS1".to_vec();
+    let mut header = b"EXCHBUS2".to_vec();
+    header.extend_from_slice(&fs::read(journal).unwrap()[8..24]);
     for value in [
-        meta.dev(),
-        meta.ino(),
         CAPACITY as u64,
         end,
         last_sequence,

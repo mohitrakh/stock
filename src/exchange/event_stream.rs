@@ -12,11 +12,16 @@ use std::{
 
 use memmap2::{MmapOptions, MmapRaw};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-use super::event_store::{FILE_MAGIC, MAX_RECORD_LEN, RECORD_HEADER_LEN, crc32};
+use super::event_store::{
+    JOURNAL_HEADER_LEN, MAX_RECORD_LEN, RECORD_HEADER_LEN, crc32, journal_id_of,
+};
 use crate::types::exchange_event::{EventEnvelope, ExchangeEvent};
 
-const MAGIC: &[u8; 8] = b"EXCHBUS1";
+/// Bytes 8..24 of the header hold the journal id; until milestone 23 they held the journal file's
+/// device and inode, which a copy on another machine does not share.
+const MAGIC: &[u8; 8] = b"EXCHBUS2";
 const HEADER: usize = 80;
 const READY: u64 = 1;
 pub const DEFAULT_CAPACITY: usize = 4 * 1024 * 1024;
@@ -30,22 +35,25 @@ fn word(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
+fn journal_id_at(bytes: &[u8]) -> Uuid {
+    Uuid::from_bytes(bytes[8..24].try_into().unwrap())
+}
+
 /// A consumer should save this together with its own processed state. Merely returning a batch
 /// cannot guarantee exactly-once external side effects across a consumer crash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReaderCheckpoint {
-    device: u64,
-    inode: u64,
+    journal_id: Uuid,
     pub next_sequence: u64,
     byte_offset: u64,
 }
 
 impl ReaderCheckpoint {
-    /// The device and inode of the journal this checkpoint was taken against. A warm promotion
-    /// passes them to `EventStore::open_existing_matching`, which compares them the moment it
-    /// holds the writer lock — before it reads or repairs anything in the file.
-    pub(crate) fn journal_identity(&self) -> (u64, u64) {
-        (self.device, self.inode)
+    /// The id of the journal this checkpoint was taken against. A warm promotion passes it to
+    /// `EventStore::open_existing_matching`, which compares it the moment it holds the writer
+    /// lock — before it reads or repairs anything in the file.
+    pub(crate) fn journal_id(&self) -> Uuid {
+        self.journal_id
     }
 
     /// The journal byte where the next unread command record starts.
@@ -118,7 +126,10 @@ impl Mapping {
         let end = word(&header, 32);
         let start = word(&header, 48);
         let len = word(&header, 56);
-        if len > self.capacity as u64 || start < 8 || start.checked_add(len) != Some(end) {
+        if len > self.capacity as u64
+            || start < JOURNAL_HEADER_LEN as u64
+            || start.checked_add(len) != Some(end)
+        {
             return Err(invalid("invalid stream window bounds"));
         }
         let cache = if let Some(offset) =
@@ -137,8 +148,7 @@ impl Mapping {
             Vec::new()
         };
         Ok(Snapshot {
-            device: word(&header, 8),
-            inode: word(&header, 16),
+            journal_id: journal_id_at(&header),
             end,
             last_sequence: word(&header, 40),
             cache,
@@ -147,8 +157,7 @@ impl Mapping {
 }
 
 struct Snapshot {
-    device: u64,
-    inode: u64,
+    journal_id: Uuid,
     end: u64,
     last_sequence: u64,
     cache: Vec<u8>,
@@ -156,8 +165,7 @@ struct Snapshot {
 
 pub struct StreamWriter {
     mapping: Mapping,
-    device: u64,
-    inode: u64,
+    journal_id: Uuid,
     end: u64,
     last_sequence: u64,
     cache: Vec<u8>,
@@ -178,6 +186,7 @@ impl StreamWriter {
             return Err(invalid("stream capacity must be between 1 byte and 64 MiB"));
         }
         let metadata = journal.metadata()?;
+        let journal_id = journal_id_of(journal)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -205,25 +214,36 @@ impl StreamWriter {
         let map = MmapOptions::new().map_raw(&file)?;
         if new {
             let mut prefix = MAGIC.to_vec();
-            for value in [metadata.dev(), metadata.ino(), capacity as u64] {
-                prefix.extend_from_slice(&value.to_le_bytes());
-            }
+            prefix.extend_from_slice(journal_id.as_bytes());
+            prefix.extend_from_slice(&(capacity as u64).to_le_bytes());
             // SAFETY: exclusive lock; the new file has fixed size; destination is disjoint.
             unsafe {
                 std::ptr::copy_nonoverlapping(prefix.as_ptr(), map.as_mut_ptr(), prefix.len());
             }
         } else {
-            let mut prefix = [0; 32];
+            let mut header = [0; 68];
             // SAFETY: exclusive file lock, fixed-size mapping, local nonoverlapping destination.
             unsafe {
-                std::ptr::copy_nonoverlapping(map.as_ptr(), prefix.as_mut_ptr(), prefix.len());
+                std::ptr::copy_nonoverlapping(map.as_ptr(), header.as_mut_ptr(), header.len());
             }
-            if &prefix[..8] != MAGIC
-                || word(&prefix, 8) != metadata.dev()
-                || word(&prefix, 16) != metadata.ino()
-                || word(&prefix, 24) != capacity as u64
+            if &header[..8] != MAGIC
+                || journal_id_at(&header) != journal_id
+                || word(&header, 24) != capacity as u64
             {
                 return Err(invalid("stream belongs to a different journal or format"));
+            }
+            // A record is published only after its sync, so what this stream published can never
+            // be ahead of the recovered journal. If it is, the journal lost committed history:
+            // an older copy of it, with the same id, was put in its place, or the disk lost
+            // writes it had reported synced. Trading on it would lose acknowledged commands and
+            // reuse offsets that readers already consumed. A torn header (bad checksum) proves
+            // nothing either way.
+            if crc32(&header[..64]) == u32::from_le_bytes(header[64..68].try_into().unwrap())
+                && (word(&header, 32) > metadata.len() || word(&header, 40) > last_sequence)
+            {
+                return Err(invalid(
+                    "the journal ends before what its stream already published: acknowledged commands are missing (an older copy of the journal, or a disk that lost synced writes)",
+                ));
             }
         }
         drop(unlock);
@@ -233,8 +253,7 @@ impl StreamWriter {
                 map,
                 capacity,
             },
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            journal_id,
             end: metadata.len(),
             last_sequence,
             cache: Vec::new(),
@@ -274,9 +293,8 @@ impl StreamWriter {
         }
         let mut header = Vec::with_capacity(68);
         header.extend_from_slice(MAGIC);
+        header.extend_from_slice(self.journal_id.as_bytes());
         for value in [
-            self.device,
-            self.inode,
             self.mapping.capacity as u64,
             self.end,
             self.last_sequence,
@@ -318,14 +336,12 @@ pub struct StreamReader {
 
 impl StreamReader {
     pub fn checkpoint_from_parts(
-        device: u64,
-        inode: u64,
+        journal_id: Uuid,
         next_sequence: u64,
         byte_offset: u64,
     ) -> ReaderCheckpoint {
         ReaderCheckpoint {
-            device,
-            inode,
+            journal_id,
             next_sequence,
             byte_offset,
         }
@@ -337,12 +353,7 @@ impl StreamReader {
         checkpoint: Option<ReaderCheckpoint>,
     ) -> io::Result<Self> {
         let mut journal = File::open(journal_path)?;
-        let meta = journal.metadata()?;
-        let mut magic = [0; 8];
-        journal.read_exact(&mut magic)?;
-        if &magic != FILE_MAGIC {
-            return Err(invalid("invalid journal magic"));
-        }
+        let journal_id = journal_id_of(&journal)?;
         let file = File::open(stream_path)?;
         let size = file.metadata()?.len();
         if size <= HEADER as u64 || size > (HEADER + MAX_CAPACITY) as u64 {
@@ -355,41 +366,30 @@ impl StreamReader {
             capacity: size as usize - HEADER,
         };
         let snapshot = mapping.snapshot(None)?;
-        if snapshot.device != meta.dev() || snapshot.inode != meta.ino() {
+        if snapshot.journal_id != journal_id {
             return Err(invalid("stream and journal identities differ"));
         }
         let cursor = checkpoint.unwrap_or(ReaderCheckpoint {
-            device: meta.dev(),
-            inode: meta.ino(),
+            journal_id,
             next_sequence: 1,
-            byte_offset: 8,
+            byte_offset: JOURNAL_HEADER_LEN as u64,
         });
-        if cursor.device != meta.dev()
-            || cursor.inode != meta.ino()
-            || cursor.byte_offset < 8
+        if cursor.journal_id != journal_id
+            || cursor.byte_offset < JOURNAL_HEADER_LEN as u64
             || cursor.next_sequence == 0
         {
             return Err(invalid(
                 "checkpoint belongs to a different journal or is invalid",
             ));
         }
-        // Validate an externally supplied checkpoint against actual record boundaries. Restart
-        // is O(history); snapshots/indexed seeking are deliberately outside this milestone.
-        let mut offset = 8;
-        let mut next = 1;
-        while offset < cursor.byte_offset {
-            let bytes = read_record(&mut journal, offset, snapshot.end)?;
-            let batch = decode_batch(&bytes, next)?;
-            next = batch
-                .last()
-                .unwrap()
-                .seq_num
-                .checked_add(1)
-                .ok_or_else(|| invalid("sequence overflow"))?;
-            offset += bytes.len() as u64;
-        }
-        if offset != cursor.byte_offset || next != cursor.next_sequence {
-            return Err(invalid("checkpoint is not at a complete command boundary"));
+        // A checkpoint is checked where it points, never by re-reading the history before it, so
+        // a restart costs the same however long the journal is: the record there must be complete
+        // and begin with the checkpoint's next sequence. A checkpoint at the committed end is
+        // checked against the published last sequence by `validate_snapshot`.
+        if cursor.byte_offset < snapshot.end {
+            read_record(&mut journal, cursor.byte_offset, snapshot.end)
+                .and_then(|bytes| decode_batch(&bytes, cursor.next_sequence))
+                .map_err(|_| invalid("checkpoint is not at a complete command boundary"))?;
         }
         let reader = Self {
             mapping,
@@ -416,8 +416,7 @@ impl StreamReader {
     }
 
     fn validate_snapshot(&self, snapshot: &Snapshot) -> io::Result<()> {
-        if snapshot.device != self.cursor.device
-            || snapshot.inode != self.cursor.inode
+        if snapshot.journal_id != self.cursor.journal_id
             || snapshot.end < self.last_watermark
             || snapshot.end < self.cursor.byte_offset
             || self.journal.metadata()?.len() < snapshot.end
@@ -695,10 +694,58 @@ pub(super) mod tests {
             .write(true)
             .open(&fixture.log)
             .unwrap()
-            .write_all_at(&[0xff], 20)
+            .write_all_at(&[0xff], JOURNAL_HEADER_LEN as u64 + 12)
             .unwrap();
         assert!(reader.next_batch().is_err());
         assert_eq!(reader.checkpoint().next_sequence, 1);
+    }
+
+    /// A checkpoint is checked where it points: a restart reads the record there, never the
+    /// history before it, so it costs the same however long the journal is. Damage earlier in
+    /// the journal is therefore invisible to it, while a reader starting from the beginning is
+    /// refused at that damage.
+    #[test]
+    fn a_checkpoint_is_checked_where_it_points_without_rereading_history() {
+        let fixture = Fixture::new();
+        // A one-byte window caches nothing, so every batch is read from the journal.
+        let (mut store, mut writer) = fixture.start(1);
+        let mut reader = fixture.reader();
+        for seq in [1, 3, 5] {
+            append(&mut store, &mut writer, seq);
+        }
+        reader.next_batch().unwrap().unwrap();
+        reader.next_batch().unwrap().unwrap();
+        let checkpoint = reader.checkpoint();
+        use std::os::unix::fs::FileExt;
+        OpenOptions::new()
+            .write(true)
+            .open(&fixture.log)
+            .unwrap()
+            .write_all_at(&[0xff], JOURNAL_HEADER_LEN as u64 + 12)
+            .unwrap();
+
+        let mut resumed = StreamReader::open(&fixture.log, &fixture.bus, Some(checkpoint)).unwrap();
+        assert_eq!(resumed.next_batch().unwrap().unwrap(), batch(5));
+        assert!(StreamReader::open(&fixture.log, &fixture.bus, None).is_err());
+    }
+
+    /// The journal id travels with the bytes, so a checkpoint is valid on a byte-identical copy
+    /// of the journal at another path, as it will be on another machine.
+    #[test]
+    fn a_checkpoint_is_valid_on_a_copy_of_the_journal() {
+        let fixture = Fixture::new();
+        let (mut store, mut writer) = fixture.start(1);
+        let mut reader = fixture.reader();
+        append(&mut store, &mut writer, 1);
+        append(&mut store, &mut writer, 3);
+        reader.next_batch().unwrap().unwrap();
+        let copy = fixture.dir.join("copy.log");
+        std::fs::copy(&fixture.log, &copy).unwrap();
+
+        let mut on_copy =
+            StreamReader::open(&copy, &fixture.bus, Some(reader.checkpoint())).unwrap();
+        assert_eq!(on_copy.next_batch().unwrap().unwrap(), batch(3));
+        assert_eq!(on_copy.checkpoint().journal_id(), store.journal_id());
     }
 
     #[test]
@@ -707,10 +754,23 @@ pub(super) mod tests {
         let (mut store, mut writer) = fixture.start(4096);
         let mut reader = fixture.reader();
         append(&mut store, &mut writer, 1);
+        append(&mut store, &mut writer, 3);
         reader.next_batch().unwrap();
-        let good = reader.checkpoint();
+        // In the middle of the journal, the record at the checkpoint is what proves it.
+        let middle = reader.checkpoint();
+        assert_eq!(
+            StreamReader::open(&fixture.log, &fixture.bus, Some(middle.clone()))
+                .unwrap()
+                .next_batch()
+                .unwrap()
+                .unwrap(),
+            batch(3)
+        );
+        // At the committed end, the published last sequence is.
+        reader.next_batch().unwrap();
+        let end = reader.checkpoint();
         assert!(
-            StreamReader::open(&fixture.log, &fixture.bus, Some(good.clone()))
+            StreamReader::open(&fixture.log, &fixture.bus, Some(end.clone()))
                 .unwrap()
                 .next_batch()
                 .unwrap()
@@ -718,20 +778,28 @@ pub(super) mod tests {
         );
         for bad in [
             ReaderCheckpoint {
-                next_sequence: 2,
-                ..good.clone()
+                next_sequence: 4,
+                ..middle.clone()
             },
             ReaderCheckpoint {
-                byte_offset: good.byte_offset - 1,
-                ..good.clone()
+                byte_offset: middle.byte_offset - 1,
+                ..middle.clone()
             },
             ReaderCheckpoint {
-                inode: good.inode + 1,
-                ..good.clone()
+                byte_offset: middle.byte_offset + 1,
+                ..middle.clone()
             },
             ReaderCheckpoint {
-                byte_offset: good.byte_offset + 1,
-                ..good.clone()
+                journal_id: Uuid::new_v4(),
+                ..middle.clone()
+            },
+            ReaderCheckpoint {
+                next_sequence: 6,
+                ..end.clone()
+            },
+            ReaderCheckpoint {
+                byte_offset: end.byte_offset + 1,
+                ..end.clone()
             },
         ] {
             assert!(StreamReader::open(&fixture.log, &fixture.bus, Some(bad)).is_err());
@@ -744,13 +812,49 @@ pub(super) mod tests {
         let (store, _writer) = fixture.start(4096);
         assert!(EventStore::open(&fixture.log).is_err());
         assert!(StreamWriter::open(&fixture.log, store.file(), 0, 4096).is_err());
-        assert_eq!(std::fs::read(&fixture.log).unwrap(), FILE_MAGIC);
+        assert_eq!(
+            std::fs::read(&fixture.log).unwrap().len(),
+            JOURNAL_HEADER_LEN
+        );
         let other = Fixture::new();
         let (other_store, _) = EventStore::open(&other.log).unwrap();
         let before = std::fs::read(&fixture.bus).unwrap();
         assert!(StreamWriter::open(&fixture.bus, other_store.file(), 0, 4096).is_err());
         assert_eq!(std::fs::read(&fixture.bus).unwrap(), before);
         assert!(StreamReader::open(&other.log, &fixture.bus, None).is_err());
+    }
+
+    /// An older copy of the journal keeps its id, so only the stream's watermark can show that it
+    /// is behind: the writer refuses to start on it, and leaves the stream as it was. A journal
+    /// behind in length alone, or in last sequence alone, is refused too.
+    #[test]
+    fn a_journal_behind_what_its_stream_published_is_refused() {
+        let fixture = Fixture::new();
+        let (mut store, mut writer) = fixture.start(4096);
+        append(&mut store, &mut writer, 1);
+        let first_end = store.file().metadata().unwrap().len() as usize;
+        append(&mut store, &mut writer, 3);
+        drop(writer);
+        drop(store);
+        let journal = std::fs::read(&fixture.log).unwrap();
+        let stream_before = std::fs::read(&fixture.bus).unwrap();
+
+        // (journal, recovered last sequence): behind in length, in sequence, in both.
+        for (bytes, last_sequence) in [
+            (&journal[..first_end], 4),
+            (&journal[..], 2),
+            (&journal[..first_end], 2),
+        ] {
+            std::fs::write(&fixture.log, bytes).unwrap();
+            let (store, _) = EventStore::open(&fixture.log).unwrap();
+            assert!(StreamWriter::open(&fixture.bus, store.file(), last_sequence, 4096).is_err());
+            assert_eq!(std::fs::read(&fixture.bus).unwrap(), stream_before);
+        }
+
+        // The whole journal, with its real last sequence, still starts.
+        std::fs::write(&fixture.log, &journal).unwrap();
+        let (store, _) = EventStore::open(&fixture.log).unwrap();
+        assert!(StreamWriter::open(&fixture.bus, store.file(), 4, 4096).is_ok());
     }
 
     #[test]

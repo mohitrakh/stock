@@ -728,14 +728,7 @@ impl ExchangeRuntime {
             .metadata()
             .map_err(|error| format!("could not inspect journal for snapshot: {error}"))?;
         let boundary = SnapshotBoundary {
-            journal_device: {
-                use std::os::unix::fs::MetadataExt;
-                metadata.dev()
-            },
-            journal_inode: {
-                use std::os::unix::fs::MetadataExt;
-                metadata.ino()
-            },
+            journal_id: store.journal_id(),
             byte_offset: metadata.len(),
             next_event_sequence: self.next_event_seq,
         };
@@ -1258,8 +1251,12 @@ fn recover_snapshot_state(
     loaded: snapshot::LoadedSnapshot,
 ) -> Result<(EventStore, ExchangeCore, Vec<EventEnvelope>, u64), String> {
     let core = ExchangeCore::from_snapshot(loaded.core)?;
-    let (store, suffix) = EventStore::open_suffix(journal_path, loaded.boundary.byte_offset)
-        .map_err(|error| error.to_string())?;
+    let (store, suffix) = EventStore::open_suffix(
+        journal_path,
+        loaded.boundary.journal_id,
+        loaded.boundary.byte_offset,
+    )
+    .map_err(|error| error.to_string())?;
     let core = replay_event_log_from_core(core, loaded.boundary.next_event_sequence, &suffix)
         .map_err(|error| format!("snapshot suffix did not replay deterministically: {error:?}"))?;
     let next_event_seq = suffix

@@ -17,3 +17,4 @@ exchange-events.log
 !docs/tasks/16-subscribers-keep-up.md
 !docs/tasks/17-trading-day.md
 !docs/tasks/18-one-order-cannot-stop-the-exchange.md
+!docs/tasks/19-two-machines.md

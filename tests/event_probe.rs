@@ -1,6 +1,6 @@
 //! Exercise the shipped executable without PostgreSQL. The fixture is encoded independently
 //! using the documented journal/stream wire format, rather than the implementation's helpers.
-use std::{fs, os::unix::fs::MetadataExt, path::PathBuf, process::Command};
+use std::{fs, path::PathBuf, process::Command};
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -23,28 +23,23 @@ impl Fixture {
             {"seq_num":2,"event":{"direction":"output","event":{"kind":"funds_deposited","data":{"user_id":"buyer","amount":10}}}}
         ]);
         let payload = serde_json::to_vec(&events).unwrap();
-        let mut log = b"EXCHLOG1".to_vec();
+        // The journal header is the magic and a 16-byte journal id; the stream names the same id.
+        let journal_id = uuid::Uuid::new_v4();
+        let mut log = b"EXCHLOG2".to_vec();
+        log.extend_from_slice(journal_id.as_bytes());
         log.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         log.extend_from_slice(&crc(&payload).to_le_bytes());
         log.extend(payload);
         fs::write(self.0.join("events.log"), &log).unwrap();
-        let meta = fs::metadata(self.0.join("events.log")).unwrap();
-        let mut bus = b"EXCHBUS1".to_vec();
-        for value in [
-            meta.dev(),
-            meta.ino(),
-            4096,
-            log.len() as u64,
-            2,
-            8,
-            log.len() as u64 - 8,
-        ] {
+        let mut bus = b"EXCHBUS2".to_vec();
+        bus.extend_from_slice(journal_id.as_bytes());
+        for value in [4096, log.len() as u64, 2, 24, log.len() as u64 - 24] {
             bus.extend_from_slice(&value.to_le_bytes());
         }
         bus.extend_from_slice(&crc(&bus).to_le_bytes());
         bus.extend_from_slice(&[0; 4]);
         bus.extend_from_slice(&1u64.to_ne_bytes());
-        bus.extend_from_slice(&log[8..]);
+        bus.extend_from_slice(&log[24..]);
         bus.resize(80 + 4096, 0);
         fs::write(self.0.join("events.mmap"), bus).unwrap();
     }

@@ -433,8 +433,9 @@ Milestone 22, complete on 2026-10-05. The specification is in `PROJECT_DIRECTION
 Selected on 2026-10-05: milestone 23, Two Machines. The specification, with the owner's decisions, is in `PROJECT_DIRECTION.md` ("23. Two Machines"). Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` (Part 1), then `docs/tasks/19-two-machines.md`.
 
 - [x] Part 1 (2026-10-05): refuse an order that would trade against more than 10,000 resting orders (`TooManyFills`) and a deposit that would take the exchange's total cash or a symbol's total shares past `u64::MAX`, so no command can stop the worker; refuse to start without `JWT_SECRET`. Live: the milestone 22 binary halted on a 55,000-order sweep and on a fill crediting a `u64::MAX` balance; the new one refused both as ordinary rejections. Independent review done, findings fixed.
-- [ ] Part 2: a journal id in the header instead of device/inode; checkpoint checks that skip history; promotion from the warm replica's core; bounded warm-replica lag. Measure promotion and restart times before and after.
-- [ ] Part 3: replication over TCP; the primary replies and publishes only after the replica confirms; the pause and "run alone".
-- [ ] Part 4: epoch-fenced promotion on the second machine; the old primary rejoins as the replica; the reporter continues from its checkpoint.
-- [ ] Part 5: measurement and failure tests; `docs/performance/08-*.md`.
+- [x] Part 2 (2026-10-06): a journal id in the header (`EXCHLOG2`) instead of device/inode, used by the stream, checkpoints, snapshots (version 5), market-data state (version 3) and the reporter (fifth migration); checkpoint checks that read only the record at the checkpoint. Restart from a checkpoint on the five-day journal: market data 9,654 → 9 ms, warm replica 9,620 → 68 ms (`docs/performance/08-restarts-without-rereading-history.md`).
+- [ ] Part 3: promotion from the warm replica's core; a warm replica whose lag stays bounded (a snapshot rule by journal growth). Measure promotion time and lag before and after.
+- [ ] Part 4: replication over TCP; the primary replies and publishes only after the replica confirms; the pause and "run alone".
+- [ ] Part 5: epoch-fenced promotion on the second machine; the old primary rejoins as the replica; the reporter continues from its checkpoint.
+- [ ] Part 6: measurement and failure tests.
 - [ ] `PROJECT_DIRECTION.md` updated after every part; an independent review of each part; `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests.

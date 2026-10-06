@@ -5,10 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    os::unix::{
-        fs::{FileExt, MetadataExt},
-        process::ExitStatusExt,
-    },
+    os::unix::{fs::FileExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -37,7 +34,9 @@ impl Fixture {
     }
 
     fn initialize(&self, records: &[Vec<u8>], last_sequence: u64) {
-        let mut journal = b"EXCHLOG1".to_vec();
+        // The journal header is the magic and a 16-byte journal id; the stream names the same id.
+        let mut journal = b"EXCHLOG2".to_vec();
+        journal.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
         for record in records {
             journal.extend_from_slice(record);
         }
@@ -236,6 +235,11 @@ fn accepted_buy_with_trade(
     ]))
 }
 
+/// The 16-byte journal id in a journal's header.
+fn journal_id(journal: &Path) -> Vec<u8> {
+    fs::read(journal).unwrap()[8..24].to_vec()
+}
+
 fn create_stream(
     journal: &Path,
     stream: &Path,
@@ -244,10 +248,8 @@ fn create_stream(
     cache_start: u64,
     cache: &[u8],
 ) {
-    let meta = fs::metadata(journal).unwrap();
     let mut bytes = header(
-        meta.dev(),
-        meta.ino(),
+        &journal_id(journal),
         end,
         last_sequence,
         cache_start,
@@ -259,23 +261,15 @@ fn create_stream(
 }
 
 fn header(
-    device: u64,
-    inode: u64,
+    journal_id: &[u8],
     end: u64,
     last_sequence: u64,
     cache_start: u64,
     cache_len: u64,
 ) -> Vec<u8> {
-    let mut header = b"EXCHBUS1".to_vec();
-    for value in [
-        device,
-        inode,
-        CAPACITY as u64,
-        end,
-        last_sequence,
-        cache_start,
-        cache_len,
-    ] {
+    let mut header = b"EXCHBUS2".to_vec();
+    header.extend_from_slice(journal_id);
+    for value in [CAPACITY as u64, end, last_sequence, cache_start, cache_len] {
         header.extend_from_slice(&value.to_le_bytes());
     }
     header.extend_from_slice(&crc(&header).to_le_bytes());
@@ -292,7 +286,6 @@ fn publish_header_and_cache(
     cache_start: u64,
     cache: &[u8],
 ) {
-    let meta = fs::metadata(journal).unwrap();
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -304,8 +297,7 @@ fn publish_header_and_cache(
         file.write_all_at(cache, 80).unwrap();
     }
     let bytes = header(
-        meta.dev(),
-        meta.ino(),
+        &journal_id(journal),
         end,
         last_sequence,
         cache_start,

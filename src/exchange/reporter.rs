@@ -16,6 +16,7 @@ use std::{
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use chrono::NaiveDate;
 use sqlx::{PgPool, Postgres, Transaction, postgres::PgPoolOptions};
+use uuid::Uuid;
 
 use super::{
     committed_batch::{
@@ -73,17 +74,16 @@ async fn connect() -> ReporterResult<PgPool> {
 async fn load_checkpoint(
     pool: &PgPool,
 ) -> ReporterResult<Option<(ReaderCheckpoint, Option<NaiveDate>)>> {
-    let row: Option<(String, String, String, String, Option<NaiveDate>)> = sqlx::query_as(
-        "SELECT journal_device::text, journal_inode::text, next_sequence::text, byte_offset::text, \
-         trading_day FROM reporter_checkpoint WHERE singleton = $1",
+    let row: Option<(Uuid, String, String, Option<NaiveDate>)> = sqlx::query_as(
+        "SELECT journal_id, next_sequence::text, byte_offset::text, trading_day \
+         FROM reporter_checkpoint WHERE singleton = $1",
     )
     .bind(CHECKPOINT_ID)
     .fetch_optional(pool)
     .await?;
-    row.map(|(device, inode, next, offset, trading_day)| {
+    row.map(|(journal_id, next, offset, trading_day)| {
         let checkpoint = StreamReader::checkpoint_from_parts(
-            parse_number("journal device", device)?,
-            parse_number("journal inode", inode)?,
+            journal_id,
             parse_number("next sequence", next)?,
             parse_number("byte offset", offset)?,
         );
@@ -115,30 +115,18 @@ async fn save_checkpoint(
     checkpoint: &ReaderCheckpoint,
     trading_day: Option<NaiveDate>,
 ) -> ReporterResult<()> {
-    // The checkpoint is private to event_stream; serde is not an external database interface.
-    let encoded = serde_json::to_value(checkpoint)?;
-    let field = |name: &str| -> ReporterResult<u64> {
-        encoded
-            .get(name)
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| invalid(format!("missing {name} in reader checkpoint")).into())
-    };
-    let device = field("device")?;
-    let inode = field("inode")?;
-    let next_sequence = field("next_sequence")?;
-    let byte_offset = field("byte_offset")?;
-    // report_version 4 is the milestone 22 schema, which keys orders by trading day. The column has
-    // no default and accepts only the current version, so an older reporter cannot save a
+    // report_version 5 is the milestone 23 schema, which names the journal by its id. The column
+    // has no default and accepts only the current version, so an older reporter cannot save a
     // checkpoint into a migrated database.
     sqlx::query(
-        "INSERT INTO reporter_checkpoint (singleton, report_version, journal_device, journal_inode, next_sequence, byte_offset, trading_day) \
-         VALUES ($1, 4, $2::numeric, $3::numeric, $4::numeric, $5::numeric, $6) \
-         ON CONFLICT (singleton) DO UPDATE SET journal_device = EXCLUDED.journal_device, \
-         journal_inode = EXCLUDED.journal_inode, next_sequence = EXCLUDED.next_sequence, byte_offset = EXCLUDED.byte_offset, \
+        "INSERT INTO reporter_checkpoint (singleton, report_version, journal_id, next_sequence, byte_offset, trading_day) \
+         VALUES ($1, 5, $2, $3::numeric, $4::numeric, $5) \
+         ON CONFLICT (singleton) DO UPDATE SET journal_id = EXCLUDED.journal_id, \
+         next_sequence = EXCLUDED.next_sequence, byte_offset = EXCLUDED.byte_offset, \
          trading_day = EXCLUDED.trading_day",
-    ).bind(CHECKPOINT_ID).bind(number(device)).bind(number(inode))
-        .bind(number(next_sequence)).bind(number(byte_offset)).bind(trading_day)
-        .execute(&mut **tx).await?;
+    ).bind(CHECKPOINT_ID).bind(checkpoint.journal_id())
+        .bind(number(checkpoint.next_sequence)).bind(number(checkpoint.byte_offset()))
+        .bind(trading_day).execute(&mut **tx).await?;
     Ok(())
 }
 

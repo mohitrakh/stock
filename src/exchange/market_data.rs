@@ -34,7 +34,8 @@ use crate::types::{
     types::{Execution, L2Level, Order, OrderBookView, Side},
 };
 
-const STATE_VERSION: u32 = 2;
+/// 3: the saved checkpoint names its journal by the journal's id (milestone 23, part 2).
+const STATE_VERSION: u32 = 3;
 const DEFAULT_ADDR: &str = "127.0.0.1:4001";
 const DEFAULT_DEPTH: usize = 10;
 const MAX_DEPTH: usize = 50;
@@ -379,14 +380,19 @@ fn load_state(
 )> {
     match std::fs::read(path) {
         Ok(bytes) => {
-            let saved: ProjectionFile = serde_json::from_slice(&bytes)?;
-            if saved.version != STATE_VERSION {
-                return Err(invalid(format!(
-                    "unsupported market-data state version {}",
-                    saved.version
-                ))
-                .into());
+            // The version first, so an older file is refused for its version rather than for
+            // whichever of its fields no longer parses.
+            #[derive(Deserialize)]
+            struct Version {
+                version: u32,
             }
+            let version = serde_json::from_slice::<Version>(&bytes)?.version;
+            if version != STATE_VERSION {
+                return Err(
+                    invalid(format!("unsupported market-data state version {version}")).into(),
+                );
+            }
+            let saved: ProjectionFile = serde_json::from_slice(&bytes)?;
             let projection = MarketDataProjection::from_orders(saved.orders).map_err(invalid)?;
             let candles = CandleProjection::from_candles(saved.candles).map_err(invalid)?;
             Ok((projection, candles, Some(saved.checkpoint)))
@@ -1250,6 +1256,18 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("unsupported")
+        );
+
+        // A real version 2 file named its journal by device and inode. It is refused for its
+        // version, before its checkpoint fails to parse.
+        std::fs::write(
+            &state_path,
+            br#"{"version":2,"checkpoint":{"device":1,"inode":2,"next_sequence":1,"byte_offset":8},"orders":[],"candles":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_state(&state_path).unwrap_err().to_string(),
+            "unsupported market-data state version 2"
         );
     }
 

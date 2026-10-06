@@ -40,7 +40,7 @@ use tokio::sync::{oneshot, watch};
 
 use super::{
     core::ExchangeCore,
-    event_store::{EventStore, EventStoreError},
+    event_store::{EventStore, EventStoreError, journal_id_of},
     event_stream::{ReaderCheckpoint, StreamReader},
     runtime::{ReplayError, ReplicaCore},
     snapshot::{self, SnapshotBoundary},
@@ -118,8 +118,7 @@ impl WarmReplica {
             match snapshot::load(&snapshot_path, &journal_path) {
                 Ok(Some(loaded)) => {
                     let checkpoint = StreamReader::checkpoint_from_parts(
-                        loaded.boundary.journal_device,
-                        loaded.boundary.journal_inode,
+                        loaded.boundary.journal_id,
                         loaded.boundary.next_event_sequence,
                         loaded.boundary.byte_offset,
                     );
@@ -202,12 +201,12 @@ impl WarmReplica {
         }
         writer.commands_since = 0;
         let started = Instant::now();
-        let (journal_device, journal_inode) = self.applied_checkpoint.journal_identity();
-        use std::os::unix::fs::MetadataExt;
-        // If the journal at this path was moved aside and replaced, a snapshot of the old one
-        // would sit on top of the new journal's valid snapshot and be refused at every restart.
-        match std::fs::metadata(&self.journal_path) {
-            Ok(meta) if meta.dev() == journal_device && meta.ino() == journal_inode => {}
+        let journal_id = self.applied_checkpoint.journal_id();
+        // If the journal at this path was moved aside and replaced by another journal, a snapshot
+        // of the old one would sit on top of the new journal's valid snapshot and be refused at
+        // every restart.
+        match File::open(&self.journal_path).and_then(|journal| journal_id_of(&journal)) {
+            Ok(id) if id == journal_id => {}
             _ => {
                 eprintln!(
                     "not writing a snapshot: the journal path no longer names the journal this warm replica follows"
@@ -216,8 +215,7 @@ impl WarmReplica {
             }
         }
         let boundary = SnapshotBoundary {
-            journal_device,
-            journal_inode,
+            journal_id,
             byte_offset: self.applied_checkpoint.byte_offset(),
             next_event_sequence: self.applied_checkpoint.next_sequence,
         };
@@ -306,11 +304,14 @@ impl WarmReplica {
         // Fence, prove identity, then recover — strictly in that order. Recovery can repair a torn
         // tail, which truncates the file; if the path now names a different journal, that repair
         // would destroy history this follower never read. `open_existing_matching` refuses a
-        // mismatched file while holding the lock and before its first read, leaving it untouched.
-        let (device, inode) = checkpoint.journal_identity();
-        let (store, recovered) =
-            EventStore::open_existing_matching(&self.journal_path, device, inode)
-                .map_err(PromotionFailure::from_store)?;
+        // mismatched file while holding the lock and before it reads past the header, leaving it
+        // untouched.
+        let (store, recovered) = EventStore::open_existing_matching(
+            &self.journal_path,
+            checkpoint.journal_id(),
+            checkpoint.byte_offset(),
+        )
+        .map_err(PromotionFailure::from_store)?;
         // The lock is held and the full journal has been physically recovered. Drop the reader and
         // warm core: `ExchangeRuntime` will rebuild solely from `recovered` before it writes.
         self.reader.take();
@@ -582,17 +583,12 @@ pub async fn run(args: &[String], snapshot_every: u64) -> WarmResult<WarmPromoti
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::OpenOptions,
-        net::TcpListener,
-        os::unix::fs::{FileExt, MetadataExt},
-        time::Duration,
-    };
+    use std::{fs::OpenOptions, net::TcpListener, os::unix::fs::FileExt, time::Duration};
 
     use super::*;
     use crate::{
         exchange::{
-            event_store::{EventStore, EventStoreError, encode_record},
+            event_store::{EventStore, EventStoreError, JOURNAL_HEADER_LEN, encode_record},
             event_stream::{StreamReader, tests::Fixture},
             runtime::{
                 promote_replica_with_stream_and_snapshot, recover_runtime_with_stream,
@@ -864,15 +860,13 @@ mod tests {
             fixture.start(crate::exchange::event_stream::DEFAULT_CAPACITY);
         // The production path: a primary always leaves a startup snapshot, so the warm opens from
         // one. Write the empty exchange's snapshot at the journal's first record boundary.
-        let journal = std::fs::metadata(&fixture.log).unwrap();
         snapshot::write(
             &snapshot,
             store.file(),
             &fixture.bus,
             SnapshotBoundary {
-                journal_device: journal.dev(),
-                journal_inode: journal.ino(),
-                byte_offset: 8,
+                journal_id: store.journal_id(),
+                byte_offset: JOURNAL_HEADER_LEN as u64,
                 next_event_sequence: 1,
             },
             ExchangeCore::new().snapshot(),
@@ -979,9 +973,8 @@ mod tests {
             stream_path,
             snapshot_path,
         } = handoff.await.unwrap().unwrap();
-        let journal = std::fs::metadata(&fixture.log).unwrap();
         assert!(matches!(
-            EventStore::open_existing_matching(&fixture.log, journal.dev(), journal.ino()),
+            EventStore::open_existing_matching(&fixture.log, store.journal_id(), 0),
             Err(EventStoreError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
 
@@ -1244,7 +1237,7 @@ mod tests {
 
         // An operator moves the followed journal aside, and a different journal — torn in the
         // middle of its only record — appears at the same path. The follower still holds the
-        // original file open by inode, so only its checkpoint identity can tell the two apart.
+        // original file open, so only the journal id in its checkpoint can tell the two apart.
         std::fs::rename(&fixture.log, fixture.dir.join("events.moved")).unwrap();
         {
             let (mut replacement, _) = EventStore::open(&fixture.log).unwrap();
@@ -1284,6 +1277,35 @@ mod tests {
         // The refusal must come before any recovery read or torn-tail repair. A journal that is
         // not the one this follower read is left byte-for-byte as the operator left it.
         assert_eq!(std::fs::read(&fixture.log).unwrap(), replacement_before);
+    }
+
+    #[test]
+    fn promotion_refuses_an_older_copy_of_the_journal_it_followed() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.dir.join("events.snapshot");
+        let mut primary = runtime_for(&fixture);
+        let deposit = |amount| ExchangeInputEvent::FundsDepositRequested {
+            user_id: "buyer".into(),
+            amount,
+        };
+        primary.record_input_for_test(deposit(10)).unwrap();
+        let older = std::fs::read(&fixture.log).unwrap();
+        primary.record_input_for_test(deposit(20)).unwrap();
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
+        warm.catch_up().unwrap();
+        drop(primary);
+
+        // A copy taken after the first deposit is put back in place. It has the same id, so only
+        // the length this follower already applied shows that it lost the second deposit.
+        let backup = fixture.dir.join("events.backup");
+        std::fs::write(&backup, &older).unwrap();
+        std::fs::rename(&backup, &fixture.log).unwrap();
+
+        assert!(matches!(
+            warm.try_promote(),
+            Err(PromotionFailure::Fatal(message)) if message.contains("already applied")
+        ));
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), older);
     }
 
     #[test]

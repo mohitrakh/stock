@@ -74,7 +74,7 @@ same-host warm replica process
 
 `ExchangeRuntime` owns the command receiver, `EventStore`, and `StreamWriter`. It writes one journal-bound snapshot at startup and none while trading; the warm replica writes the periodic ones. It keeps no event history in production; the complete history is the journal, and an in-memory copy exists only in test builds. Group commit commits each command in memory before its group's sync, so after a failed sync the live core is ahead of the disk: the worker halts, that core is never used again, and recovery from the journal is the only way back. `ExchangeCore` owns the deterministic trading components; it never touches the files. All core operations still run on one exchange-worker thread. `ReplicaCore` is a separate read-only follower core: it has no writer, queue, callbacks, database, or customer routes. Readers and the warm follower are separate consumers, not additional owners of exchange state.
 
-`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. `ReplicaCore` uses the same complete-batch comparison before it advances its applied checkpoint. Production startup calls `recover_runtime_with_stream_and_snapshot` before binding the listener. A valid versioned, checksummed snapshot is tied to the journal device/inode and a complete-batch byte boundary; it restores the core and replays only the later suffix. A missing, corrupt, inconsistent, or journal-mismatched snapshot is preserved and falls back to full replay. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`; `EVENT_SNAPSHOT_PATH` defaults to that path plus `.snapshot`; and `EVENT_SNAPSHOT_INTERVAL` (the warm replica's snapshot interval) defaults to 10,000 commands. The journal is authoritative; the mmap file is a disposable delivery cache and the snapshot is only a recovery checkpoint. Warm promotion takes the writer lock with `EventStore::open_existing_matching`, which proves the locked file is the journal the warm followed before reading or repairing it, then fully replays the recovered journal rather than promoting mmap-derived state.
+`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. `ReplicaCore` uses the same complete-batch comparison before it advances its applied checkpoint. Production startup calls `recover_runtime_with_stream_and_snapshot` before binding the listener. A valid versioned, checksummed snapshot is tied to the journal's id and a complete-batch byte boundary; it restores the core and replays only the later suffix. A missing, corrupt, inconsistent, or journal-mismatched snapshot is preserved and falls back to full replay. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`; `EVENT_SNAPSHOT_PATH` defaults to that path plus `.snapshot`; and `EVENT_SNAPSHOT_INTERVAL` (the warm replica's snapshot interval) defaults to 10,000 commands. The journal is authoritative; the mmap file is a disposable delivery cache and the snapshot is only a recovery checkpoint. Warm promotion takes the writer lock with `EventStore::open_existing_matching`, which proves the locked file is the journal the warm followed before reading or repairing it, then fully replays the recovered journal rather than promoting mmap-derived state.
 
 Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
 
@@ -83,7 +83,7 @@ Latest verified status on 2026-10-05, on Linux (the office Ubuntu machine; the c
 ```text
 cargo fmt -- --check
 cargo test --locked
-164 unit tests + the executable integration tests passed; 0 failed
+172 unit tests + the executable integration tests passed; 0 failed
 3 opt-in Reporter acceptance tests ignored by default (need REPORTER_TEST_DATABASE_URL);
   all passed against PostgreSQL 16 when run with it
 ```
@@ -693,7 +693,7 @@ Both independent reviews' findings were fixed (parts 2 and 3).
 
 ## 23. Two Machines
 
-**Status: selected on 2026-10-05; Part 1 complete on 2026-10-05.** Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` for Part 1, then `docs/tasks/19-two-machines.md`. Decisions confirmed by the owner:
+**Status: selected on 2026-10-05; Part 1 complete on 2026-10-05; Part 2 complete on 2026-10-06.** Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` for Part 1, then `docs/tasks/19-two-machines.md`. Part 2 as first specified was split in two on 2026-10-06, as recommended: the journal id and restarts in Part 2, promotion and the warm replica's lag in Part 3. Decisions confirmed by the owner:
 - the primary waits for the replica: a command is answered, and becomes visible to anyone, only once it is on both machines' disks;
 - if the replica cannot be reached, the primary pauses until an operator either promotes the replica or tells the primary to run alone;
 - the machines talk over TCP;
@@ -715,29 +715,30 @@ Survive the loss of a machine without losing an acknowledged command, and resume
    - A deposit is refused if it would take the exchange's total cash, or a symbol's total shares, past `u64::MAX`. Fills only move cash and shares between users, so no fill can then overflow a balance or a holding. Before, one deposit of `u64::MAX` and a one-share trade halted the worker the same way. The independent review of Part 1 found this.
    - The exchange and the warm replica refuse to start without `JWT_SECRET`. Before, the token check fell back to the key `"secret"` when it was unset.
 2. **The journal names itself (Part 2).** A new journal starts with a random journal id in its header. Snapshots, reader checkpoints, the stream header, the MDP state and the reporter checkpoint bind to that id instead of the device and inode, so a byte-identical copy on another machine is the same journal.
-3. **Restarts cost the day, not history (Part 2).**
-   - A reader checks its checkpoint by reading the record there, not every record before it.
-   - Promotion reuses the warm replica's core, which it built from the journal and checked output by output, and replays only the records after it. Nothing on the promotion path grows with history.
-   - The warm replica's lag stays bounded at the exchange's full rate. Today it grows through the day because of its snapshots, and a promotion would have to replay that backlog first.
-4. **Every acknowledged command is on both machines (Part 3).**
+3. **Restarts cost the day, not history.**
+   - A reader checks its checkpoint by reading the record there, not every record before it (Part 2).
+   - Promotion reuses the warm replica's core, which it built from the journal and checked output by output, and replays only the records after it. Nothing on the promotion path grows with history (Part 3).
+   - The warm replica's lag stays bounded at the exchange's full rate (Part 3). Today it grows through the day because of its snapshots, and a promotion would have to replay that backlog first.
+4. **Every acknowledged command is on both machines (Part 4).**
    - The primary sends each group's records to the replica over TCP while it syncs its own journal.
    - The replica checks them, appends exactly those bytes to its own journal, syncs, and confirms.
    - The primary publishes, runs callbacks and replies only once both syncs are done. Nothing that exists on one machine only is ever visible to a client or a subscriber.
    - A replica that starts behind first catches up from the primary's journal.
-5. **Pause, never guess (Part 3).** If the replica stops confirming, the primary stops committing: commands wait in its queue and nothing is acknowledged. The operator port shows the pause and offers "run alone": the primary continues without a replica, and the recovery point of zero no longer holds until a replica has caught up again. The operator must never both promote the replica and tell the primary to run alone.
-6. **Fenced promotion on the second machine (Part 4).**
+5. **Pause, never guess (Part 4).** If the replica stops confirming, the primary stops committing: commands wait in its queue and nothing is acknowledged. The operator port shows the pause and offers "run alone": the primary continues without a replica, and the recovery point of zero no longer holds until a replica has caught up again. The operator must never both promote the replica and tell the primary to run alone.
+6. **Fenced promotion on the second machine (Part 5).**
    - Promotion is manual.
    - Each primary term has an epoch number, journaled at its start. The promoted replica raises the epoch and refuses the old primary. The old primary can no longer get a confirmation, so it can no longer acknowledge anything.
    - When the old machine returns, it rejoins as the replica. It drops the end of its journal that was never confirmed, and so was never acknowledged or published, then follows the new primary.
-7. **Subscribers continue (Part 4).** The reporter, whose checkpoint is in PostgreSQL, resumes against the new primary's journal without a rebuild, because it is the same journal. The MDP starts on the new primary's machine like any MDP: from its state file when one is there, otherwise from the journal.
+7. **Subscribers continue (Part 5).** The reporter, whose checkpoint is in PostgreSQL, resumes against the new primary's journal without a rebuild, because it is the same journal. The MDP starts on the new primary's machine like any MDP: from its state file when one is there, otherwise from the journal.
 
 ### Parts
 
 1. No command can stop the exchange: the fill cap and the deposit totals; `JWT_SECRET` required at startup.
-2. On one machine: the journal id, checkpoint checks that skip history, promotion from the warm replica's core, and a warm replica whose lag stays bounded. Measure promotion and restart times before and after on a multi-day journal.
-3. Replication over TCP with the primary waiting for the replica; the pause and "run alone".
-4. Epoch-fenced promotion on the second machine; the old primary rejoining as the replica; subscribers continuing.
-5. Measurement and failure tests:
+2. On one machine: the journal id, and checkpoint checks that skip history. Measure restart times before and after on a multi-day journal.
+3. On one machine: promotion from the warm replica's core, and a warm replica whose lag stays bounded. Measure promotion time and the warm replica's lag before and after.
+4. Replication over TCP with the primary waiting for the replica; the pause and "run alone".
+5. Epoch-fenced promotion on the second machine; the old primary rejoining as the replica; subscribers continuing.
+6. Measurement and failure tests:
    - throughput and p99 with and without replication;
    - killing the primary under load loses no acknowledged command;
    - recovery time, from the promote request to the first accepted order;
@@ -796,6 +797,39 @@ The independent review's other findings were fixed:
 
 Its re-check of the fixes confirmed the conservation argument and the two-step planner. It found that the first version of the deposit check scanned every holding of every symbol on each share deposit, which any client could make slow; the totals are now running sums. It also found the deposit limit that one client can use up, recorded above as not fixed.
 
+**Part 2, complete (2026-10-06): a journal that names itself.** Write-up: `docs/tasks/19-two-machines.md`; measurement: `docs/performance/08-restarts-without-rereading-history.md`.
+- **The journal id.** A new journal's header is `EXCHLOG2` plus 16 random bytes, chosen once. These name the journal by that id instead of its file's device and inode:
+  - the stream header (`EXCHBUS2`);
+  - reader checkpoints, and with them the market-data state (version 3) and the probe's checkpoint;
+  - snapshot boundaries (version 5);
+  - the reporter's checkpoint row (migration `20261006000000_reporter_journal_id.sql`, `report_version` 5);
+  - the promotion fence and suffix recovery, which compare the id under the writer lock before reading on.
+
+  A byte-identical copy at another path is the same journal; an `EXCHLOG1` journal is refused with its reason.
+- **Checkpoints checked where they point.** A reader no longer re-reads the journal from its start: the record at the checkpoint must be complete, pass its checksum and begin with the expected sequence, or the checkpoint must sit at the committed end.
+- **An older copy of the journal is refused.** The id cannot tell an older copy of the same journal from the journal itself. So the primary refuses to start when its stream already published more than the recovered journal holds, and promotion refuses a journal whose complete records end before what the warm replica applied. The independent review found this gap; device and inode used to refuse a file renamed into place.
+- **Compatibility.** Start a new journal. Remove the old stream, snapshot, market-data state and probe checkpoint files, and apply the fifth reporter migration, which empties the report for a rebuild.
+
+Verified on Linux: `cargo fmt -- --check`, and `cargo test --locked` with 172 unit tests plus the integration tests, and all three PostgreSQL acceptance tests. Measured on the same five-day workload (788 MB, 1,000,000 orders):
+- a market-data restart from its checkpoint went from 9,654 ms to 9 ms;
+- a warm replica starting from a 667 KB snapshot went from 9,620 ms to 68 ms;
+- full builds and promotion (18.9 s) are unchanged, and promotion is Part 3.
+
+The same files copied to another directory started as the same journal: the warm replica in 67 ms, market data in 9 ms. The milestone 22 binary refused its own copied files and did not start.
+
+A first-day copy of a two-day journal, put back in place, was refused. Renamed into place, it was refused by promotion ("shorter than the 930 bytes already applied from it"); copied over the followed file, it made the running warm replica stop following ("committed history regressed"). Either way the primary refused to start ("the journal ends before what its stream already published").
+
+Re-checking the fixes, the reviewer confirmed that the new stream check refuses no legitimate restart and that no test still passes vacuously. Its smaller findings, all fixed:
+- promotion now compares the length of the complete records, not the raw file, so an older copy with a torn tail reaching past what was applied is refused too, before anything is cut;
+- the stream refusal also names a disk that lost synced writes, and the operator notes say what starting anyway means;
+- the known limitation now includes a restored journal without a stream file;
+- a new test proves promotion passes the applied length, and the stream test checks each of its two conditions alone.
+
+The independent review found the older-copy gap above, and a reporter acceptance test that had stopped testing anything, because a rewritten journal got a new id. Both are fixed; that test and the other two that expect the reporter to stop now check its error output for the reason. Its smaller findings were fixed too:
+- an old snapshot is refused for its version;
+- new tests cover mid-journal checkpoints and a real version 2 market-data state;
+- the docs no longer claim the normal restart re-reads the older journal.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -820,21 +854,22 @@ Its re-check of the fixes confirmed the conservation argument and the two-step p
 - the warm replica's snapshot writes share the host's disk with the journal's syncs
 - after a failed journal sync the in-memory core is ahead of the disk; it is never used again, the worker halts, and the process must be restarted to recover from the journal
 - a `client_order_id` is unique within its trading day, including after its order finished; earlier days' orders are only in the reporter's tables, and there is no reporting API to read them
-- snapshots rely on the journal file identity and committed boundary; an invalid snapshot falls back to full replay and is retained for diagnosis
+- snapshots rely on the journal id and committed boundary; an invalid snapshot falls back to full replay and is retained for diagnosis. A journal copied by hand that kept its id but diverged before a snapshot or checkpoint would not be detected; the replication design never publishes a record that is not on both machines, and Part 5's epochs handle divergence after a failover
 - event-log sequencing and matching-input sequencing remain distinct concepts
 - live HTTP replies still use `oneshot`
 - MDP saves its complete JSON open-order and candle state at most once a second; a crash replays up to about a second of journal, and each save still grows with candle history
 - candle state retains every one-minute bucket without a retention limit, rollups, or external historical store
 - there is no public reporting API or trade-tape service
 - mmap is a same-host Unix transport using cooperative file locks, JSON, and a bounded window; it is not lock-free, cross-server replication, or an ingress transport
-- the journal still grows without bound; reader checkpoint validation still scans history on reader restart
+- the journal still grows without bound; a reader restart checks only the record at its checkpoint, and the primary's normal restart validates only the records after its snapshot (milestone 23 part 2), so damage in the older part of the journal is found only by what reads it again: a full replay with no usable snapshot, a reader starting from the beginning, or a promotion until Part 3 removes its full read. Nothing scrubs the journal in the background
+- restoring an older copy of the journal is unsupported. The stream's watermark and the warm replica's applied length catch it, but not when the copy comes back without a stream file, with an unreadable stream header, or with its own old stream file: that primary starts trading, and readers whose checkpoints lie beyond it are refused only until the new history grows past them. To go back, start a new journal
 - mmap is not the durable recovery source; never modify, truncate, replace, or unlink mapped files while processes use them
 - consumer crashes require checkpoint/state coordination; arbitrary downstream effects are not exactly-once
 - internal matching and settlement failures are rejected before commit and halt the worker if they cannot be represented as a business rejection
 - warm promotion is manual and same-host: no heartbeat, automatic failover, leader election, second machine, or measured RTO/RPO
 - promotion replays the entire journal instead of reusing the caught-up warm core, so its duration grows with history
 - the warm replica's management API is unauthenticated and loopback-only; `202` from `/promote` means the old writer is fenced, not that the customer listener is ready
-- the crate uses Unix-only APIs (advisory file locks, device/inode journal identity, mmap) and builds and tests on Linux only
+- the crate uses Unix-only APIs (advisory file locks, positioned reads, mmap) and builds and tests on Linux only
 - the reporter applies about 1,600 commands/s: it keeps up at 1,000 orders/s but falls behind a sustained faster exchange and catches up afterwards; set-based writes or `COPY` are the next lever
 
 ## What Not To Work On Yet

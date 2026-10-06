@@ -8,7 +8,6 @@ use std::{
     fs,
     io::Write,
     net::{TcpListener, TcpStream},
-    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -18,11 +17,12 @@ use std::{
 
 const CAPACITY: usize = 4096;
 /// The reporter's migrations, applied in this order.
-const MIGRATIONS: [&str; 4] = [
+const MIGRATIONS: [&str; 5] = [
     "20260926000000_create_reporter_tables.sql",
     "20260930000000_reporter_rejections.sql",
     "20261005000000_reporter_expiry.sql",
     "20261005100000_reporter_trading_days.sql",
+    "20261006000000_reporter_journal_id.sql",
 ];
 /// Every test resets the one supplied database, so they must never overlap.
 static DATABASE: Mutex<()> = Mutex::new(());
@@ -229,11 +229,17 @@ fn lifecycle_records() -> Vec<Vec<u8>> {
 }
 
 /// Writes `records` as a journal, and a stream whose cache holds only the last record: a real
-/// Reporter process then catches up from the journal and hands off to the cache.
+/// Reporter process then catches up from the journal and hands off to the cache. Rewriting an
+/// existing journal keeps its journal id, so it is the same journal grown longer.
 fn write_journal(dir: &Path, records: &[Vec<u8>]) -> (PathBuf, PathBuf) {
     let journal = dir.join("events.log");
     let stream = dir.join("events.mmap");
-    let mut journal_bytes = b"EXCHLOG1".to_vec();
+    // The journal header is the magic and a 16-byte journal id; the stream names the same id.
+    let journal_id = fs::read(&journal)
+        .map(|bytes| uuid::Uuid::from_slice(&bytes[8..24]).unwrap())
+        .unwrap_or_else(|_| uuid::Uuid::new_v4());
+    let mut journal_bytes = b"EXCHLOG2".to_vec();
+    journal_bytes.extend_from_slice(journal_id.as_bytes());
     for record in records {
         journal_bytes.extend_from_slice(record);
     }
@@ -244,11 +250,9 @@ fn write_journal(dir: &Path, records: &[Vec<u8>]) -> (PathBuf, PathBuf) {
     let last_sequence = last_batch.as_array().unwrap().last().unwrap()["seq_num"]
         .as_u64()
         .unwrap();
-    let metadata = fs::metadata(&journal).unwrap();
-    let mut header = b"EXCHBUS1".to_vec();
+    let mut header = b"EXCHBUS2".to_vec();
+    header.extend_from_slice(journal_id.as_bytes());
     for value in [
-        metadata.dev(),
-        metadata.ino(),
         CAPACITY as u64,
         journal_bytes.len() as u64,
         last_sequence,
@@ -374,7 +378,9 @@ fn wait_until_ready(child: &mut Child, address: &str) {
     }
 }
 
-fn assert_fails_before_ready(mut child: Child) {
+/// Waits for the reporter to exit with a failure, and returns what it wrote to stderr, so a test
+/// can check that it stopped for the reason it is about.
+fn assert_fails_before_ready(mut child: Child) -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -382,7 +388,11 @@ fn assert_fails_before_ready(mut child: Child) {
                 !status.success(),
                 "reporter unexpectedly survived injected failure"
             );
-            return;
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                std::io::Read::read_to_string(&mut pipe, &mut stderr).unwrap();
+            }
+            return stderr;
         }
         assert!(
             Instant::now() < deadline,
@@ -428,11 +438,15 @@ fn reporter_rolls_back_then_restarts_without_duplicate_history() {
     let database_url =
         std::env::var("REPORTER_TEST_DATABASE_URL").expect("set REPORTER_TEST_DATABASE_URL");
     reset_database(&database_url);
-    // Reporters from before the milestone 21 and milestone 22 migrations cannot save a checkpoint.
+    // Reporters from before the milestone 21, 22 and 23 migrations cannot save a checkpoint, and
+    // neither can a current one at a byte inside the journal's header.
     for old_reporter_checkpoint in [
         "INSERT INTO reporter_checkpoint (singleton, journal_device, journal_inode, next_sequence, byte_offset) VALUES (true, 1, 1, 1, 8)",
         "INSERT INTO reporter_checkpoint (singleton, report_version, journal_device, journal_inode, next_sequence, byte_offset) VALUES (true, 2, 1, 1, 1, 8)",
         "INSERT INTO reporter_checkpoint (singleton, report_version, journal_device, journal_inode, next_sequence, byte_offset) VALUES (true, 3, 1, 1, 1, 8)",
+        "INSERT INTO reporter_checkpoint (singleton, report_version, journal_device, journal_inode, next_sequence, byte_offset, trading_day) VALUES (true, 4, 1, 1, 1, 8, NULL)",
+        "INSERT INTO reporter_checkpoint (singleton, report_version, journal_id, next_sequence, byte_offset) VALUES (true, 4, gen_random_uuid(), 1, 24)",
+        "INSERT INTO reporter_checkpoint (singleton, report_version, journal_id, next_sequence, byte_offset) VALUES (true, 5, gen_random_uuid(), 1, 8)",
     ] {
         assert!(
             !psql(&database_url, &["-c", old_reporter_checkpoint])
@@ -449,12 +463,13 @@ fn reporter_rolls_back_then_restarts_without_duplicate_history() {
         &database_url,
         "CREATE OR REPLACE FUNCTION reporter_fail_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected checkpoint failure'; END; $$; CREATE TRIGGER reporter_fail_checkpoint BEFORE INSERT OR UPDATE ON reporter_checkpoint FOR EACH ROW EXECUTE FUNCTION reporter_fail_checkpoint()",
     );
-    assert_fails_before_ready(spawn_reporter(
+    let stderr = assert_fails_before_ready(spawn_reporter(
         &database_url,
         &journal,
         &stream,
         &unused_address(),
     ));
+    assert!(stderr.contains("injected checkpoint failure"), "{stderr}");
     assert_eq!(summary(&database_url), "0:0:0:0:none");
     run_sql(
         &database_url,
@@ -548,12 +563,16 @@ fn a_close_that_leaves_an_order_resting_stops_the_reporter() {
     // and the report disagree, so the reporter stops without recording the close, every time.
     records.push(closed(7, "2026-10-05", &[]));
     write_journal(&dir, &records);
-    assert_fails_before_ready(spawn_reporter(
+    let stderr = assert_fails_before_ready(spawn_reporter(
         &database_url,
         &journal,
         &stream,
         &unused_address(),
     ));
+    assert!(
+        stderr.contains("orders of the closed day are still resting in the report"),
+        "the reporter stopped for another reason: {stderr}"
+    );
     assert_eq!(summary(&database_url), "1:0:1:0:7");
     assert_eq!(
         query(&database_url, "SELECT status FROM reported_orders"),
@@ -599,12 +618,13 @@ fn a_failed_group_rolls_back_only_itself() {
         &database_url,
         "CREATE OR REPLACE FUNCTION reporter_refuse_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected order failure'; END; $$; CREATE TRIGGER reporter_refuse_order BEFORE INSERT ON reported_orders FOR EACH ROW WHEN (NEW.order_id = 'poison') EXECUTE FUNCTION reporter_refuse_order()",
     );
-    assert_fails_before_ready(spawn_reporter(
+    let stderr = assert_fails_before_ready(spawn_reporter(
         &database_url,
         &journal,
         &stream,
         &unused_address(),
     ));
+    assert!(stderr.contains("injected order failure"), "{stderr}");
     // The first group committed with the checkpoint just after its 1,000th batch (sequence 2000).
     // The failed group rolled back whole: no trade, and rest-1 is still resting.
     assert_eq!(summary(&database_url), "999:0:0:0:2001");

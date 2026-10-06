@@ -1,17 +1,27 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    io::{self, Read, Seek, SeekFrom, Write},
+    os::unix::fs::{FileExt, OpenOptionsExt},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
+
+use uuid::Uuid;
 
 use crate::types::exchange_event::EventEnvelope;
 
 /// Marks the file as an exchange event log and pins the on-disk format. A format change bumps the
 /// trailing digit, so an old file is rejected with a clear message instead of failing somewhere
 /// deep in a JSON parse.
-pub(super) const FILE_MAGIC: &[u8; 8] = b"EXCHLOG1";
+pub(super) const FILE_MAGIC: &[u8; 8] = b"EXCHLOG2";
+
+/// The format before milestone 23, whose journals had no id.
+const OLD_FILE_MAGIC: &[u8; 8] = b"EXCHLOG1";
+
+/// The magic, then the journal id: 16 random bytes chosen when the journal is created. The id is
+/// what names a journal, so a byte-identical copy on another machine is the same journal, and the
+/// first record starts right after it.
+pub(crate) const JOURNAL_HEADER_LEN: usize = 24;
 
 /// Journal syncs since the process started. `--bench` divides orders by this to show how many
 /// commands shared one sync.
@@ -29,16 +39,23 @@ pub enum EventStoreError {
     Io(std::io::Error),
     /// The file exists but is not an event log, or not one this build can read.
     BadMagic,
+    /// A journal from before milestone 23, which has no journal id.
+    OldFormat,
     /// Damage that is not a torn tail: a bad checksum or unreadable payload with more records
     /// after it. Recovery refuses rather than guessing which part is trustworthy.
     Corrupt(String),
-    /// A warm process found a different journal at its configured path after it took the writer
-    /// lock. This is checked before recovery can truncate a torn tail in the wrong file.
+    /// The journal at the path is not the one expected, found after taking the writer lock and
+    /// before recovery can truncate a torn tail in the wrong file.
     JournalIdentityMismatch {
-        expected_device: u64,
-        expected_inode: u64,
-        actual_device: u64,
-        actual_inode: u64,
+        expected: Uuid,
+        actual: Uuid,
+    },
+    /// The journal's complete records end before the bytes a warm replica already applied from
+    /// it: it lost committed history, most likely because an older copy with the same id
+    /// replaced it.
+    ShorterThanApplied {
+        length: u64,
+        applied: u64,
     },
 }
 
@@ -51,24 +68,72 @@ impl std::fmt::Display for EventStoreError {
                 "file is not an exchange event log (expected magic {:?})",
                 String::from_utf8_lossy(FILE_MAGIC)
             ),
+            Self::OldFormat => f.write_str(OLD_FORMAT),
             Self::Corrupt(detail) => write!(f, "event log is corrupt: {}", detail),
-            Self::JournalIdentityMismatch {
-                expected_device,
-                expected_inode,
-                actual_device,
-                actual_inode,
-            } => write!(
+            Self::JournalIdentityMismatch { expected, actual } => write!(
                 f,
-                "event log identity changed (expected {expected_device}:{expected_inode}, found {actual_device}:{actual_inode})"
+                "event log identity changed (expected journal {expected}, found {actual})"
+            ),
+            Self::ShorterThanApplied { length, applied } => write!(
+                f,
+                "event log is {length} bytes, shorter than the {applied} bytes already applied from it: it may be an older copy of the journal"
             ),
         }
     }
 }
 
+const OLD_FORMAT: &str = "event log is in the EXCHLOG1 format from before milestone 23, which has no journal id; start a new journal";
+
 impl From<std::io::Error> for EventStoreError {
     fn from(err: std::io::Error) -> Self {
         Self::Io(err)
     }
+}
+
+/// The journal id in a header, or why the bytes are not a journal header this build can read.
+fn parse_header(header: &[u8]) -> Result<Uuid, EventStoreError> {
+    if header.starts_with(OLD_FILE_MAGIC) {
+        return Err(EventStoreError::OldFormat);
+    }
+    if !header.starts_with(FILE_MAGIC) {
+        return Err(EventStoreError::BadMagic);
+    }
+    if header.len() < JOURNAL_HEADER_LEN {
+        return Err(EventStoreError::Corrupt(
+            "incomplete journal header".to_string(),
+        ));
+    }
+    Ok(Uuid::from_bytes(
+        header[FILE_MAGIC.len()..JOURNAL_HEADER_LEN]
+            .try_into()
+            .unwrap(),
+    ))
+}
+
+/// Refuses an open file that is not the expected journal. It reads only the header, so nothing is
+/// read or repaired in a journal that is not the one expected.
+fn check_journal_id(file: &File, expected: Uuid) -> Result<(), EventStoreError> {
+    let mut header = [0; JOURNAL_HEADER_LEN];
+    let read = file.read_at(&mut header, 0)?;
+    let actual = parse_header(&header[..read])?;
+    if actual != expected {
+        return Err(EventStoreError::JournalIdentityMismatch { expected, actual });
+    }
+    Ok(())
+}
+
+/// Reads the id of an open journal from its header, without moving the file's cursor.
+pub(crate) fn journal_id_of(file: &File) -> io::Result<Uuid> {
+    let mut header = [0; JOURNAL_HEADER_LEN];
+    file.read_exact_at(&mut header, 0).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            io::Error::new(io::ErrorKind::InvalidData, "incomplete journal header")
+        } else {
+            error
+        }
+    })?;
+    parse_header(&header)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 /// CRC-32 (IEEE 802.3, reflected) over `data`.
@@ -97,6 +162,7 @@ pub(super) fn crc32(data: &[u8]) -> u32 {
 /// file: it can never find an input whose outputs went missing.
 pub struct EventStore {
     file: File,
+    journal_id: Uuid,
     /// Syncs through this handle, so a test can prove that a group shares one.
     #[cfg(test)]
     pub(crate) syncs: u64,
@@ -112,9 +178,10 @@ impl Drop for EventStore {
 }
 
 impl EventStore {
-    fn from_file(file: File) -> Self {
+    fn from_file(file: File, journal_id: Uuid) -> Self {
         Self {
             file,
+            journal_id,
             #[cfg(test)]
             syncs: 0,
         }
@@ -123,7 +190,13 @@ impl EventStore {
     #[cfg(test)]
     pub(crate) fn open_read_only_for_test(path: impl AsRef<Path>) -> Result<Self, EventStoreError> {
         let file = OpenOptions::new().read(true).open(path)?;
-        Ok(Self::from_file(file))
+        let journal_id = journal_id_of(&file)?;
+        Ok(Self::from_file(file, journal_id))
+    }
+
+    /// The id this journal was created with.
+    pub(crate) fn journal_id(&self) -> Uuid {
+        self.journal_id
     }
 
     /// Opens (or creates) the log at `path`, recovers the events already in it, and truncates any
@@ -140,22 +213,27 @@ impl EventStore {
     /// follower read. It never creates or initializes a journal: a follower's in-memory state
     /// is not a durability authority, so a missing or empty journal is an error, not a fresh start.
     ///
-    /// Identity is compared as soon as the exclusive lock is held and before any recovery read or
+    /// The id is compared as soon as the exclusive lock is held and before any recovery read or
     /// torn-tail truncation. Recovery can shorten the file, so a path that now names a different
     /// journal must be refused before recovery can touch it — this is the only way promotion
-    /// opens a journal, deliberately, so there is no unchecked variant left to call by mistake.
+    /// opens a journal, deliberately, so there is no unchecked variant left to call by mistake. A
+    /// byte-identical copy of the journal is the same journal.
+    ///
+    /// `applied` is the journal length the follower already applied. The id cannot tell an older
+    /// copy of the same journal from the journal itself, but a journal whose complete records end
+    /// before what was applied lost committed history, so it is refused untouched too.
     pub(crate) fn open_existing_matching(
         path: impl AsRef<Path>,
-        expected_device: u64,
-        expected_inode: u64,
+        expected: Uuid,
+        applied: u64,
     ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
-        Self::open_inner(path, false, Some((expected_device, expected_inode)))
+        Self::open_inner(path, false, Some((expected, applied)))
     }
 
     fn open_inner(
         path: impl AsRef<Path>,
         allow_initialize_empty: bool,
-        expected_identity: Option<(u64, u64)>,
+        expected: Option<(Uuid, u64)>,
     ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
         let path = path.as_ref().to_path_buf();
         let mut options = OpenOptions::new();
@@ -169,16 +247,13 @@ impl EventStore {
         // never take this lifetime lock; they read only the published, immutable prefix.
         file.try_lock().map_err(std::io::Error::from)?;
 
-        if let Some((expected_device, expected_inode)) = expected_identity {
-            let metadata = file.metadata()?;
-            if metadata.dev() != expected_device || metadata.ino() != expected_inode {
-                return Err(EventStoreError::JournalIdentityMismatch {
-                    expected_device,
-                    expected_inode,
-                    actual_device: metadata.dev(),
-                    actual_inode: metadata.ino(),
-                });
+        if let Some((expected, _)) = expected {
+            if file.metadata()?.len() == 0 {
+                return Err(EventStoreError::Corrupt(
+                    "existing journal is empty".to_string(),
+                ));
             }
+            check_journal_id(&file, expected)?;
         }
 
         // ponytail: reads the whole log into memory. Fine while history is small; stream it, or
@@ -192,7 +267,11 @@ impl EventStore {
                     "existing journal is empty".to_string(),
                 ));
             }
-            file.write_all(FILE_MAGIC)?;
+            // A new journal names itself once, here, for its whole life.
+            let journal_id = Uuid::new_v4();
+            let mut header = FILE_MAGIC.to_vec();
+            header.extend_from_slice(journal_id.as_bytes());
+            file.write_all(&header)?;
             file.sync_all()?;
             let parent = path
                 .parent()
@@ -200,15 +279,24 @@ impl EventStore {
                 .unwrap_or(Path::new("."));
             File::open(parent)?.sync_all()?;
 
-            return Ok((Self::from_file(file), Vec::new()));
+            return Ok((Self::from_file(file, journal_id), Vec::new()));
         }
 
-        if bytes.len() < FILE_MAGIC.len() || &bytes[..FILE_MAGIC.len()] != FILE_MAGIC {
-            return Err(EventStoreError::BadMagic);
-        }
+        let journal_id = parse_header(&bytes)?;
+        let (events, decoded_len) =
+            decode_records(&bytes[JOURNAL_HEADER_LEN..], JOURNAL_HEADER_LEN)?;
+        let good_len = JOURNAL_HEADER_LEN + decoded_len;
 
-        let (events, decoded_len) = decode_records(&bytes[FILE_MAGIC.len()..], FILE_MAGIC.len())?;
-        let good_len = FILE_MAGIC.len() + decoded_len;
+        // A torn tail is not history: complete records ending before what the follower applied
+        // mean committed commands are gone, so refuse before the tail is dropped.
+        if let Some((_, applied)) = expected {
+            if (good_len as u64) < applied {
+                return Err(EventStoreError::ShorterThanApplied {
+                    length: good_len as u64,
+                    applied,
+                });
+            }
+        }
 
         // Drop a torn tail so the next append cannot be written after damaged bytes.
         if good_len < bytes.len() {
@@ -218,14 +306,16 @@ impl EventStore {
 
         file.seek(SeekFrom::End(0))?;
 
-        Ok((Self::from_file(file), events))
+        Ok((Self::from_file(file, journal_id), events))
     }
 
     /// Opens the writer-owned journal at an already committed command boundary and recovers only
     /// records after it. A validated core snapshot supplies the skipped prefix; the journal still
-    /// owns truncation of a torn suffix and remains the only authoritative history.
+    /// owns truncation of a torn suffix and remains the only authoritative history. Like
+    /// promotion, it checks that the locked file is the expected journal before reading on.
     pub(crate) fn open_suffix(
         path: impl AsRef<Path>,
+        expected: Uuid,
         boundary: u64,
     ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
         let path = path.as_ref().to_path_buf();
@@ -235,19 +325,14 @@ impl EventStore {
             .create(false)
             .open(&path)?;
         file.try_lock().map_err(std::io::Error::from)?;
+        check_journal_id(&file, expected)?;
 
         let file_len = file.metadata()?.len();
-        if boundary < FILE_MAGIC.len() as u64 || boundary > file_len {
+        if boundary < JOURNAL_HEADER_LEN as u64 || boundary > file_len {
             return Err(EventStoreError::Corrupt(format!(
                 "snapshot boundary {} is outside the journal length {}",
                 boundary, file_len
             )));
-        }
-
-        let mut magic = [0; FILE_MAGIC.len()];
-        file.read_exact(&mut magic)?;
-        if &magic != FILE_MAGIC {
-            return Err(EventStoreError::BadMagic);
         }
 
         file.seek(SeekFrom::Start(boundary))?;
@@ -263,7 +348,7 @@ impl EventStore {
             file.sync_all()?;
         }
         file.seek(SeekFrom::End(0))?;
-        Ok((Self::from_file(file), events))
+        Ok((Self::from_file(file, expected), events))
     }
 
     /// Writes one command's envelopes as a single framed record and synchronizes it to disk.
@@ -398,7 +483,7 @@ fn decode_records(
 mod tests {
     use super::*;
     use crate::types::exchange_event::{ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent};
-    use std::{os::unix::fs::MetadataExt, path::PathBuf};
+    use std::path::PathBuf;
 
     fn deposit_batch(seq: u64, amount: u64) -> Vec<EventEnvelope> {
         vec![
@@ -477,18 +562,17 @@ mod tests {
     fn promotion_open_never_creates_or_initializes_a_missing_or_empty_journal() {
         let missing = temp_path("promotion-missing");
         assert!(matches!(
-            EventStore::open_existing_matching(&missing, 0, 0),
+            EventStore::open_existing_matching(&missing, Uuid::new_v4(), 0),
             Err(EventStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
         ));
         assert!(!missing.exists());
 
-        // Requesting the empty file's own identity gets past the identity comparison, so this
-        // proves the emptiness check itself refuses to initialize it.
+        // Emptiness is checked before the id, so any expected id reaches the refusal to
+        // initialize it.
         let empty = temp_path("promotion-empty");
         std::fs::File::create(&empty).unwrap();
-        let metadata = std::fs::metadata(&empty).unwrap();
         assert!(matches!(
-            EventStore::open_existing_matching(&empty, metadata.dev(), metadata.ino()),
+            EventStore::open_existing_matching(&empty, Uuid::new_v4(), 0),
             Err(EventStoreError::Corrupt(detail)) if detail == "existing journal is empty"
         ));
         assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
@@ -499,50 +583,137 @@ mod tests {
     fn promotion_checks_identity_before_it_repairs_a_foreign_torn_tail() {
         let expected = temp_path("promotion-expected-identity");
         let foreign = temp_path("promotion-foreign-identity");
-        {
+        let expected_id = {
             let (mut store, _) = EventStore::open(&expected).unwrap();
             store.append(&deposit_batch(1, 10)).unwrap();
-        }
-        let expected_metadata = std::fs::metadata(&expected).unwrap();
-
-        {
+            store.journal_id()
+        };
+        let foreign_id = {
             let (mut store, _) = EventStore::open(&foreign).unwrap();
             store.append(&deposit_batch(1, 20)).unwrap();
-        }
-        let foreign_metadata = std::fs::metadata(&foreign).unwrap();
+            store.journal_id()
+        };
+        let foreign_len = std::fs::metadata(&foreign).unwrap().len();
         OpenOptions::new()
             .write(true)
             .open(&foreign)
             .unwrap()
-            .set_len(foreign_metadata.len() - 4)
+            .set_len(foreign_len - 4)
             .unwrap();
         let foreign_before = std::fs::read(&foreign).unwrap();
 
         assert!(matches!(
-            EventStore::open_existing_matching(
-                &foreign,
-                expected_metadata.dev(),
-                expected_metadata.ino(),
-            ),
-            Err(EventStoreError::JournalIdentityMismatch { .. })
+            EventStore::open_existing_matching(&foreign, expected_id, 0),
+            Err(EventStoreError::JournalIdentityMismatch { expected, actual })
+                if expected == expected_id && actual == foreign_id
         ));
         assert_eq!(std::fs::read(&foreign).unwrap(), foreign_before);
 
-        let (store, recovered) = EventStore::open_existing_matching(
-            &foreign,
-            foreign_metadata.dev(),
-            foreign_metadata.ino(),
-        )
-        .unwrap();
+        let (store, recovered) =
+            EventStore::open_existing_matching(&foreign, foreign_id, 0).unwrap();
         assert!(recovered.is_empty());
         drop(store);
         assert_eq!(
             std::fs::metadata(&foreign).unwrap().len(),
-            FILE_MAGIC.len() as u64
+            JOURNAL_HEADER_LEN as u64
         );
 
         std::fs::remove_file(expected).unwrap();
         std::fs::remove_file(foreign).unwrap();
+    }
+
+    /// The id travels with the bytes: a copy of the journal at another path, as on another
+    /// machine, opens as the same journal, and only a journal with a different id is refused.
+    #[test]
+    fn a_journal_keeps_its_id_and_a_copy_is_the_same_journal() {
+        let path = temp_path("journal-id");
+        let copy = temp_path("journal-id-copy");
+        let journal_id = {
+            let (mut store, _) = EventStore::open(&path).unwrap();
+            store.append(&deposit_batch(1, 10)).unwrap();
+            store.journal_id()
+        };
+        let (store, _) = EventStore::open(&path).unwrap();
+        assert_eq!(store.journal_id(), journal_id);
+        assert_eq!(journal_id_of(store.file()).unwrap(), journal_id);
+        drop(store);
+
+        std::fs::copy(&path, &copy).unwrap();
+        let applied = std::fs::metadata(&copy).unwrap().len();
+        let (store, recovered) =
+            EventStore::open_existing_matching(&copy, journal_id, applied).unwrap();
+        assert_eq!(recovered, deposit_batch(1, 10));
+        drop(store);
+
+        // Another id is refused before anything is read or repaired: the torn tail stays.
+        OpenOptions::new()
+            .write(true)
+            .open(&copy)
+            .unwrap()
+            .set_len(applied - 4)
+            .unwrap();
+        let torn = std::fs::read(&copy).unwrap();
+        assert!(matches!(
+            EventStore::open_existing_matching(&copy, Uuid::new_v4(), 0),
+            Err(EventStoreError::JournalIdentityMismatch { .. })
+        ));
+        assert!(matches!(
+            EventStore::open_suffix(&copy, Uuid::new_v4(), JOURNAL_HEADER_LEN as u64),
+            Err(EventStoreError::JournalIdentityMismatch { .. })
+        ));
+        assert_eq!(std::fs::read(&copy).unwrap(), torn);
+
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(copy).unwrap();
+    }
+
+    /// An older copy of the journal keeps its id, so promotion also refuses a journal shorter
+    /// than what the follower already applied, and leaves it as it found it.
+    #[test]
+    fn promotion_refuses_a_journal_shorter_than_what_was_applied_untouched() {
+        let path = temp_path("shorter-than-applied");
+        let (journal_id, first_end, applied) = {
+            let (mut store, _) = EventStore::open(&path).unwrap();
+            store.append(&deposit_batch(1, 10)).unwrap();
+            let first_end = store.file.metadata().unwrap().len();
+            store.append(&deposit_batch(3, 20)).unwrap();
+            let applied = store.file.metadata().unwrap().len();
+            (store.journal_id(), first_end, applied)
+        };
+        let full = std::fs::read(&path).unwrap();
+
+        // One older copy is cut inside its last record. The other's last record claims more bytes
+        // than it has, so the file is as long as what was applied, but that record is torn.
+        let mut torn_across = full.clone();
+        let at = first_end as usize;
+        let claimed = u32::from_le_bytes(full[at..at + 4].try_into().unwrap()) + 100;
+        torn_across[at..at + 4].copy_from_slice(&claimed.to_le_bytes());
+
+        for copy in [full[..full.len() - 4].to_vec(), torn_across] {
+            std::fs::write(&path, &copy).unwrap();
+            assert!(matches!(
+                EventStore::open_existing_matching(&path, journal_id, applied),
+                Err(EventStoreError::ShorterThanApplied { length, applied: a })
+                    if length == first_end && a == applied
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), copy);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_journal_from_before_journal_ids_is_refused_untouched_with_its_reason() {
+        let path = temp_path("old-format");
+        let mut old = OLD_FILE_MAGIC.to_vec();
+        old.extend_from_slice(&encode_record(&deposit_batch(1, 10)).unwrap());
+        std::fs::write(&path, &old).unwrap();
+
+        assert!(matches!(
+            EventStore::open(&path),
+            Err(EventStoreError::OldFormat)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -591,7 +762,7 @@ mod tests {
         // Flip a byte inside the first record's payload. All bytes are present, so this is real
         // damage rather than a torn tail, and it must not be silently dropped.
         let mut bytes = std::fs::read(&path).unwrap();
-        let victim = FILE_MAGIC.len() + RECORD_HEADER_LEN + 4;
+        let victim = JOURNAL_HEADER_LEN + RECORD_HEADER_LEN + 4;
         bytes[victim] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
@@ -627,7 +798,8 @@ mod tests {
 
         // A real write failure: a handle that cannot write. The runtime treats this as fatal.
         let read_only = OpenOptions::new().read(true).open(&path).unwrap();
-        let mut store = EventStore::from_file(read_only);
+        let journal_id = journal_id_of(&read_only).unwrap();
+        let mut store = EventStore::from_file(read_only, journal_id);
 
         assert!(store.append(&deposit_batch(3, 250)).is_err());
 
@@ -637,15 +809,16 @@ mod tests {
     #[test]
     fn suffix_recovery_starts_at_a_committed_record_boundary() {
         let path = temp_path("suffix");
-        let boundary;
+        let (journal_id, boundary);
         {
             let (mut store, _) = EventStore::open(&path).unwrap();
             store.append(&deposit_batch(1, 10)).unwrap();
             boundary = store.file.metadata().unwrap().len();
             store.append(&deposit_batch(3, 20)).unwrap();
+            journal_id = store.journal_id();
         }
 
-        let (_store, suffix) = EventStore::open_suffix(&path, boundary).unwrap();
+        let (_store, suffix) = EventStore::open_suffix(&path, journal_id, boundary).unwrap();
         assert_eq!(suffix, deposit_batch(3, 20));
         std::fs::remove_file(path).unwrap();
     }
@@ -653,12 +826,13 @@ mod tests {
     #[test]
     fn suffix_recovery_drops_only_a_torn_suffix_tail() {
         let path = temp_path("suffix-torn-tail");
-        let boundary;
+        let (journal_id, boundary);
         {
             let (mut store, _) = EventStore::open(&path).unwrap();
             store.append(&deposit_batch(1, 10)).unwrap();
             boundary = store.file.metadata().unwrap().len();
             store.append(&deposit_batch(3, 20)).unwrap();
+            journal_id = store.journal_id();
         }
         let full = std::fs::metadata(&path).unwrap().len();
         OpenOptions::new()
@@ -668,7 +842,7 @@ mod tests {
             .set_len(full - 4)
             .unwrap();
 
-        let (_store, suffix) = EventStore::open_suffix(&path, boundary).unwrap();
+        let (_store, suffix) = EventStore::open_suffix(&path, journal_id, boundary).unwrap();
         assert!(suffix.is_empty());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), boundary);
         std::fs::remove_file(path).unwrap();
