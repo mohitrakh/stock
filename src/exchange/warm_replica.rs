@@ -41,7 +41,7 @@ use tokio::sync::{oneshot, watch};
 use super::{
     core::ExchangeCore,
     event_store::{EventStore, EventStoreError, journal_id_of},
-    event_stream::{ReaderCheckpoint, StreamReader},
+    event_stream::{ReaderCheckpoint, StreamReader, decode_batch, read_record},
     runtime::{ReplayError, ReplicaCore},
     snapshot::{self, SnapshotBoundary},
 };
@@ -54,6 +54,23 @@ type WarmResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+/// Whether `checkpoint` is a command boundary of the journal itself: the journal ends there, or a
+/// complete record starts there with its next sequence. Read from the journal, never from the
+/// stream, whose header a running primary may be rewriting.
+fn is_journal_boundary(journal_path: &Path, checkpoint: &ReaderCheckpoint) -> bool {
+    let Ok(journal) = File::open(journal_path) else {
+        return false;
+    };
+    let Ok(len) = journal.metadata().map(|metadata| metadata.len()) else {
+        return false;
+    };
+    let at = checkpoint.byte_offset();
+    at == len
+        || read_record(&journal, at, len)
+            .and_then(|record| decode_batch(&record, checkpoint.next_sequence))
+            .is_ok()
 }
 
 /// The fenced ownership hand-off returned to `main`, which creates the primary runtime from it:
@@ -121,6 +138,8 @@ impl WarmReplica {
             };
 
         let mut snapshot_is_safe_to_replace = true;
+        // The offset of a snapshot found ahead of the stream, which stays the restart point.
+        let mut ahead = None;
         let mut invalid_snapshot = |error: String| {
             eprintln!("ignoring snapshot and rebuilding warm replica from sequence 1: {error}");
             snapshot_is_safe_to_replace = false;
@@ -152,7 +171,18 @@ impl WarmReplica {
                                 // A stale or malformed snapshot boundary is an optimization failure,
                                 // not authority to invent a new exchange. Starting from the stream's
                                 // validated beginning is safe; a bad stream still makes that fail.
-                                invalid_snapshot(error.to_string());
+                                // A snapshot at a command boundary of the journal that the stream
+                                // cannot open is only ahead of it: a stream that a power loss left
+                                // behind, or one whose replicated primary holds records back for
+                                // its replica. It stays valid, and the restart point.
+                                if is_journal_boundary(&journal_path, &checkpoint) {
+                                    eprintln!(
+                                        "snapshot ahead of the stream; rebuilding from sequence 1"
+                                    );
+                                    ahead = Some(checkpoint.byte_offset());
+                                } else {
+                                    invalid_snapshot(error.to_string());
+                                }
                                 from_start()?
                             }
                         },
@@ -170,12 +200,18 @@ impl WarmReplica {
             };
 
         let snapshots = if snapshot_is_safe_to_replace {
+            // Rebuilding behind a snapshot found ahead of the stream, the replica writes none
+            // until it has passed it, so the restart point never moves back.
+            let (last_offset, last_size) = match ahead {
+                Some(offset) => (offset, snapshot_size),
+                None => (applied_checkpoint.byte_offset(), start_size),
+            };
             Some(SnapshotWriter {
                 journal: File::open(&journal_path)
                     .map_err(|error| format!("could not open journal for snapshots: {error}"))?,
                 growth: snapshot_growth,
-                last_offset: applied_checkpoint.byte_offset(),
-                last_size: start_size,
+                last_offset,
+                last_size,
             })
         } else {
             eprintln!(
@@ -214,7 +250,12 @@ impl WarmReplica {
             return;
         };
         let offset = self.applied_checkpoint.byte_offset();
-        let grown = offset.saturating_sub(writer.last_offset);
+        // Never behind the last snapshot: only a replica rebuilding past one found ahead of the
+        // stream is ever there.
+        if offset < writer.last_offset {
+            return;
+        }
+        let grown = offset - writer.last_offset;
         if !opened && grown < writer.growth.saturating_mul(writer.last_size) {
             return;
         }
@@ -618,7 +659,9 @@ mod tests {
     use crate::{
         exchange::{
             event_store::{EventStore, EventStoreError, JOURNAL_HEADER_LEN, encode_record},
-            event_stream::{StreamReader, tests::Fixture},
+            event_stream::{
+                DEFAULT_CAPACITY, StreamReader, StreamWriter, record_length, tests::Fixture,
+            },
             runtime::{
                 promote_replica, recover_runtime_with_stream,
                 recover_runtime_with_stream_and_snapshot, replay_event_log,
@@ -940,7 +983,7 @@ mod tests {
         } = warm.try_promote().unwrap();
         assert!(suffix.is_empty());
         let (_tx, rx) = tokio::sync::mpsc::channel(8);
-        let promoted = promote_replica(rx, store, replica, suffix, &stream_path).unwrap();
+        let promoted = promote_replica(rx, store, replica, suffix, &stream_path, false).unwrap();
         assert_eq!(
             promoted.core_snapshot_for_test(),
             replay_event_log(&journal_batch).unwrap().snapshot()
@@ -1003,7 +1046,7 @@ mod tests {
         ));
 
         let (_tx, rx) = tokio::sync::mpsc::channel(8);
-        let promoted = promote_replica(rx, store, replica, suffix, &stream_path).unwrap();
+        let promoted = promote_replica(rx, store, replica, suffix, &stream_path, false).unwrap();
         assert_eq!(promoted.next_event_sequence(), 3);
         assert_eq!(
             promoted.core_snapshot_for_test(),
@@ -1157,6 +1200,65 @@ mod tests {
             primary.core_snapshot_for_test()
         );
         assert_eq!(std::fs::read(&snapshot).unwrap(), corrupt);
+    }
+
+    /// A snapshot at a command boundary of the journal, beyond what the stream has published yet,
+    /// is ahead, not invalid: a power loss left the stream's header behind, or a replicated
+    /// primary holds records back. The warm replica rebuilds from sequence 1, writes no snapshot
+    /// behind it, and keeps writing snapshots after it.
+    #[test]
+    fn a_snapshot_ahead_of_the_stream_is_kept_and_snapshots_continue() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.dir.join("events.snapshot");
+        let deposit = |primary: &mut crate::exchange::runtime::ExchangeRuntime, amount| {
+            primary
+                .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                    user_id: "buyer".into(),
+                    amount,
+                })
+                .unwrap();
+        };
+        let mut primary = runtime_for(&fixture);
+        deposit(&mut primary, 10);
+        deposit(&mut primary, 20);
+        let mut first = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 0).unwrap();
+        first.catch_up().unwrap();
+        drop(first);
+        // A record follows the snapshot, so its checkpoint is where a complete record starts.
+        deposit(&mut primary, 30);
+        drop(primary);
+        let ahead = snapshot::load(&snapshot, &fixture.log)
+            .unwrap()
+            .unwrap()
+            .boundary
+            .byte_offset;
+
+        // The stream comes back publishing only the first deposit.
+        let journal = std::fs::read(&fixture.log).unwrap();
+        let first_end = JOURNAL_HEADER_LEN + record_length(&journal[JOURNAL_HEADER_LEN..]).unwrap();
+        std::fs::remove_file(&fixture.bus).unwrap();
+        let file = File::open(&fixture.log).unwrap();
+        let published = (first_end as u64, 2);
+        drop(StreamWriter::open_at(&fixture.bus, &file, 6, published, DEFAULT_CAPACITY).unwrap());
+
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 0).unwrap();
+        assert_eq!(warm.applied_checkpoint.next_sequence, 1);
+        assert!(warm.snapshots.is_some());
+        // A snapshot is due after every command here, yet none is written behind the one found.
+        warm.catch_up().unwrap();
+        assert_eq!(warm.applied_checkpoint.next_sequence, 3);
+        let kept = snapshot::load(&snapshot, &fixture.log).unwrap().unwrap();
+        assert_eq!(kept.boundary.byte_offset, ahead);
+
+        // The primary restarts and publishes everything: past the snapshot, snapshots continue.
+        let mut primary = runtime_for(&fixture);
+        deposit(&mut primary, 40);
+        warm.catch_up().unwrap();
+        let latest = snapshot::load(&snapshot, &fixture.log).unwrap().unwrap();
+        assert_eq!(
+            latest.boundary.byte_offset,
+            std::fs::metadata(&fixture.log).unwrap().len()
+        );
     }
 
     #[test]
@@ -1561,7 +1663,8 @@ mod tests {
         // Only the durable batch the warm replica never saw is read and replayed.
         assert_eq!(suffix.len(), 2);
         let (_tx, rx) = tokio::sync::mpsc::channel(8);
-        let mut promoted = promote_replica(rx, store, replica, suffix, &stream_path).unwrap();
+        let mut promoted =
+            promote_replica(rx, store, replica, suffix, &stream_path, false).unwrap();
         assert_eq!(
             promoted.core_snapshot_for_test(),
             expected_after_hidden_tail

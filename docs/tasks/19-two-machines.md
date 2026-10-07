@@ -473,3 +473,325 @@ At maximum rate the warm replica's lag now swings within each day between 0 and 
 events instead of growing for the whole run. On this machine, which it shares with the primary and
 the benchmark, that rate is at its limit: in one of two runs the lows rose by about 50,000 events a
 day.
+
+## Part 4 - Synchronous replication
+
+### Why Part 4 came next
+
+Until this part, one disk held the only journal. Losing that machine lost every acknowledged
+command since the last copy. The owner's decision for this milestone: a command is answered, and
+becomes visible to anyone, only once it is on both machines' disks. If the replica cannot be
+reached, the primary pauses until an operator either promotes the replica (part 5) or tells the
+primary to run alone. The machines talk over TCP, and the second machine is a second container on
+the office machine, with its own volume and network address.
+
+### What changed
+
+- **A replica process.** `stock --replica PRIMARY_ADDR JOURNAL STREAM` keeps a byte-identical copy
+  of the primary's journal, and a stream of its own. It has no exchange core, no customer port and
+  no database. Part 3's warm replica runs beside it on that machine, following the copy, ready for
+  part 5's promotion there.
+- **The primary replicates** when `REPLICATION_LISTEN_ADDR` is set. Each group:
+  1. is written to the journal;
+  2. is shipped to the replica while the primary syncs its own disk;
+  3. waits for the replica's confirmation that its disk holds it too;
+  4. only then is published and answered.
+
+  The replica checks every record (framing, checksum, sequence), appends exactly those bytes,
+  syncs, and confirms how far it is durable. Nothing that exists on one machine only is ever
+  answered or published.
+- **The commit point.** The primary sends the replica the end that both disks hold. The replica
+  publishes on its own stream only up to there, so its readers never see a record that might
+  still be cut.
+- **A restart holds back what the replica may lack.** A replicated primary recovers its journal,
+  but publishes only what its stream had already published. The rest is published, and nothing is
+  served, until the replica confirms it holds it.
+- **Pause, never guess.** There is no timeout. Without a replica the worker simply waits, and
+  commands queue behind it:
+  - `/health` answers 503 "paused: waiting for the replica";
+  - `GET 127.0.0.1:4004/replication` shows "paused";
+  - `POST /replication/run-alone` lets the primary continue without its replica.
+
+  Acknowledged commands then exist on that machine only, until a replica holds everything the
+  primary has synced, which turns running alone off by itself.
+- **A silent link is dropped.** The primary sends the commit point at least every second, and the
+  replica answers every frame. Either side drops a link that stays silent for 10 s, as when the
+  other machine lost power or the network was cut without a word, and the replica dials again.
+- **The replica stops on a failure of its own disk,** as the primary's worker does: a failed read,
+  write or sync of its files could otherwise make it confirm what its disk does not hold.
+- **The bench replicates too** when `REPLICATION_LISTEN_ADDR` is set, so throughput can be measured
+  with a replica.
+
+### The link
+
+The replica dials the primary, so a restarted replica just reconnects and the primary needs no
+replica address. Frames are binary: a length, a kind, a body, and each read refuses a body longer
+than the frame expected can be. When the replica connects, it says which journal it holds, how far
+its copy is committed, how long it is, and the checksum of the bytes between those two points. Its
+committed end is what its stream published. Then:
+- **Its committed part** is on both disks, so it is identical on both machines. The primary's
+  journal must reach it, at a command boundary with the same next sequence. A shorter journal lost
+  committed history and is refused: this catches a primary started on an older copy of its own
+  journal.
+- **Beyond that,** the replica keeps what it holds only if the primary holds the same bytes there.
+  Otherwise it cuts back to its committed end and takes the primary's records instead. That is
+  always safe: anything the primary lacks there it never synced, so it was never acknowledged.
+- **The primary then sends what the replica lacks,** straight from its journal file: first the
+  catch-up, then each group as the worker writes it. Records are sent whole, at most 1 MiB in one
+  frame unless a single record is bigger.
+
+A replica that only lost its link keeps everything it holds, and the primary resumes after it.
+
+A stream is a cache and is never synced, so after a power loss its header can be as old as the
+kernel's writeback delay, about 30 s by default, or gone. The replica's committed end would then be
+older than it really was. So the replica syncs its stream's header within about two seconds of it
+moving: after a power loss its committed end is at most about that old. A stream that is gone
+makes the whole copy its tail. That costs reading, not memory:
+- both machines compute the checksum from their journal files a megabyte at a time;
+- the replica computes its own before it connects, and waits up to 5 minutes for the primary's;
+- it keeps only each unpublished record's end and sequence in memory, 16 bytes a record. It
+  publishes by moving its stream's end, and its readers read the records from its journal.
+
+### Why it cuts back to the committed end, and nowhere else
+
+The first version checked only that the replica ended at one of the primary's command boundaries,
+with the same next sequence. A test showed that this was not enough. A primary that restarted
+without a record it had sent but never synced can write a different record in its place, with the
+same length and the same sequence. The replica then looked like a prefix of the primary and kept
+the wrong record. The checksum of everything beyond the committed end catches any difference, and
+cutting back to a point both disks are known to hold needs no search.
+
+The cut is safe as long as the primary's disk keeps what it synced. If it lost writes it had
+reported synced, or the primary was started on an older copy of its journal, the primary lacks
+acknowledged records. A journal that ends before the replica's committed end is refused. But the
+replica cannot tell records beyond that end, at most about two seconds' worth after a power loss,
+from records the primary never synced, and it cuts both. Only a third machine could tell them
+apart: the three-machine quorum recorded as this milestone's follow-up.
+
+### Options considered and rejected
+
+- **The primary dials the replica.** Then the primary must know the replica's address, and a
+  restarted replica must wait to be dialed.
+- **The replica publishes as soon as its own disk holds a record.** A record the primary never
+  synced could then reach the replica's readers, and later be cut.
+- **A timeout after which the primary gives up its replica and runs alone.** That trades the
+  recovery point of zero for availability without asking, and only an operator can choose between
+  promoting the replica and running alone. The 10 s timeout on a silent link changes nothing the
+  primary may acknowledge: it only lets the replica dial again.
+- **TCP keepalive instead of heartbeats.** The standard library cannot turn it on, and Linux's
+  defaults notice a dead peer after more than two hours. Heartbeats need no new dependency, and a
+  test can play a primary that falls silent.
+- **A commit point synced with every frame on the replica,** in a file of its own. It would add a
+  second sync to every group on the replica's disk. Syncing the stream's header at most once a
+  second bounds what a power loss can make it forget to about two seconds, at almost no cost.
+- **Sending each group from the worker to a replication thread through a channel.** Catch-up has
+  to read the journal file anyway; sending everything from the file needs one path, not two.
+- **The replica keeping its unpublished records in memory, for its stream's cache.** The first
+  version did, and compared at most 64 MiB beyond the committed end. With its stream far behind
+  or gone, it would have read every record since into memory, three times over, and a longer
+  difference meant fetching it all again. Its only reader, the warm replica, reads the journal
+  just as well.
+- **Raft, or more than one replica.** Out of scope for this milestone; a three-machine quorum is
+  its recorded follow-up.
+
+### Compatibility
+
+No file format changed. Without `REPLICATION_LISTEN_ADDR` the primary behaves as before, one write
+and one sync per group, except that recovery now always syncs the journal it recovered, once, before
+anything is served.
+- **New settings and commands:**
+  - `REPLICATION_LISTEN_ADDR` on the primary, the bench, and a warm replica being promoted, since
+    the promoted primary then replicates too;
+  - `stock --replica PRIMARY_ADDR JOURNAL STREAM` on the second machine;
+  - on the operator port, `GET /replication` and `POST /replication/run-alone`; both answer 404
+    when the journal is not replicated.
+- **`/health` answers 503 "paused: waiting for the replica"** while the primary is paused.
+- **An existing journal can be replicated as it is.** A new replica fetches all of it from the
+  primary, starting with its header.
+- **The replication port is the only listener meant to be reached from another machine.** The
+  link is neither authenticated nor encrypted: use a private network.
+- **A restarted primary that holds records back writes no startup snapshot.** The last one stays
+  the restart point until the warm replica writes the next.
+- **While a write waits for the replica, everything behind it waits,** reads included, and the
+  queue of 10,000 commands fills. Reads alone are answered without waiting, since every state they
+  can show is already on both disks, or was let through by running alone.
+
+### Found by the independent review
+
+It found nothing that lets a command be answered or published before both disks hold it in normal
+operation. A separate check of the memory fix above confirmed three of the same findings. All
+fixed, except where noted:
+- **A dead link went unnoticed** (high). The replica only waited for the primary's next frame. When
+  the primary's machine lost power, or the network was cut without a word, it waited forever and
+  never dialed again, while a restarted primary waited for it. Now:
+  - the primary sends the commit point at least every second, and the replica answers every frame;
+  - either side drops a link silent for 10 s;
+  - the replica gives up a dial after 5 s instead of the minutes the system's own retries take.
+- **A restarted primary trusted records that only its page cache held.** A process killed between
+  writing a group and syncing it leaves the group in the page cache. The restarted primary
+  recovered it and, once the replica confirmed it, published and served it, though a power loss
+  could still take it from its own disk. Recovery now syncs the journal before anything is served,
+  whether or not it cut a torn tail. Without replication the same gap existed, and is closed too.
+- **The replica went on after a failed write or sync of its own files.** Its counters had already
+  moved. After a failed sync, a reconnect could report as durable records whose sync failed; after
+  a write failed on a full disk, every handshake failed, forever. A failure of its own disk now
+  stops the replica.
+- **Its committed end could be far older than it was.** A stream is never synced, so after a power
+  loss its header can be about 30 s old. A cut back to there fetches again what the primary still
+  holds, and the check that refuses a primary on an older copy of its journal is weaker by as
+  much. The replica now syncs its stream's header within about two seconds of it moving. Not fixed:
+  within those two seconds the replica cannot tell what the primary never synced from what its disk
+  lost after syncing, as described above.
+- **Running alone could stay on for good under load.** It ended only when a confirmation reached
+  what the worker had written, and a busy worker had always written more. Now it ends once the
+  replica holds everything the primary has synced, including the moment such a replica attaches;
+  the group in flight then waits for the replica. A replica slower than the sustained load still
+  cannot catch up until the load drops.
+- **A stream that would not open was never retried.** The replica went on confirming records it
+  could not publish, reconnecting every second. It now opens the stream whenever it has none, and
+  stops if it cannot.
+- **A restart that held records back wrote its startup snapshot beyond what it published.** A
+  warm replica starting from that snapshot before the replica confirmed found it invalid. It then
+  replayed from the start and wrote no snapshots for the rest of its life. Now no startup snapshot
+  is written while records are held back.
+- **Smaller:**
+  - the replica computed its hello, over its whole copy when its stream was gone, after
+    connecting, inside the primary's 5 s handshake timeout; it now computes it first;
+  - a confirmation was checked against what the worker had written, not what this link had sent;
+  - a hello's length was not checked before its body was read, and one slow peer held up the only
+    listener thread. Every frame is now read with the limit of the frame expected, and each
+    handshake runs on its own thread;
+  - a new copy's directory entry was not synced;
+  - a promoted warm replica read `REPLICATION_LISTEN_ADDR` only after fencing the old primary. A bad
+    value now stops it before.
+- **Tests:**
+  - the restarted-primary test reached the checksum only if the primary wrote its record before the
+    replica connected; it now waits for that;
+  - a replica that keeps its tail would also have passed if the primary had cut it, since it then
+    fetches the same bytes. The handshake's decisions now have their own test;
+  - new tests cover a torn tail and a damaged record, a silent link on either side, an idle link, a
+    peer that never says hello, and a stream that will not open.
+
+### Found by re-checking the fixes
+
+The re-check confirmed all twelve fixes and found the new tests sound. Its findings:
+- **A warm replica could still lose its own snapshot for good.** The fix above stops a held-back
+  primary from writing its startup snapshot past what it published. But the warm replica's own
+  snapshot can lie there too: after a power loss leaves the stream's header behind, or while a
+  restarted primary holds records back. A warm replica that started then found its snapshot
+  invalid, rebuilt from sequence 1, and wrote no snapshots for the rest of its life. This could
+  happen without replication too, whenever a warm replica starts before its primary after a power
+  loss. Now a snapshot whose checkpoint is a command boundary of the journal, but which the stream
+  cannot open yet, counts as ahead, not invalid. The warm replica still rebuilds from sequence 1,
+  which is safe, and writes no snapshot behind that one, so the restart point never moves back. Whether a snapshot is ahead is decided from the journal, not from the
+  stream's header, which a running primary may be rewriting. Waiting for the stream to catch up
+  was rejected: with the primary dead, the warm replica could then never be promoted.
+- **The hello was computed again before every dial.** Without its stream, its checksum covers the
+  whole copy, and while the primary was unreachable the replica re-read it every second or two. It
+  is now reused until the copy changes. A cut clears it: a copy refilled to the same length can
+  hold other bytes.
+- **A final check of these two fixes found both first versions wrong,** in ways their tests did not
+  show:
+  - the cached hello survived a cut. A replica refilled to the same length then described the bytes
+    it had cut, and the primary, seeing a difference, cut a record it had just acknowledged;
+  - the warm replica wrote its first snapshot at its first command, behind the one it had found.
+
+  Each now has a test that fails without its fix.
+- **A test bound was tight:** the slow-peer test now allows 4 s, still less than the 5 s the old
+  listener needed.
+- **Not changed:** a promotion still binds the replication port only after fencing the old primary,
+  as it binds the customer and operator ports. A port already in use then leaves no primary until
+  the operator starts one; recorded as a limitation.
+- **Docs:**
+  - the tests were listed under the wrong headings;
+  - the count of removals was off by one;
+  - a measurement said 197 syncs where one run had 196;
+  - the note that allows a stream under `/dev/shm` now excludes the replica's, whose published end
+    is the committed end it reports.
+
+### Verification
+
+Tests, with a primary and a replica over a real TCP connection on one machine:
+- `a_command_is_answered_only_once_the_replica_holds_it`: without a replica a deposit gets no answer
+  and the primary reports "paused"; once the replica connects, the answer arrives, the journals
+  are byte-identical, and the replica's stream publishes both commands;
+- `a_replica_that_loses_its_link_comes_back_and_the_primary_waits_meanwhile`;
+- `running_alone_releases_a_paused_primary_until_a_replica_catches_up`: running alone answers the
+  waiting deposit and the next one, and a replica that catches up turns it off by itself;
+- `a_replica_holding_what_a_restarted_primary_lost_takes_the_primarys_records`: the case the first
+  version got wrong. The replica holds a record the restarted primary never had, and the primary
+  has written a different record of the same length in its place before the replica connects;
+- `a_replica_keeps_what_it_holds_and_publishes_it_once_committed`: a copy whose stream published
+  nothing, as after a power loss before the stream was ever written back, keeps its journal
+  untouched and publishes all of it;
+- `a_replica_of_another_journal_is_refused_and_left_untouched`;
+- `a_restarted_primary_publishes_and_serves_nothing_before_its_replica_holds_it`: a primary whose
+  stream is gone answers, publishes and snapshots nothing until its replica has the whole journal;
+- `an_idle_link_stays_up`: heartbeats keep a link with nothing to send up past the link timeout;
+- `a_peer_that_never_says_hello_holds_up_no_replica`;
+- `a_replica_whose_stream_belongs_to_another_journal_stops`.
+
+With the test playing one side over a socket:
+- `a_replica_publishes_only_up_to_the_commit_point`: the replica confirms two records and publishes
+  neither, then each as the commit point reaches it, and a commit point beyond its journal ends the
+  session;
+- `the_handshake_keeps_an_identical_tail_cuts_a_different_one_and_refuses_lost_history`: an
+  identical tail is kept; one byte different, or longer than the primary's journal, is cut back to
+  the committed end; a committed end the primary lacks, or one that is not its command boundary, is
+  refused;
+- `a_silent_link_is_dropped_on_both_sides`: a primary that welcomes the replica and falls silent,
+  and a replica that never answers;
+- `a_replica_refilled_after_a_cut_describes_its_new_bytes`: cut back, refilled to the same length
+  with another record, and dialing again before the commit point moved.
+
+Without a connection:
+- `frames_are_bounded_and_positions_round_trip`: a frame longer than the one expected is refused
+  before anything is allocated;
+- `a_replica_cuts_a_torn_tail_and_refuses_a_damaged_record`;
+- `a_file_checksum_read_in_chunks_equals_the_checksum_of_its_bytes`;
+- `a_snapshot_ahead_of_the_stream_is_kept_and_snapshots_continue`: a warm replica whose snapshot
+  lies beyond what the stream published rebuilds the published part and keeps that snapshot, then
+  writes the next one past it once the primary publishes the rest.
+
+`cargo fmt -- --check` is clean. `cargo test --locked` passes: 197 unit tests and the executable
+integration tests. All three PostgreSQL acceptance tests pass, and the release build still has its
+12 warnings. Each test written for a review finding, or for the commit point, fails when its fix is
+removed: nine removals with `~/stock-scripts/m23p4-mutate.sh`, on a throwaway copy of the tree,
+three with `m23p4-mutate2.sh` for the later fixes, and one by hand for the commit point. Every one
+failed, one of them by hanging until killed.
+
+Live, a primary and a replica in two containers on the office Ubuntu machine, each with its own
+volume and network address (`~/stock-scripts/m23p4-live.sh`). Commands came from the operator port:
+1. **No replica.** `/replication` showed "paused", `/health` answered 503, and opening a day got no
+   answer within 3 s.
+2. **The replica connected.** The waiting open was applied and the mode turned synchronous. The day
+   was closed, and the journals were byte-identical (477 bytes).
+3. **The replica was killed.** The next open waited. After 3.1 s the operator ran the primary alone,
+   and the open was applied.
+4. **The replica restarted.** It resumed at byte 477, caught up, and the primary logged "the replica
+   caught up; synchronous again". Journals identical, 1,175 bytes.
+5. **The primary was killed and restarted.** The replica reconnected and resumed at byte 1,175, its
+   whole copy. Journals identical, 1,386 bytes.
+6. **The replica restarted without its stream file.** It kept its whole journal and resumed at byte
+   1,386 instead of fetching it again. Journals identical, 1,632 bytes.
+7. **The network was cut** (`docker network disconnect`), so no packet arrived on either side. The
+   primary dropped the silent link after 9.9 s; the replica, after the same timeout, logged
+   "nothing heard from the other side in time". Once the network was back, the replica was attached
+   again 11.1 s after the cut. Journals identical, 1,843 bytes.
+
+The live run was repeated twice more, after each later round of fixes: the same seven steps and
+journal sizes, with the link dropped after 9.8 and 10.2 s and the replica back 10.8 and 11.3 s
+after the cut.
+
+Measured, with both containers sharing the machine's 2 cores and its SSD
+(`docs/performance/10-synchronous-replication.md`):
+
+| | Alone | Replicated | Replica's files in memory |
+|---|---|---|---|
+| Maximum rate, orders/s, two runs | 44,610 and 43,968 | 32,372 and 34,511 | 45,274 and 40,081 |
+| 5,000 orders/s, p50 | 7.4 and 7.5 ms | 14.7 and 12.3 ms | 7.5 and 7.0 ms |
+| 5,000 orders/s, p99 | 18.3 and 25.6 ms | 53.3 and 31.9 ms | 25.2 and 27.0 ms |
+
+With the replica's files in memory there is no difference beyond the noise: on this machine the
+whole cost is the replica's sync waiting for the same disk as the primary's. After each replicated
+run the two journals were byte-identical.

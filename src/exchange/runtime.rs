@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{net::SocketAddr, path::Path, sync::Arc};
 
 use crate::{
     exchange::{
@@ -7,7 +7,8 @@ use crate::{
             SessionError,
         },
         event_store::{EventStore, EventStoreError, MAX_RECORD_LEN, encode_record},
-        event_stream::{DEFAULT_CAPACITY, StreamWriter},
+        event_stream::{DEFAULT_CAPACITY, StreamWriter, already_published},
+        replication::Replication,
         snapshot::{self, SnapshotBoundary},
     },
     types::{
@@ -32,6 +33,13 @@ pub struct ExchangeRuntime {
     /// `ExchangeRuntime::new` want. The server always supplies a store.
     store: Option<EventStore>,
     stream: Option<StreamWriter>,
+    /// The link to the replica on the other machine, when the journal is replicated. Every group
+    /// then waits for the replica's confirmation before it is published or answered.
+    replication: Option<Arc<Replication>>,
+    /// With replication, startup publishes only what was already published, since the replica
+    /// may not hold the rest. This is the journal's recovered end and last sequence, published,
+    /// and served, once the replica confirms it.
+    held: Option<(u64, u64)>,
 }
 
 /// How much the journal grows between core snapshots, as a multiple of the last snapshot's size.
@@ -665,6 +673,8 @@ impl ExchangeRuntime {
             next_event_seq: 1,
             store: None,
             stream: None,
+            replication: None,
+            held: None,
         }
     }
 
@@ -704,6 +714,8 @@ impl ExchangeRuntime {
             next_event_seq,
             store,
             stream: None,
+            replication: None,
+            held: None,
         })
     }
 
@@ -723,6 +735,8 @@ impl ExchangeRuntime {
             next_event_seq,
             store: Some(store),
             stream: None,
+            replication: None,
+            held: None,
         }
     }
 
@@ -750,7 +764,48 @@ impl ExchangeRuntime {
         .map(|_| ())
     }
 
+    /// Replicates the journal from now on: listens on `address` for the replica on the other
+    /// machine. Called before `run`; every group then waits for the replica's confirmation.
+    pub fn replicate(&mut self, address: SocketAddr) -> std::io::Result<Arc<Replication>> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("an in-memory exchange has no journal"))?;
+        let end = store
+            .end()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let replication = Replication::listen(
+            address,
+            store.file().try_clone()?,
+            store.journal_id(),
+            end,
+            self.next_event_seq,
+        )?;
+        self.replication = Some(Arc::clone(&replication));
+        Ok(replication)
+    }
+
+    /// Startup's last step with replication: waits until the replica holds the whole recovered
+    /// journal, then publishes what was held back. No command is served before.
+    fn release_held(&mut self) -> Result<(), RuntimeFailure> {
+        let Some((end, last_sequence)) = self.held.take() else {
+            return Ok(());
+        };
+        if let Some(replication) = &self.replication {
+            replication.confirm(end);
+        }
+        self.stream
+            .as_mut()
+            .expect("a held runtime has a stream")
+            .publish_through(end, last_sequence)
+            .map_err(RuntimeFailure::Stream)
+    }
+
     pub fn run(mut self) {
+        if let Err(err) = self.release_held() {
+            eprintln!("exchange worker halted: {err}. No further commands accepted.");
+            return;
+        }
         let mut group = Vec::with_capacity(MAX_GROUP);
         while let Some(first) = self.rx.blocking_recv() {
             // Natural batching: whatever queued up while the previous group was syncing becomes
@@ -1010,9 +1065,23 @@ impl ExchangeRuntime {
         }
         if let Some(store) = self.store.as_mut() {
             let records: Vec<&[u8]> = staged.iter().map(|s| s.record.as_slice()).collect();
-            store
-                .append_record(&records.concat())
-                .map_err(RuntimeFailure::Store)?;
+            let records = records.concat();
+            if let Some(replication) = &self.replication {
+                // The group goes to the replica while this disk syncs, then waits for both:
+                // nothing that exists on one machine only is ever published or answered.
+                store
+                    .write_records(&records)
+                    .map_err(RuntimeFailure::Store)?;
+                let end = store.end().map_err(RuntimeFailure::Store)?;
+                let next_sequence = staged.last().expect("a group").last_sequence + 1;
+                replication.written(end, next_sequence);
+                store.sync().map_err(RuntimeFailure::Store)?;
+                replication.confirm(end);
+            } else {
+                store
+                    .append_record(&records)
+                    .map_err(RuntimeFailure::Store)?;
+            }
         }
         for command in staged {
             // Only now is the command part of history and visible to callbacks.
@@ -1139,7 +1208,7 @@ pub fn recover_runtime_with_stream(
     stream_path: impl AsRef<Path>,
 ) -> Result<ExchangeRuntime, StartupError> {
     let mut runtime = recover_runtime(rx, journal_path)?;
-    attach_stream(&mut runtime, stream_path.as_ref())?;
+    attach_stream(&mut runtime, stream_path.as_ref(), false)?;
     Ok(runtime)
 }
 
@@ -1152,9 +1221,43 @@ pub fn recover_runtime_with_stream_and_snapshot(
     stream_path: impl AsRef<Path>,
     snapshot_path: impl AsRef<Path>,
 ) -> Result<ExchangeRuntime, StartupError> {
-    let journal_path = journal_path.as_ref().to_path_buf();
-    let stream_path = stream_path.as_ref().to_path_buf();
-    let snapshot_path = snapshot_path.as_ref().to_path_buf();
+    recover_from_files(
+        rx,
+        journal_path.as_ref(),
+        stream_path.as_ref(),
+        snapshot_path.as_ref(),
+        false,
+    )
+}
+
+/// The same for a replicated journal, except that it publishes nothing beyond what the stream
+/// had already published: the replica may not hold the rest yet. `run` publishes it, and starts
+/// serving, once the replica confirms it (attach the link with `replicate` first).
+pub fn recover_replicated_runtime(
+    rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
+    journal_path: impl AsRef<Path>,
+    stream_path: impl AsRef<Path>,
+    snapshot_path: impl AsRef<Path>,
+) -> Result<ExchangeRuntime, StartupError> {
+    recover_from_files(
+        rx,
+        journal_path.as_ref(),
+        stream_path.as_ref(),
+        snapshot_path.as_ref(),
+        true,
+    )
+}
+
+fn recover_from_files(
+    rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
+    journal_path: &Path,
+    stream_path: &Path,
+    snapshot_path: &Path,
+    hold: bool,
+) -> Result<ExchangeRuntime, StartupError> {
+    let journal_path = journal_path.to_path_buf();
+    let stream_path = stream_path.to_path_buf();
+    let snapshot_path = snapshot_path.to_path_buf();
 
     let (mut runtime, snapshot_is_safe_to_replace) =
         match snapshot::load(&snapshot_path, &journal_path) {
@@ -1177,10 +1280,14 @@ pub fn recover_runtime_with_stream_and_snapshot(
             }
         };
 
-    attach_stream(&mut runtime, &stream_path)?;
+    attach_stream(&mut runtime, &stream_path, hold)?;
     // ONE fresh snapshot of the recovered core before the exchange accepts any command. From then
     // on the trading thread writes no snapshots; the warm replica keeps the checkpoint current.
+    // None while records are held back: it would stand beyond what the stream published, and a
+    // warm replica starting before the replica confirmed them would have to rebuild from
+    // sequence 1.
     if snapshot_is_safe_to_replace
+        && runtime.held.is_none()
         && let Err(error) = runtime.write_snapshot(&snapshot_path, &stream_path)
     {
         // This does not affect a durable, replayable exchange. An older snapshot, if any, stays.
@@ -1204,27 +1311,45 @@ pub(crate) fn promote_replica(
     replica: ReplicaCore,
     suffix: Vec<EventEnvelope>,
     stream_path: impl AsRef<Path>,
+    hold: bool,
 ) -> Result<ExchangeRuntime, StartupError> {
     let (core, next_event_seq) = replica.into_parts();
     let (core, next_event_seq) =
         replay_suffix(core, next_event_seq, &suffix).map_err(StartupError::Replay)?;
     let mut runtime =
         ExchangeRuntime::from_snapshot_suffix(rx, store, core, suffix, next_event_seq);
-    attach_stream(&mut runtime, stream_path.as_ref())?;
+    attach_stream(&mut runtime, stream_path.as_ref(), hold)?;
     Ok(runtime)
 }
 
 /// Opens the mmap stream at the recovered end. It refuses a journal that ends before what the
-/// stream already published.
-fn attach_stream(runtime: &mut ExchangeRuntime, stream_path: &Path) -> Result<(), StartupError> {
-    let stream = StreamWriter::open(
+/// stream already published. With `hold`, for a replicated journal, it publishes only what the
+/// stream had already published, and the runtime holds the rest until the replica confirms it.
+fn attach_stream(
+    runtime: &mut ExchangeRuntime,
+    stream_path: &Path,
+    hold: bool,
+) -> Result<(), StartupError> {
+    let journal = runtime.store.as_ref().unwrap().file();
+    let last_sequence = runtime.next_event_seq - 1;
+    let end = journal.metadata().map_err(StartupError::Stream)?.len();
+    let published = if hold {
+        already_published(stream_path, journal).map_err(StartupError::Stream)?
+    } else {
+        (end, last_sequence)
+    };
+    let stream = StreamWriter::open_at(
         stream_path,
-        runtime.store.as_ref().unwrap().file(),
-        runtime.next_event_seq - 1,
+        journal,
+        last_sequence,
+        published,
         DEFAULT_CAPACITY,
     )
     .map_err(StartupError::Stream)?;
     runtime.stream = Some(stream);
+    if published.0 < end {
+        runtime.held = Some((end, last_sequence));
+    }
     Ok(())
 }
 

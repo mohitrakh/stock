@@ -188,10 +188,27 @@ pub struct StreamWriter {
 impl StreamWriter {
     /// The caller owns the journal's lifetime writer lock and has completed deterministic replay.
     /// Recovery publishes the entire validated journal as readable, with an initially empty cache.
+    /// Production goes through `open_at`, which can also hold records back.
+    #[cfg(test)]
     pub(super) fn open(
         path: impl AsRef<Path>,
         journal: &File,
         last_sequence: u64,
+        capacity: usize,
+    ) -> io::Result<Self> {
+        let end = journal.metadata()?.len();
+        Self::open_at(path, journal, last_sequence, (end, last_sequence), capacity)
+    }
+
+    /// Like `open`, but publishes only up to `published`: the journal end, and the last sequence
+    /// before it, that readers may see. A replicated journal holds back the records its replica
+    /// has not confirmed yet, and publishes them later with `publish_through`. `last_sequence` is
+    /// the journal's own, for the check against what the stream already published.
+    pub(super) fn open_at(
+        path: impl AsRef<Path>,
+        journal: &File,
+        last_sequence: u64,
+        published: (u64, u64),
         capacity: usize,
     ) -> io::Result<Self> {
         if !(1..=MAX_CAPACITY).contains(&capacity) {
@@ -259,6 +276,12 @@ impl StreamWriter {
             }
         }
         drop(unlock);
+        if published.0 < JOURNAL_HEADER_LEN as u64
+            || published.0 > metadata.len()
+            || published.1 > last_sequence
+        {
+            return Err(invalid("cannot publish beyond the journal"));
+        }
         let mut writer = Self {
             mapping: Mapping {
                 file,
@@ -266,14 +289,34 @@ impl StreamWriter {
                 capacity,
             },
             journal_id,
-            end: metadata.len(),
-            last_sequence,
+            end: published.0,
+            last_sequence: published.1,
             cache: Vec::new(),
             #[cfg(test)]
             fail_publish: false,
         };
         writer.publish(None)?;
         Ok(writer)
+    }
+
+    /// Publishes the journal up to `end` without appending a record: readers read what lies
+    /// between from the journal. Used by a replicated primary once its replica confirms what it
+    /// held back, and by the replica, which keeps no records in memory.
+    pub(super) fn publish_through(&mut self, end: u64, last_sequence: u64) -> io::Result<()> {
+        if end < self.end || last_sequence < self.last_sequence {
+            return Err(invalid("stream publication cannot move backwards"));
+        }
+        self.end = end;
+        self.last_sequence = last_sequence;
+        // The cache window must end where the published journal ends.
+        self.cache.clear();
+        self.publish(None)
+    }
+
+    /// Writes the header to disk. A stream is a cache and is otherwise never synced; the replica
+    /// syncs its own, because what it published is the committed end it reports to the primary.
+    pub(super) fn sync_header(&self) -> io::Result<()> {
+        self.mapping.map.flush_range(0, HEADER)
     }
 
     /// Called only AFTER durable append and core commit. Oversized batches bypass the cache;
@@ -515,7 +558,28 @@ impl StreamReader {
     }
 }
 
-fn record_length(header: &[u8]) -> io::Result<usize> {
+/// The journal end, and the last sequence before it, that the stream file at `path` already
+/// published for this journal: a whole header with a valid checksum. Otherwise nothing beyond
+/// the journal header. Read without the stream lock: only the journal's writer, who holds the
+/// journal's writer lock and calls this, ever writes the stream.
+pub(crate) fn already_published(path: impl AsRef<Path>, journal: &File) -> io::Result<(u64, u64)> {
+    let journal_id = journal_id_of(journal)?;
+    let nothing = (JOURNAL_HEADER_LEN as u64, 0);
+    let mut header = [0; 68];
+    let Ok(file) = File::open(path) else {
+        return Ok(nothing);
+    };
+    if file.read_exact_at(&mut header, 0).is_err()
+        || &header[..8] != MAGIC
+        || journal_id_at(&header) != journal_id
+        || crc32(&header[..64]) != u32::from_le_bytes(header[64..68].try_into().unwrap())
+    {
+        return Ok(nothing);
+    }
+    Ok((word(&header, 32), word(&header, 40)))
+}
+
+pub(super) fn record_length(header: &[u8]) -> io::Result<usize> {
     if header.len() < RECORD_HEADER_LEN {
         return Err(invalid("incomplete record header"));
     }
@@ -526,7 +590,7 @@ fn record_length(header: &[u8]) -> io::Result<usize> {
     Ok(RECORD_HEADER_LEN + len as usize)
 }
 
-fn read_record(file: &File, offset: u64, committed_end: u64) -> io::Result<Vec<u8>> {
+pub(super) fn read_record(file: &File, offset: u64, committed_end: u64) -> io::Result<Vec<u8>> {
     if offset
         .checked_add(RECORD_HEADER_LEN as u64)
         .is_none_or(|end| end > committed_end)
@@ -551,7 +615,7 @@ fn read_record(file: &File, offset: u64, committed_end: u64) -> io::Result<Vec<u
     Ok(bytes)
 }
 
-fn decode_batch(bytes: &[u8], first_sequence: u64) -> io::Result<Vec<EventEnvelope>> {
+pub(super) fn decode_batch(bytes: &[u8], first_sequence: u64) -> io::Result<Vec<EventEnvelope>> {
     if record_length(bytes)? != bytes.len()
         || crc32(&bytes[8..]) != u32::from_le_bytes(bytes[4..8].try_into().unwrap())
     {

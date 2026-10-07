@@ -97,7 +97,7 @@ impl From<std::io::Error> for EventStoreError {
 }
 
 /// The journal id in a header, or why the bytes are not a journal header this build can read.
-fn parse_header(header: &[u8]) -> Result<Uuid, EventStoreError> {
+pub(super) fn parse_header(header: &[u8]) -> Result<Uuid, EventStoreError> {
     if header.starts_with(OLD_FILE_MAGIC) {
         return Err(EventStoreError::OldFormat);
     }
@@ -128,6 +128,15 @@ fn check_journal_id(file: &File, expected: Uuid) -> Result<(), EventStoreError> 
     Ok(())
 }
 
+/// Syncs the directory holding `path`, so that a file just created there survives a power loss.
+pub(super) fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
 /// Reads the id of an open journal from its header, without moving the file's cursor.
 pub(crate) fn journal_id_of(file: &File) -> io::Result<Uuid> {
     let mut header = [0; JOURNAL_HEADER_LEN];
@@ -149,9 +158,24 @@ pub(crate) fn journal_id_of(file: &File) -> io::Result<Uuid> {
 /// writing a snapshot, and a seventh of a warm replica's replay (milestone 23 part 3).
 /// `crc32_matches_known_vector` pins the standard check value.
 pub(super) fn crc32(data: &[u8]) -> u32 {
-    const CRC32: crc::Crc<u32, crc::Table<16>> =
-        crc::Crc::<u32, crc::Table<16>>::new(&crc::CRC_32_ISO_HDLC);
     CRC32.checksum(data)
+}
+
+const CRC32: crc::Crc<u32, crc::Table<16>> =
+    crc::Crc::<u32, crc::Table<16>>::new(&crc::CRC_32_ISO_HDLC);
+
+/// The same checksum over the file's bytes `from..to`, read a megabyte at a time: a long stretch of
+/// journal never has to fit in memory.
+pub(super) fn crc32_of_file(file: &File, mut from: u64, to: u64) -> io::Result<u32> {
+    let mut digest = CRC32.digest();
+    let mut chunk = vec![0; 1024 * 1024];
+    while from < to {
+        let len = (to - from).min(chunk.len() as u64) as usize;
+        file.read_exact_at(&mut chunk[..len], from)?;
+        digest.update(&chunk[..len]);
+        from += len as u64;
+    }
+    Ok(digest.finalize())
 }
 
 /// An append-only file of durable records, one record per processed command.
@@ -230,11 +254,7 @@ impl EventStore {
             header.extend_from_slice(journal_id.as_bytes());
             file.write_all(&header)?;
             file.sync_all()?;
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            File::open(parent)?.sync_all()?;
+            sync_parent_dir(path)?;
 
             return Ok((Self::from_file(file, journal_id), Vec::new()));
         }
@@ -247,8 +267,10 @@ impl EventStore {
         // Drop a torn tail so the next append cannot be written after damaged bytes.
         if good_len < bytes.len() {
             file.set_len(good_len as u64)?;
-            file.sync_all()?;
         }
+        // Synced even when nothing was cut: a process that died before its sync leaves records
+        // in the page cache only, and recovery is about to serve and publish them as durable.
+        file.sync_all()?;
 
         file.seek(SeekFrom::End(0))?;
 
@@ -314,8 +336,9 @@ impl EventStore {
 
         if good_len < file_len {
             file.set_len(good_len)?;
-            file.sync_all()?;
         }
+        // As in `open`: what was recovered may still be in the page cache only.
+        file.sync_all()?;
         file.seek(SeekFrom::End(0))?;
         Ok((Self::from_file(file, expected), events))
     }
@@ -339,19 +362,34 @@ impl EventStore {
     /// and ONE sync. The runtime publishes the group and releases its replies only after this
     /// returns. Any error is fatal; recovery decides which complete records survived.
     pub(super) fn append_record(&mut self, records: &[u8]) -> Result<(), EventStoreError> {
+        self.write_records(records)?;
+        self.sync()
+    }
+
+    /// The first half of `append_record`: the records are written but not synced yet, so a
+    /// replication sender can read them back and ship them while `sync` runs.
+    pub(super) fn write_records(&mut self, records: &[u8]) -> Result<(), EventStoreError> {
         // One write_all of back-to-back records, so a process crash can only cut the tail of the
         // group: every record before the cut is complete, and recovery drops the torn one. After a
         // power loss, unsynced bytes can survive out of order; a complete record with a bad
         // checksum still refuses startup, exactly as a torn single record always could.
         self.file.write_all(records)?;
+        Ok(())
+    }
+
+    pub(super) fn sync(&mut self) -> Result<(), EventStoreError> {
         self.file.sync_all()?;
         JOURNAL_SYNCS.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         {
             self.syncs += 1;
         }
-
         Ok(())
+    }
+
+    /// Where the next record will start: the journal's length.
+    pub(super) fn end(&self) -> Result<u64, EventStoreError> {
+        Ok(self.file.metadata()?.len())
     }
 
     pub(super) fn file(&self) -> &File {
@@ -490,6 +528,21 @@ mod tests {
             crc32(b"The quick brown fox jumps over the lazy dog"),
             0x414F_A339
         );
+    }
+
+    #[test]
+    fn a_file_checksum_read_in_chunks_equals_the_checksum_of_its_bytes() {
+        let path = temp_path("crc-of-file");
+        let bytes: Vec<u8> = (0..2_500_000u32).map(|i| (i * 7 + i / 255) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        let (from, to) = (5, bytes.len() - 3);
+        assert_eq!(
+            crc32_of_file(&file, from as u64, to as u64).unwrap(),
+            crc32(&bytes[from..to])
+        );
+        assert_eq!(crc32_of_file(&file, 9, 9).unwrap(), 0);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

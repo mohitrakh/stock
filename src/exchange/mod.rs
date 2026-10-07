@@ -7,6 +7,8 @@ pub mod event_store;
 pub mod event_stream;
 pub mod market_data;
 pub mod operator;
+pub mod replica;
+pub mod replication;
 pub mod reporter;
 pub mod runtime;
 pub mod snapshot;

@@ -178,13 +178,27 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     std::fs::create_dir_all(&config.dir).map_err(|error| error.to_string())?;
     let journal = config.dir.join("bench-events.log");
     let (tx, rx) = mpsc::channel(crate::EXCHANGE_COMMAND_QUEUE_SIZE);
-    let runtime = recover_runtime_with_stream_and_snapshot(
+    let mut runtime = recover_runtime_with_stream_and_snapshot(
         rx,
         &journal,
         config.dir.join("bench-events.log.mmap"),
         config.dir.join("bench-events.log.snapshot"),
     )
     .map_err(|error| error.to_string())?;
+    // With `REPLICATION_LISTEN_ADDR` set, every group waits for a replica, as on a real primary:
+    // start `--replica` against this address, or the first command waits for good.
+    if let Ok(address) = std::env::var("REPLICATION_LISTEN_ADDR") {
+        let address = address
+            .parse()
+            .map_err(|error| format!("REPLICATION_LISTEN_ADDR: {error}"))?;
+        let replication = runtime
+            .replicate(address)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "bench: replicating, waiting for the replica on {}",
+            replication.address()
+        );
+    }
     let worker = thread::spawn(move || runtime.run());
 
     let now = SystemTime::now()

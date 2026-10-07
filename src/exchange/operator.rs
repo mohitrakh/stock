@@ -1,11 +1,13 @@
-//! The operator port: a loopback-only listener that opens and closes the market.
+//! The operator port: a loopback-only listener that opens and closes the market, and shows and
+//! controls replication.
 //!
 //! Opening and closing are exchange commands like any other: the single worker processes them, they
 //! are journaled, and replay reproduces them. This listener only turns an operator's HTTP request
-//! into that command. Like the warm replica's management port it is unauthenticated, so it accepts
-//! loopback addresses only.
+//! into that command. Replication is shown and switched to running alone directly, since a paused
+//! worker answers no command. Like the warm replica's management port it is unauthenticated, so it
+//! accepts loopback addresses only.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -18,6 +20,7 @@ use chrono::NaiveDate;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
+use super::replication::Replication;
 use crate::types::types::{ExchangeCommand, SessionView};
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:4004";
@@ -41,17 +44,29 @@ struct OpenRequest {
     trading_day: NaiveDate,
 }
 
-pub fn router(exchange: Exchange) -> Router {
+#[derive(Clone)]
+struct Operator {
+    exchange: Exchange,
+    replication: Option<Arc<Replication>>,
+}
+
+pub fn router(exchange: Exchange, replication: Option<Arc<Replication>>) -> Router {
     Router::new()
         .route("/session", get(session))
         .route("/session/open", post(open))
         .route("/session/close", post(close))
-        .with_state(exchange)
+        .route("/replication", get(replication_status))
+        .route("/replication/run-alone", post(run_alone))
+        .with_state(Operator {
+            exchange,
+            replication,
+        })
 }
 
-async fn session(State(exchange): State<Exchange>) -> Response {
+async fn session(State(operator): State<Operator>) -> Response {
     let (respond_to, reply) = oneshot::channel();
-    if exchange
+    if operator
+        .exchange
         .send(ExchangeCommand::GetSession { respond_to })
         .await
         .is_err()
@@ -64,19 +79,44 @@ async fn session(State(exchange): State<Exchange>) -> Response {
     }
 }
 
-async fn open(State(exchange): State<Exchange>, Json(request): Json<OpenRequest>) -> Response {
-    change(&exchange, |respond_to| ExchangeCommand::OpenMarket {
-        trading_day: request.trading_day,
-        respond_to,
+async fn open(State(operator): State<Operator>, Json(request): Json<OpenRequest>) -> Response {
+    change(&operator.exchange, |respond_to| {
+        ExchangeCommand::OpenMarket {
+            trading_day: request.trading_day,
+            respond_to,
+        }
     })
     .await
 }
 
-async fn close(State(exchange): State<Exchange>) -> Response {
-    change(&exchange, |respond_to| ExchangeCommand::CloseMarket {
-        respond_to,
+async fn close(State(operator): State<Operator>) -> Response {
+    change(&operator.exchange, |respond_to| {
+        ExchangeCommand::CloseMarket { respond_to }
     })
     .await
+}
+
+/// Where replication stands: synchronous, paused, or running alone. 404 when the journal is not
+/// replicated.
+async fn replication_status(State(operator): State<Operator>) -> Response {
+    match &operator.replication {
+        Some(replication) => Json(replication.status()).into_response(),
+        None => not_replicated(),
+    }
+}
+
+/// Lets a paused primary continue without its replica. Acknowledged commands then exist on this
+/// machine only until a replica catches up again, which switches this back off. Never do this and
+/// promote the replica too.
+async fn run_alone(State(operator): State<Operator>) -> Response {
+    match &operator.replication {
+        Some(replication) => Json(replication.run_alone()).into_response(),
+        None => not_replicated(),
+    }
+}
+
+fn not_replicated() -> Response {
+    (StatusCode::NOT_FOUND, "the journal is not replicated").into_response()
 }
 
 /// 200 with the new session; 409 when the session refused the change, which is journaled like any
@@ -156,7 +196,7 @@ mod tests {
             .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
             .unwrap();
         let address = listener.local_addr().unwrap();
-        let app = router(exchange.clone());
+        let app = router(exchange.clone(), None);
         server.spawn(async move { axum::serve(listener, app).await });
 
         assert_eq!(

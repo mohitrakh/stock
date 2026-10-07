@@ -32,9 +32,12 @@ mod db;
 mod state;
 use state::AppState;
 
-use crate::exchange::runtime::{
-    DEFAULT_SNAPSHOT_GROWTH, ExchangeRuntime, promote_replica,
-    recover_runtime_with_stream_and_snapshot,
+use crate::exchange::{
+    replication::Replication,
+    runtime::{
+        DEFAULT_SNAPSHOT_GROWTH, ExchangeRuntime, promote_replica, recover_replicated_runtime,
+        recover_runtime_with_stream_and_snapshot,
+    },
 };
 
 const EXCHANGE_COMMAND_QUEUE_SIZE: usize = 10_000;
@@ -72,10 +75,20 @@ async fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--replica") {
+        // The second machine's copy of the journal: it has no exchange core, no customer port
+        // and no database. It runs until the primary refuses it.
+        if let Err(error) = exchange::replica::run(&args[1..]) {
+            eprintln!("replica: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--warm-replica") {
-        // A promoted warm replica checks login tokens: refuse now, not after it has fenced the
-        // old primary.
+        // A promoted warm replica checks login tokens and may replicate: refuse a missing secret
+        // or a bad address now, not after it has fenced the old primary.
         require_jwt_secret();
+        let replicating = replication_address_or_exit();
         let promotion = exchange::warm_replica::run(&args[1..], snapshot_growth_or_exit())
             .await
             .unwrap_or_else(|error| {
@@ -90,24 +103,32 @@ async fn main() {
             stream_path,
         } = promotion;
         let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
-        let runtime =
-            promote_replica(rx, store, replica, suffix, &stream_path).unwrap_or_else(|error| {
-                eprintln!("refusing to promote: {error}");
-                eprintln!("event log: {}", journal_path.display());
-                eprintln!("event stream: {}", stream_path.display());
-                eprintln!("Preserve the durable history and resolve the reported error.");
-                std::process::exit(1);
-            });
+        let mut runtime = promote_replica(
+            rx,
+            store,
+            replica,
+            suffix,
+            &stream_path,
+            replicating.is_some(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("refusing to promote: {error}");
+            eprintln!("event log: {}", journal_path.display());
+            eprintln!("event stream: {}", stream_path.display());
+            eprintln!("Preserve the durable history and resolve the reported error.");
+            std::process::exit(1);
+        });
         println!(
             "Warm replica promoted through event sequence {}",
             runtime.next_event_sequence().saturating_sub(1)
         );
-        serve_primary(runtime, tx).await;
+        let replication = replicate_or_exit(&mut runtime, replicating);
+        serve_primary(runtime, tx, replication).await;
         return;
     }
     if !args.is_empty() {
         eprintln!(
-            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR] | --bench EMPTY_DIR [OPTIONS]]"
+            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --replica PRIMARY_ADDR JOURNAL STREAM | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR] | --bench EMPTY_DIR [OPTIONS]]"
         );
         std::process::exit(1);
     }
@@ -123,14 +144,24 @@ async fn main() {
 
     // Recovery happens before the listener binds, and on the main thread. History that cannot be
     // trusted must stop the process, not kill a worker thread and leave a server answering
-    // requests it can never fulfil.
-    let runtime = recover_runtime_with_stream_and_snapshot(
-        rx,
-        &event_log_path,
-        &event_stream_path,
-        &event_snapshot_path,
-    )
-    .unwrap_or_else(|err| {
+    // requests it can never fulfil. A replicated journal publishes nothing its replica may lack.
+    let replicating = replication_address_or_exit();
+    let recovered = if replicating.is_some() {
+        recover_replicated_runtime(
+            rx,
+            &event_log_path,
+            &event_stream_path,
+            &event_snapshot_path,
+        )
+    } else {
+        recover_runtime_with_stream_and_snapshot(
+            rx,
+            &event_log_path,
+            &event_stream_path,
+            &event_snapshot_path,
+        )
+    };
+    let mut runtime = recovered.unwrap_or_else(|err| {
         eprintln!("refusing to start: {}", err);
         eprintln!("event log: {}", event_log_path);
         eprintln!("event stream: {}", event_stream_path);
@@ -144,7 +175,35 @@ async fn main() {
         event_log_path,
         runtime.next_event_sequence().saturating_sub(1)
     );
-    serve_primary(runtime, tx).await;
+    let replication = replicate_or_exit(&mut runtime, replicating);
+    serve_primary(runtime, tx, replication).await;
+}
+
+/// `REPLICATION_LISTEN_ADDR`: where the primary listens for its replica on the other machine.
+/// Unset, the journal is not replicated. The link is neither authenticated nor encrypted: use a
+/// private network.
+fn replication_address_or_exit() -> Option<SocketAddr> {
+    let value = std::env::var("REPLICATION_LISTEN_ADDR").ok()?;
+    Some(value.parse().unwrap_or_else(|error| {
+        eprintln!("REPLICATION_LISTEN_ADDR is not a socket address: {error}");
+        std::process::exit(1);
+    }))
+}
+
+fn replicate_or_exit(
+    runtime: &mut ExchangeRuntime,
+    address: Option<SocketAddr>,
+) -> Option<Arc<Replication>> {
+    let address = address?;
+    let replication = runtime.replicate(address).unwrap_or_else(|error| {
+        eprintln!("could not listen for the replica on {address}: {error}");
+        std::process::exit(1);
+    });
+    println!(
+        "Replicating the journal: waiting for the replica on {}",
+        replication.address()
+    );
+    Some(replication)
 }
 
 /// The primary signs and checks login tokens with `JWT_SECRET`. Without it, refuse to start, before
@@ -172,6 +231,7 @@ fn snapshot_growth_or_exit() -> u64 {
 async fn serve_primary(
     runtime: ExchangeRuntime,
     tx: tokio::sync::mpsc::Sender<crate::types::types::ExchangeCommand>,
+    replication: Option<Arc<Replication>>,
 ) {
     // The runtime has already recovered and, in a promotion, fenced the old writer. Database
     // availability must not decide whether untrusted durable history is accepted.
@@ -196,13 +256,14 @@ async fn serve_primary(
             std::process::exit(1);
         });
     println!("Operator port is listening on {operator_address}");
-    let operator = exchange::operator::router(tx.clone());
+    let operator = exchange::operator::router(tx.clone(), replication.clone());
     tokio::spawn(async move { axum::serve(operator_listener, operator).await });
 
     let state = AppState {
         db,
         tx,
         exchange_available,
+        replication,
     };
 
     let app = Router::new()
@@ -219,9 +280,20 @@ async fn serve_primary(
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    if state.exchange_available.load(Ordering::Acquire) {
-        (StatusCode::OK, "OK")
-    } else {
+    if !state.exchange_available.load(Ordering::Acquire) {
         (StatusCode::SERVICE_UNAVAILABLE, "exchange unavailable")
+    } else if state
+        .replication
+        .as_ref()
+        .is_some_and(|replication| replication.paused())
+    {
+        // Nothing can be acknowledged until the replica confirms or the operator lets this
+        // primary run alone.
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "paused: waiting for the replica",
+        )
+    } else {
+        (StatusCode::OK, "OK")
     }
 }

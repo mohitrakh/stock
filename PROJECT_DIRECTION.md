@@ -697,7 +697,7 @@ Both independent reviews' findings were fixed (parts 2 and 3).
 
 ## 23. Two Machines
 
-**Status: selected on 2026-10-05; Part 1 complete on 2026-10-05; Parts 2 and 3 complete on 2026-10-06.** Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` for Part 1, then `docs/tasks/19-two-machines.md`. Part 2 as first specified was split in two on 2026-10-06, as recommended: the journal id and restarts in Part 2, promotion and the warm replica's lag in Part 3. Decisions confirmed by the owner:
+**Status: selected on 2026-10-05; Part 1 complete on 2026-10-05; Parts 2 and 3 complete on 2026-10-06; Part 4 complete on 2026-10-07.** Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` for Part 1, then `docs/tasks/19-two-machines.md`. Part 2 as first specified was split in two on 2026-10-06, as recommended: the journal id and restarts in Part 2, promotion and the warm replica's lag in Part 3. Decisions confirmed by the owner:
 - the primary waits for the replica: a command is answered, and becomes visible to anyone, only once it is on both machines' disks;
 - if the replica cannot be reached, the primary pauses until an operator either promotes the replica or tells the primary to run alone;
 - the machines talk over TCP;
@@ -858,6 +858,41 @@ It also found an older gap, recorded below: a primary that dies while publishing
 
 Its re-check confirmed the fixes and that the published-end check never refuses a legitimate promotion. It found that the published end was read under a stream lock that waits, so a primary frozen mid-publication could have made `/promote` hang instead of answering 409; it is now read without waiting, from any header with a valid checksum, as the primary itself trusts it. The back-off on a journal path that names another journal now has a test, and the restart bound is qualified everywhere: it holds while snapshots are being written, plus whatever the warm replica had not applied.
 
+**Part 4, complete (2026-10-07): synchronous replication.** Write-up: `docs/tasks/19-two-machines.md`; measurement: `docs/performance/10-synchronous-replication.md`.
+- **The replica.** `stock --replica PRIMARY_ADDR JOURNAL STREAM` dials the primary's `REPLICATION_LISTEN_ADDR` and keeps a byte-identical copy of the journal, and a stream of its own for a warm replica on that machine. It checks every record (framing, checksum, sequence), appends exactly those bytes, syncs, and confirms. It publishes only up to the commit point, the end both disks hold, keeps no record bytes in memory, and stops if its own disk fails.
+- **The primary waits for it.** Each group is shipped while the primary syncs its own disk, and published and answered only once the replica confirms it. A restarted replicated primary publishes only what its stream had already published, and serves nothing until the replica holds the rest.
+- **The handshake.** The replica's committed end is on both disks, so the primary's journal must reach it at a command boundary with the same next sequence, or the replica is refused. Beyond it, the replica keeps its bytes only if the primary's are identical (CRC-32, read from the files a megabyte at a time); otherwise it cuts back to its committed end, since the primary never synced what it lacks there. A first version compared only positions and sequences: a test showed that a restarted primary can write a different record of the same length in place of one it lost.
+- **Pause, never guess.** Waiting for the replica never times out. `/health` answers 503, the operator port shows the mode (`GET /replication`), and `POST /replication/run-alone` lets the primary continue alone until a replica holds everything it synced.
+- **A silent link is dropped.** The primary sends a frame at least every second and the replica answers each one; either side drops a link silent for 10 s, and the replica dials again.
+- **Compatibility.** No file format changed. Without `REPLICATION_LISTEN_ADDR` the primary behaves as before, except that recovery now always syncs the journal it recovered.
+
+Verified on Linux: `cargo fmt -- --check`, `cargo test --locked` with 197 unit tests plus the integration tests, and all three PostgreSQL acceptance tests. Live, with a primary and a replica in two containers on the office machine, each with its own volume:
+- the primary paused without a replica (503, an open that got no answer) and applied the open when the replica connected;
+- it paused again when the replica was killed, ran alone on request, and turned synchronous again when the replica returned;
+- killed and restarted, it was followed again from where the replica was;
+- the replica, restarted without its stream file, kept its whole journal;
+- with the network cut, both sides dropped the silent link after 10 s, and the replica was back 11 s after the cut.
+
+After every step the two journals were byte-identical. Measured on the same machine, where both containers share 2 cores and one SSD:
+- at the maximum rate, 32,372 and 34,511 orders/s replicated, against 44,610 and 43,968 alone;
+- at 5,000 orders/s, a p50 of 14.7 and 12.3 ms replicated, against 7.4 and 7.5 ms alone;
+- with the replica's files in memory, no difference beyond the noise: on this machine the whole cost is the replica's sync waiting for the same disk;
+- after every replicated run the two journals were byte-identical.
+
+The independent review found nothing that lets a command be answered or published before both disks hold it in normal operation. Its findings, all fixed:
+- a dead link went unnoticed, so after a power loss or a silent network cut the replica never dialed again: heartbeats and a 10 s timeout on both sides now, and a 5 s limit on each dial;
+- a restarted primary trusted records only its page cache held: recovery now always syncs, which closes the same gap without replication;
+- the replica went on after its own disk failed: it now stops;
+- its committed end, from a stream that is never synced, could be about 30 s old after a power loss: its stream's header is now synced within about two seconds of moving;
+- running alone could stay on for good under load: it now ends once the replica holds everything the primary synced;
+- a stream that would not open was never retried;
+- a restart holding records back wrote its startup snapshot past what it published;
+- smaller points about the hello, frame limits, a slow peer, a directory sync and when a promotion reads its replication address.
+
+Two tests could pass without reaching their path, and the new or fixed tests each fail when their fix is removed. A separate check of the replica's memory fix found three of the same problems, and three wording errors in these documents.
+
+Re-checking the fixes, the reviewer confirmed all twelve and found the new tests sound. It found that a warm replica could still lose its own snapshot for good: one beyond what the stream had published, after a power loss left the stream behind or while a restarted primary held records back, was treated as invalid, and the warm replica then wrote no snapshots for the rest of its life. This could happen without replication too. Such a snapshot, at a command boundary of the journal, now counts as ahead, not invalid: the warm replica rebuilds from sequence 1 and writes no snapshot behind it. The replica now reuses its hello until its copy changes instead of re-reading the copy before every dial, a tight test bound was loosened, and the docs' test lists, a count and a sync number were corrected. A final check of those two fixes found both first versions wrong: the cached hello survived a cut, so a replica refilled to the same length could get a record it had just confirmed cut, and the warm replica wrote its first snapshot behind the one it had found. Both are fixed, each with a test that fails without its fix.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -876,7 +911,10 @@ Its re-check confirmed the fixes and that the published-end check never refuses 
 - order records and the per-user execution index hold one trading day; the open replaces both maps, releasing their memory, while the matching engine's order-location map and risk usage keep the capacity of the largest day, and a price level's node slots are freed only when the level empties, which the close guarantees once a day
 - the books hold at most 200,000 resting orders across all symbols, so that the close's one journal record always fits; beyond that an order that would rest is refused (409 `BookFull`) until orders trade, are cancelled, or expire at the close, and one user can fill the book, as there is no per-user share; there is no close spread across several records
 - one order may trade against at most 10,000 resting orders (`TooManyFills`, 409), so that its record always fits the 64 MiB limit; a client that wants more must split its order
-- one journal `sync_all` per group of queued commands; the worker waits during it (no pipelined journaler thread yet), and p99 cannot beat the disk's own sync latency
+- one journal `sync_all` per group of queued commands; the worker waits during it (no pipelined journaler thread yet), and p99 cannot beat the disk's own sync latency. With replication it also waits for the replica's sync and one round trip; on the office machine the two syncs share one SSD
+- replication has one replica, and a new connection replaces the current one. Its link is neither authenticated nor encrypted, and its listener is the only one meant to be reached from another machine: use a private network. Waiting for the replica never times out: a primary without its replica waits until the operator acts (only a link silent for 10 s is dropped, so that the replica dials again). Running alone is not remembered across a restart, and a replica slower than the sustained load cannot end it until the load drops. The operator must never both let the primary run alone and promote the replica: nothing prevents it until part 5's epochs
+- the replica publishes a record one round trip after confirming it, when the next commit point arrives; its stream holds no records, so its readers read every record from the journal
+- the replica's committed end is what its stream published, synced within about two seconds of it moving. If the primary's disk loses writes it reported synced, or the primary starts on an older copy of its journal, the replica cannot tell the acknowledged records it lost, at most about two seconds' worth after a power loss, from records the primary never synced, and cuts them. Only a third machine could tell them apart
 - the core snapshot serializes the whole exchange state, which since milestone 22 holds one trading day: at 200,000 orders a day it grows to about 85 MB and 2 s by the close, and falls to under 1 MB at the next open. It runs on the warm replica, right after each open and whenever the journal has grown by four times the last snapshot's size, and only at primary startup on the primary. The warm replica writes it on its follower thread, so a promotion request waits for a snapshot in progress (up to about 2.5 s at the end of a day), and at the maximum rate on the office machine, where it shares two cores with the primary, its lag rises within a day by up to about 250,000 events before it falls back
 - without a running warm replica no periodic snapshots are written, including after a promotion until a new warm replica starts; a restart then replays everything since the last snapshot. As long as snapshots are being written, a restart replays at most about four snapshot sizes of journal, never more than the day: 2.9 s measured at the end of the fifth day on the office machine, about 4 s at worst
 - the warm replica's snapshot writes share the host's disk with the journal's syncs
@@ -894,9 +932,10 @@ Its re-check confirmed the fixes and that the published-end check never refuses 
 - mmap is not the durable recovery source; never modify, truncate, replace, or unlink mapped files while processes use them
 - consumer crashes require checkpoint/state coordination; arbitrary downstream effects are not exactly-once
 - internal matching and settlement failures are rejected before commit and halt the worker if they cannot be represented as a business rejection
-- warm promotion is manual and same-host: no heartbeat, automatic failover, leader election or second machine
+- warm promotion is manual and same-host: no heartbeat, automatic failover or leader election. The replica's machine holds a byte-identical journal, but nothing promotes there until part 5
 - promotion takes over only the file the warm replica followed: a journal replaced at its path, even by a byte-identical copy, needs a new warm replica on it first. It does not re-read the journal before the warm replica's position, so it would not notice that part being rewritten in place; never modify the journal
 - the warm replica opens its control port only after its first catch-up, so a promotion cannot be requested before that
+- a promotion binds the customer, operator and replication ports only after it has fenced the old primary: a port already in use then leaves no primary until the operator starts one
 - if the primary dies while publishing to the stream, leaving its ready marker cleared, the warm replica stops when it reaches the end it validated and cannot be promoted; restarting the primary repairs the stream from the journal. Part 6's failure tests will cover it
 - the warm replica's management API is unauthenticated and loopback-only; `202` from `/promote` means the old writer is fenced, not that the customer listener is ready
 - the crate uses Unix-only APIs (advisory file locks, positioned reads, mmap) and builds and tests on Linux only
@@ -916,7 +955,7 @@ The same restraint applies to tax or customer statements, settlement, broad hist
 
 Start by reading this file and `EXCHANGE_PIPELINE_TODO.md`. Verify the code and test result before trusting old milestone notes.
 
-The crate uses Unix-only APIs and does not compile on Windows. Build and test on Linux — the Ubuntu machine, or a `rust` container with the repository mounted (from Git Bash, set `MSYS_NO_PATHCONV=1` so container paths are not rewritten). The customer, operator, and warm-replica listeners bind loopback only, so a live failover run needs the primary, the warm replica, and the HTTP client in one network namespace. A new journal starts with the market closed: open a trading day on the operator port (`POST 127.0.0.1:4004/session/open`) before placing orders.
+The crate uses Unix-only APIs and does not compile on Windows. Build and test on Linux — the Ubuntu machine, or a `rust` container with the repository mounted (from Git Bash, set `MSYS_NO_PATHCONV=1` so container paths are not rewritten). The customer, operator, and warm-replica listeners bind loopback only, so a live failover run needs the primary, the warm replica, and the HTTP client in one network namespace. The replication listener (`REPLICATION_LISTEN_ADDR`) is the exception: the replica on the other machine must reach it. A new journal starts with the market closed: open a trading day on the operator port (`POST 127.0.0.1:4004/session/open`) before placing orders.
 
 Discuss architecture before implementation. If a suggestion conflicts with the target design or changes the command/event boundary, stop and explain the tradeoff. Update this journal whenever a milestone is completed so the next session does not repeat old work.
 
