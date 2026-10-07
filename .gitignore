@@ -1,7 +1,5 @@
 /target
 AGENTS.md
-TESTING_NOTES.md
-*.md
 !DEFERRED_ITEMS.md
 exchange-events.log
 *.log
