@@ -33,7 +33,7 @@ mod state;
 use state::AppState;
 
 use crate::exchange::runtime::{
-    DEFAULT_SNAPSHOT_INTERVAL, ExchangeRuntime, promote_replica_with_stream_and_snapshot,
+    DEFAULT_SNAPSHOT_GROWTH, ExchangeRuntime, promote_replica,
     recover_runtime_with_stream_and_snapshot,
 };
 
@@ -76,7 +76,7 @@ async fn main() {
         // A promoted warm replica checks login tokens: refuse now, not after it has fenced the
         // old primary.
         require_jwt_secret();
-        let promotion = exchange::warm_replica::run(&args[1..], snapshot_interval_or_exit())
+        let promotion = exchange::warm_replica::run(&args[1..], snapshot_growth_or_exit())
             .await
             .unwrap_or_else(|error| {
                 eprintln!("warm replica: {error}");
@@ -84,28 +84,20 @@ async fn main() {
             });
         let exchange::warm_replica::WarmPromotion {
             store,
-            recovered,
+            replica,
+            suffix,
             journal_path,
             stream_path,
-            snapshot_path,
         } = promotion;
         let (tx, rx) = tokio::sync::mpsc::channel(EXCHANGE_COMMAND_QUEUE_SIZE);
-        let runtime = promote_replica_with_stream_and_snapshot(
-            rx,
-            store,
-            recovered,
-            &journal_path,
-            &stream_path,
-            &snapshot_path,
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("refusing to promote: {error}");
-            eprintln!("event log: {}", journal_path.display());
-            eprintln!("event stream: {}", stream_path.display());
-            eprintln!("event snapshot: {}", snapshot_path.display());
-            eprintln!("Preserve the durable history and resolve the reported error.");
-            std::process::exit(1);
-        });
+        let runtime =
+            promote_replica(rx, store, replica, suffix, &stream_path).unwrap_or_else(|error| {
+                eprintln!("refusing to promote: {error}");
+                eprintln!("event log: {}", journal_path.display());
+                eprintln!("event stream: {}", stream_path.display());
+                eprintln!("Preserve the durable history and resolve the reported error.");
+                std::process::exit(1);
+            });
         println!(
             "Warm replica promoted through event sequence {}",
             runtime.next_event_sequence().saturating_sub(1)
@@ -164,20 +156,15 @@ fn require_jwt_secret() {
     }
 }
 
-/// Commands between the snapshots the warm replica writes. The primary no longer snapshots while
-/// trading; it writes one snapshot at startup.
-fn snapshot_interval_or_exit() -> u64 {
-    std::env::var("EVENT_SNAPSHOT_INTERVAL")
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .ok()
-                .filter(|&value| value > 0)
-                .ok_or(())
-        })
-        .unwrap_or(Ok(DEFAULT_SNAPSHOT_INTERVAL))
+/// How much the journal grows between the snapshots the warm replica writes, as a multiple of the
+/// last snapshot's size (0 writes one after every command). The primary does not snapshot while
+/// trading: a normal startup writes one snapshot, and a promotion writes none.
+fn snapshot_growth_or_exit() -> u64 {
+    std::env::var("EVENT_SNAPSHOT_GROWTH")
+        .map(|value| value.parse::<u64>())
+        .unwrap_or(Ok(DEFAULT_SNAPSHOT_GROWTH))
         .unwrap_or_else(|_| {
-            eprintln!("EVENT_SNAPSHOT_INTERVAL must be a positive integer");
+            eprintln!("EVENT_SNAPSHOT_GROWTH must be a whole number");
             std::process::exit(1);
         })
 }

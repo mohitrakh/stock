@@ -1935,6 +1935,7 @@ dependencies = [
  "axum",
  "bcrypt",
  "chrono",
+ "crc",
  "dotenvy",
  "hdrhistogram",
  "jsonwebtoken",

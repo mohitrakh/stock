@@ -62,28 +62,30 @@ independent MDP process
 same-host warm replica process
   -> StreamReader in journal-only mode (mmap supplies only the committed watermark)
   -> replay complete batches into a read-only ReplicaCore before binding 127.0.0.1:4003
-  -> every EVENT_SNAPSHOT_INTERVAL commands, write the journal-bound core snapshot
+  -> right after each open, and whenever the journal has grown by EVENT_SNAPSHOT_GROWTH
+     times the last snapshot's size, write the journal-bound core snapshot
      at exactly its applied checkpoint
   -> GET /health and GET /status report follower availability only
   -> POST /promote returns 409 while the primary owns the journal writer lock
-  -> after the fence, verify journal identity before any read or repair,
-     then fully recover and replay the journal before primary startup
+  -> after the fence, verify it is the file the replica read, with the same journal id,
+     before any read or repair; read only the journal after the applied checkpoint and
+     replay it into the replica's own core, which becomes the primary's
 ```
 
 `ExchangeCommand` is live gateway plumbing and may contain `respond_to`. `ExchangeEvent` contains replayable business data and must remain free of HTTP response channels.
 
 `ExchangeRuntime` owns the command receiver, `EventStore`, and `StreamWriter`. It writes one journal-bound snapshot at startup and none while trading; the warm replica writes the periodic ones. It keeps no event history in production; the complete history is the journal, and an in-memory copy exists only in test builds. Group commit commits each command in memory before its group's sync, so after a failed sync the live core is ahead of the disk: the worker halts, that core is never used again, and recovery from the journal is the only way back. `ExchangeCore` owns the deterministic trading components; it never touches the files. All core operations still run on one exchange-worker thread. `ReplicaCore` is a separate read-only follower core: it has no writer, queue, callbacks, database, or customer routes. Readers and the warm follower are separate consumers, not additional owners of exchange state.
 
-`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. `ReplicaCore` uses the same complete-batch comparison before it advances its applied checkpoint. Production startup calls `recover_runtime_with_stream_and_snapshot` before binding the listener. A valid versioned, checksummed snapshot is tied to the journal's id and a complete-batch byte boundary; it restores the core and replays only the later suffix. A missing, corrupt, inconsistent, or journal-mismatched snapshot is preserved and falls back to full replay. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`; `EVENT_SNAPSHOT_PATH` defaults to that path plus `.snapshot`; and `EVENT_SNAPSHOT_INTERVAL` (the warm replica's snapshot interval) defaults to 10,000 commands. The journal is authoritative; the mmap file is a disposable delivery cache and the snapshot is only a recovery checkpoint. Warm promotion takes the writer lock with `EventStore::open_existing_matching`, which proves the locked file is the journal the warm followed before reading or repairing it, then fully replays the recovered journal rather than promoting mmap-derived state.
+`replay_event_log` rebuilds a fresh core from recorded inputs and checks regenerated outputs against history. `ReplicaCore` uses the same complete-batch comparison before it advances its applied checkpoint. Production startup calls `recover_runtime_with_stream_and_snapshot` before binding the listener. A valid versioned, checksummed snapshot is tied to the journal's id and a complete-batch byte boundary; it restores the core and replays only the later suffix. A missing, corrupt, inconsistent, or journal-mismatched snapshot is preserved and falls back to full replay. `EVENT_LOG_PATH` defaults to `exchange-events.log`; `EVENT_STREAM_PATH` defaults to that path plus `.mmap`; `EVENT_SNAPSHOT_PATH` defaults to that path plus `.snapshot`; and `EVENT_SNAPSHOT_GROWTH` (how much the journal grows between the warm replica's snapshots, as a multiple of the last snapshot's size) defaults to 4. The journal is authoritative; the mmap file is a disposable delivery cache and the snapshot is only a recovery checkpoint. Warm promotion takes the writer lock with `EventStore::open_suffix`, which proves the locked file is the one the warm replica read, with the expected journal id and at least what it applied, before reading or repairing anything. It then reads only the journal after the applied checkpoint, and the new primary replays that into the warm replica's own core, which was built from the journal, never from mmap-derived state.
 
 Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
 
-Latest verified status on 2026-10-05, on Linux (the office Ubuntu machine; the crate uses Unix-only APIs and does not build on Windows):
+Latest verified status on 2026-10-07, on Linux (the office Ubuntu machine; the crate uses Unix-only APIs and does not build on Windows):
 
 ```text
 cargo fmt -- --check
 cargo test --locked
-172 unit tests + the executable integration tests passed; 0 failed
+179 unit tests + the executable integration tests passed; 0 failed
 3 opt-in Reporter acceptance tests ignored by default (need REPORTER_TEST_DATABASE_URL);
   all passed against PostgreSQL 16 when run with it
 ```
@@ -97,6 +99,8 @@ replica writes them, up from about 8,300 when the trading thread did. See
 On the office Ubuntu machine, milestone 22's trading days keep the state to one day. Five days of
 200,000 orders end with 263 MB of exchange memory, an 85 MB largest snapshot and a 2.4 s restart.
 The milestone 21 binary, on the same 1,000,000 orders, ends with 1,234 MB, 422 MB and 11.7 s.
+Since milestone 23 part 3 a promotion takes over the warm replica's own core: 58 ms on that
+journal instead of 25.8 s, and 0.5 s from the end of a maximum-rate run instead of 103 s.
 Throughput is unchanged (40,000 to 45,000 orders/s with no warm replica). See
 `docs/performance/07-trading-days-bound-the-state.md`.
 
@@ -693,7 +697,7 @@ Both independent reviews' findings were fixed (parts 2 and 3).
 
 ## 23. Two Machines
 
-**Status: selected on 2026-10-05; Part 1 complete on 2026-10-05; Part 2 complete on 2026-10-06.** Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` for Part 1, then `docs/tasks/19-two-machines.md`. Part 2 as first specified was split in two on 2026-10-06, as recommended: the journal id and restarts in Part 2, promotion and the warm replica's lag in Part 3. Decisions confirmed by the owner:
+**Status: selected on 2026-10-05; Part 1 complete on 2026-10-05; Parts 2 and 3 complete on 2026-10-06.** Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` for Part 1, then `docs/tasks/19-two-machines.md`. Part 2 as first specified was split in two on 2026-10-06, as recommended: the journal id and restarts in Part 2, promotion and the warm replica's lag in Part 3. Decisions confirmed by the owner:
 - the primary waits for the replica: a command is answered, and becomes visible to anyone, only once it is on both machines' disks;
 - if the replica cannot be reached, the primary pauses until an operator either promotes the replica or tells the primary to run alone;
 - the machines talk over TCP;
@@ -830,6 +834,30 @@ The independent review found the older-copy gap above, and a reporter acceptance
 - new tests cover mid-journal checkpoints and a real version 2 market-data state;
 - the docs no longer claim the normal restart re-reads the older journal.
 
+**Part 3, complete (2026-10-06): promotion from the warm replica's own state.** Write-up: `docs/tasks/19-two-machines.md`; measurement: `docs/performance/09-promotion-from-the-warm-replica.md`.
+- **Promotion reuses the warm replica's core.** It takes the writer lock, reads only the journal after the warm replica's applied checkpoint (`EventStore::open_suffix`), and the new primary replays that into the core (`promote_replica`) with every output checked. It writes no startup snapshot. Before anything is read or repaired, the path must still name the file the warm replica read (`NotTheFollowedFile`, even for a byte-identical copy), with the same id, reaching both what the stream published and what the warm replica applied (`ShorterThanApplied`). The core includes the snapshot the warm replica started from, which promotion trusts as a restart does. Part 2's whole-journal promotion opener is gone.
+- **Snapshots by journal growth.** Right after each open, and whenever the journal has grown by `EVENT_SNAPSHOT_GROWTH` (default 4) times the last snapshot's size, instead of every 10,000 commands. The snapshot work is proportional to the journal applied. While snapshots are being written, a restart replays at most about four snapshot sizes past the last one, plus whatever the warm replica had not applied yet.
+- **A reader behind reads committed records straight from the journal**, consulting the stream only when it reaches the last end it validated: two system calls per record instead of six. Every reader catches up faster.
+- **The CRC-32 is the `crc` crate's table-driven one** (already a dependency of sqlx): 7.8 times faster, same values.
+- **Compatibility.** No file format changed. `EVENT_SNAPSHOT_GROWTH` replaces `EVENT_SNAPSHOT_INTERVAL`. A promotion refuses a journal path that names a different file from the one the warm replica read; start a new warm replica on it instead.
+
+Verified on Linux: `cargo fmt -- --check`, `cargo test --locked` with 179 unit tests plus the integration tests, and all three PostgreSQL acceptance tests. Measured on the five-day workload (788 MB, 1,000,000 orders) with a warm replica beside the benchmark, all sharing the office machine's 2 cores:
+- promotion of a caught-up warm replica went from 25,816 ms to 58 ms; requested the moment a maximum-rate run stopped, from 103,255 ms to 502 ms until the customer port answered;
+- at maximum rate, the warm replica caught up 1.7 s after trading stopped instead of 85 s; its lag now swings within each day between 0 and about 250,000 events instead of growing for the whole run. In one of two runs the lows rose by about 50,000 events a day, so on this machine the maximum rate is at its limit;
+- at 20,000 orders/s its lag stayed at a median of 0 and at most 99,000 events, where before it grew to 2.19 million;
+- snapshot time over the five days fell from 87.2 s to 11.0 s, and a warm replica's full replay from 29.1 s to 19.2 s;
+- a primary restart at the end of the fifth day took 2.9 s (2.4 s in milestone 22).
+
+The independent review found nothing of high severity. Its findings, all fixed:
+- the test that the warm replica never builds its core from the stream's cache had stopped testing it, because a reader behind its validated end now reads the journal anyway; the warm replica now catches up before the differing record is published;
+- a failing snapshot was retried after every command when the warm replica had started without one; failed attempts now back off by the growth factor;
+- an older copy written over the followed file passed promotion when the warm replica lagged; promotion now also requires the stream's published end;
+- the reasoning now says that promotion trusts the warm replica's starting snapshot; the CRC test covers a vector longer than 16 bytes; the id check on the promotion path has its own test; and the descriptions of the stream cache and a few numbers were corrected.
+
+It also found an older gap, recorded below: a primary that dies while publishing leaves the warm replica unable to be promoted.
+
+Its re-check confirmed the fixes and that the published-end check never refuses a legitimate promotion. It found that the published end was read under a stream lock that waits, so a primary frozen mid-publication could have made `/promote` hang instead of answering 409; it is now read without waiting, from any header with a valid checksum, as the primary itself trusts it. The back-off on a journal path that names another journal now has a test, and the restart bound is qualified everywhere: it holds while snapshots are being written, plus whatever the warm replica had not applied.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -844,13 +872,13 @@ The independent review found the older-copy gap above, and a reporter acceptance
 - `Order.leaves_qty` and `ManagedOrder.remaining_quantity` are separate sources of truth for the same number
 - one global minor-unit price scale is assumed; per-product currency and tick-size metadata are not modeled
 - a deposit is refused if it would take the exchange's total cash, or a symbol's total shares, past `u64::MAX`, so no fill can overflow a balance or holding; nothing withdraws, so one client can deposit up to that limit and refuse every later deposit by anyone, until deposits become operator actions
-- the event log is one file that grows without bound; snapshots reduce exchange-core replay work but do not compact or retain less journal history; startup reads the part of the journal it replays (all of it without a usable snapshot or on warm promotion, the suffix with one) into memory in one piece rather than streaming it
+- the event log is one file that grows without bound; snapshots reduce exchange-core replay work but do not compact or retain less journal history; startup reads the part of the journal it replays (all of it without a usable snapshot, the suffix after the snapshot with one, and after the warm replica's position at promotion) into memory in one piece rather than streaming it
 - order records and the per-user execution index hold one trading day; the open replaces both maps, releasing their memory, while the matching engine's order-location map and risk usage keep the capacity of the largest day, and a price level's node slots are freed only when the level empties, which the close guarantees once a day
 - the books hold at most 200,000 resting orders across all symbols, so that the close's one journal record always fits; beyond that an order that would rest is refused (409 `BookFull`) until orders trade, are cancelled, or expire at the close, and one user can fill the book, as there is no per-user share; there is no close spread across several records
 - one order may trade against at most 10,000 resting orders (`TooManyFills`, 409), so that its record always fits the 64 MiB limit; a client that wants more must split its order
 - one journal `sync_all` per group of queued commands; the worker waits during it (no pipelined journaler thread yet), and p99 cannot beat the disk's own sync latency
-- the core snapshot serializes the whole exchange state, which since milestone 22 holds one trading day: at 200,000 orders a day it grows to about 85 MB and 2 s by the close, and falls to under 1 MB at the next open. It runs on the warm replica (every interval and right after each open), which still falls behind at full load because it snapshots every 10,000 commands, and only at primary startup on the primary
-- without a running warm replica no periodic snapshots are written; a restart then replays everything since the primary's last startup snapshot
+- the core snapshot serializes the whole exchange state, which since milestone 22 holds one trading day: at 200,000 orders a day it grows to about 85 MB and 2 s by the close, and falls to under 1 MB at the next open. It runs on the warm replica, right after each open and whenever the journal has grown by four times the last snapshot's size, and only at primary startup on the primary. The warm replica writes it on its follower thread, so a promotion request waits for a snapshot in progress (up to about 2.5 s at the end of a day), and at the maximum rate on the office machine, where it shares two cores with the primary, its lag rises within a day by up to about 250,000 events before it falls back
+- without a running warm replica no periodic snapshots are written, including after a promotion until a new warm replica starts; a restart then replays everything since the last snapshot. As long as snapshots are being written, a restart replays at most about four snapshot sizes of journal, never more than the day: 2.9 s measured at the end of the fifth day on the office machine, about 4 s at worst
 - the warm replica's snapshot writes share the host's disk with the journal's syncs
 - after a failed journal sync the in-memory core is ahead of the disk; it is never used again, the worker halts, and the process must be restarted to recover from the journal
 - a `client_order_id` is unique within its trading day, including after its order finished; earlier days' orders are only in the reporter's tables, and there is no reporting API to read them
@@ -861,13 +889,15 @@ The independent review found the older-copy gap above, and a reporter acceptance
 - candle state retains every one-minute bucket without a retention limit, rollups, or external historical store
 - there is no public reporting API or trade-tape service
 - mmap is a same-host Unix transport using cooperative file locks, JSON, and a bounded window; it is not lock-free, cross-server replication, or an ingress transport
-- the journal still grows without bound; a reader restart checks only the record at its checkpoint, and the primary's normal restart validates only the records after its snapshot (milestone 23 part 2), so damage in the older part of the journal is found only by what reads it again: a full replay with no usable snapshot, a reader starting from the beginning, or a promotion until Part 3 removes its full read. Nothing scrubs the journal in the background
+- the journal still grows without bound; a reader restart checks only the record at its checkpoint, and the primary's normal restart validates only the records after its snapshot (milestone 23 part 2), so damage in the older part of the journal is found only by what reads it again: a full replay with no usable snapshot, or a reader starting from the beginning. Promotion reads only the journal after the warm replica's position. Nothing scrubs the journal in the background
 - restoring an older copy of the journal is unsupported. The stream's watermark and the warm replica's applied length catch it, but not when the copy comes back without a stream file, with an unreadable stream header, or with its own old stream file: that primary starts trading, and readers whose checkpoints lie beyond it are refused only until the new history grows past them. To go back, start a new journal
 - mmap is not the durable recovery source; never modify, truncate, replace, or unlink mapped files while processes use them
 - consumer crashes require checkpoint/state coordination; arbitrary downstream effects are not exactly-once
 - internal matching and settlement failures are rejected before commit and halt the worker if they cannot be represented as a business rejection
-- warm promotion is manual and same-host: no heartbeat, automatic failover, leader election, second machine, or measured RTO/RPO
-- promotion replays the entire journal instead of reusing the caught-up warm core, so its duration grows with history
+- warm promotion is manual and same-host: no heartbeat, automatic failover, leader election or second machine
+- promotion takes over only the file the warm replica followed: a journal replaced at its path, even by a byte-identical copy, needs a new warm replica on it first. It does not re-read the journal before the warm replica's position, so it would not notice that part being rewritten in place; never modify the journal
+- the warm replica opens its control port only after its first catch-up, so a promotion cannot be requested before that
+- if the primary dies while publishing to the stream, leaving its ready marker cleared, the warm replica stops when it reaches the end it validated and cannot be promoted; restarting the primary repairs the stream from the journal. Part 6's failure tests will cover it
 - the warm replica's management API is unauthenticated and loopback-only; `202` from `/promote` means the old writer is fenced, not that the customer listener is ready
 - the crate uses Unix-only APIs (advisory file locks, positioned reads, mmap) and builds and tests on Linux only
 - the reporter applies about 1,600 commands/s: it keeps up at 1,000 orders/s but falls behind a sustained faster exchange and catches up afterwards; set-based writes or `COPY` are the next lever

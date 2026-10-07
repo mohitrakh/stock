@@ -4,8 +4,8 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    io,
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -50,8 +50,8 @@ pub struct ReaderCheckpoint {
 
 impl ReaderCheckpoint {
     /// The id of the journal this checkpoint was taken against. A warm promotion passes it to
-    /// `EventStore::open_existing_matching`, which compares it the moment it holds the writer
-    /// lock — before it reads or repairs anything in the file.
+    /// `EventStore::open_suffix`, which compares it the moment it holds the writer lock — before
+    /// it reads or repairs anything in the file.
     pub(crate) fn journal_id(&self) -> Uuid {
         self.journal_id
     }
@@ -106,6 +106,18 @@ impl Mapping {
         // SAFETY: mmap is page aligned; offset 72 is aligned and within the fixed header. This
         // field is accessed exclusively as an atomic, including in other cooperating processes.
         unsafe { &*self.map.as_ptr().add(72).cast::<AtomicU64>() }
+    }
+
+    /// The journal id and published end in the header, by the writer's own rule: any header with
+    /// a valid checksum, even while a publication is interrupted, since every record before the
+    /// end was synced first. `None` if the header is torn, or at once while a writer holds the
+    /// stream: only a live writer can, and then the journal's writer lock is taken too.
+    fn published_end(&self) -> Option<(Uuid, u64)> {
+        self.file.try_lock_shared().ok()?;
+        let _unlock = Unlock(&self.file);
+        let header = self.copy(0, 68);
+        (crc32(&header[..64]) == u32::from_le_bytes(header[64..68].try_into().unwrap()))
+            .then(|| (journal_id_at(&header), word(&header, 32)))
     }
 
     fn snapshot(&self, requested_offset: Option<u64>) -> io::Result<Snapshot> {
@@ -324,13 +336,19 @@ impl StreamWriter {
     }
 }
 
-/// An independent consumer. `next_batch` copies under a short shared lock, then validates and
-/// deserializes outside it. Consumer processing never holds a writer-blocking lock.
+/// An independent consumer. When it reaches the last committed end it validated, `next_batch`
+/// reads the stream header, and the next record from the cache window if it is there, under a
+/// short shared lock; records before that end come straight from the journal. Validation and
+/// deserializing happen outside the lock, and consumer processing never holds a writer-blocking
+/// lock.
 pub struct StreamReader {
     mapping: Mapping,
     journal: File,
     cursor: ReaderCheckpoint,
+    /// The committed end and last sequence of the last stream header this reader validated.
+    /// Everything before that end is committed and never changes.
     last_watermark: u64,
+    last_sequence: u64,
     journal_only: bool,
 }
 
@@ -352,7 +370,7 @@ impl StreamReader {
         stream_path: impl AsRef<Path>,
         checkpoint: Option<ReaderCheckpoint>,
     ) -> io::Result<Self> {
-        let mut journal = File::open(journal_path)?;
+        let journal = File::open(journal_path)?;
         let journal_id = journal_id_of(&journal)?;
         let file = File::open(stream_path)?;
         let size = file.metadata()?.len();
@@ -387,7 +405,7 @@ impl StreamReader {
         // and begin with the checkpoint's next sequence. A checkpoint at the committed end is
         // checked against the published last sequence by `validate_snapshot`.
         if cursor.byte_offset < snapshot.end {
-            read_record(&mut journal, cursor.byte_offset, snapshot.end)
+            read_record(&journal, cursor.byte_offset, snapshot.end)
                 .and_then(|bytes| decode_batch(&bytes, cursor.next_sequence))
                 .map_err(|_| invalid("checkpoint is not at a complete command boundary"))?;
         }
@@ -396,6 +414,7 @@ impl StreamReader {
             journal,
             cursor,
             last_watermark: snapshot.end,
+            last_sequence: snapshot.last_sequence,
             journal_only: false,
         };
         reader.validate_snapshot(&snapshot)?;
@@ -413,6 +432,23 @@ impl StreamReader {
     pub(crate) fn journal_only(mut self) -> Self {
         self.journal_only = true;
         self
+    }
+
+    /// The journal file this reader reads, as opened: a promotion takes over only this file.
+    pub(crate) fn journal(&self) -> &File {
+        &self.journal
+    }
+
+    /// The journal end the stream has published, which a promotion's journal must still reach:
+    /// every record before it was synced first, and readers may already have consumed it. It never
+    /// waits for a writer. If the header cannot be read now, the last end this reader validated.
+    pub(crate) fn published_end(&self) -> u64 {
+        match self.mapping.published_end() {
+            Some((journal_id, end)) if journal_id == self.cursor.journal_id => {
+                end.max(self.last_watermark)
+            }
+            _ => self.last_watermark,
+        }
     }
 
     fn validate_snapshot(&self, snapshot: &Snapshot) -> io::Result<()> {
@@ -438,17 +474,25 @@ impl StreamReader {
     }
 
     pub fn next_batch(&mut self) -> io::Result<Option<Vec<EventEnvelope>>> {
-        let cached = (!self.journal_only).then_some(self.cursor.byte_offset);
-        let snapshot = self.mapping.snapshot(cached)?;
-        self.validate_snapshot(&snapshot)?;
-        self.last_watermark = snapshot.end;
-        if self.cursor.byte_offset == snapshot.end {
-            return Ok(None);
+        // The stream is consulted only once the reader reaches the last end it validated. Before
+        // that, records are committed and never change, so a reader that is behind reads them
+        // straight from the journal: two reads per record instead of six system calls.
+        let mut cache = Vec::new();
+        if self.cursor.byte_offset == self.last_watermark {
+            let cached = (!self.journal_only).then_some(self.cursor.byte_offset);
+            let snapshot = self.mapping.snapshot(cached)?;
+            self.validate_snapshot(&snapshot)?;
+            self.last_watermark = snapshot.end;
+            self.last_sequence = snapshot.last_sequence;
+            if self.cursor.byte_offset == snapshot.end {
+                return Ok(None);
+            }
+            cache = snapshot.cache;
         }
-        let bytes = if !snapshot.cache.is_empty() {
-            snapshot.cache
+        let bytes = if !cache.is_empty() {
+            cache
         } else {
-            read_record(&mut self.journal, self.cursor.byte_offset, snapshot.end)?
+            read_record(&self.journal, self.cursor.byte_offset, self.last_watermark)?
         };
         let batch = decode_batch(&bytes, self.cursor.next_sequence)?;
         let next_sequence = batch
@@ -458,9 +502,9 @@ impl StreamReader {
             .checked_add(1)
             .ok_or_else(|| invalid("sequence overflow"))?;
         let end = self.cursor.byte_offset + bytes.len() as u64;
-        if end > snapshot.end
-            || next_sequence > snapshot.last_sequence + 1
-            || (end == snapshot.end) != (next_sequence == snapshot.last_sequence + 1)
+        if end > self.last_watermark
+            || next_sequence > self.last_sequence + 1
+            || (end == self.last_watermark) != (next_sequence == self.last_sequence + 1)
         {
             return Err(invalid("batch disagrees with committed watermark"));
         }
@@ -482,16 +526,15 @@ fn record_length(header: &[u8]) -> io::Result<usize> {
     Ok(RECORD_HEADER_LEN + len as usize)
 }
 
-fn read_record(file: &mut File, offset: u64, committed_end: u64) -> io::Result<Vec<u8>> {
+fn read_record(file: &File, offset: u64, committed_end: u64) -> io::Result<Vec<u8>> {
     if offset
         .checked_add(RECORD_HEADER_LEN as u64)
         .is_none_or(|end| end > committed_end)
     {
         return Err(invalid("record header exceeds committed prefix"));
     }
-    file.seek(SeekFrom::Start(offset))?;
     let mut header = [0; RECORD_HEADER_LEN];
-    file.read_exact(&mut header)?;
+    file.read_exact_at(&mut header, offset)?;
     let len = record_length(&header)?;
     if offset
         .checked_add(len as u64)
@@ -501,7 +544,10 @@ fn read_record(file: &mut File, offset: u64, committed_end: u64) -> io::Result<V
     }
     let mut bytes = vec![0; len];
     bytes[..RECORD_HEADER_LEN].copy_from_slice(&header);
-    file.read_exact(&mut bytes[RECORD_HEADER_LEN..])?;
+    file.read_exact_at(
+        &mut bytes[RECORD_HEADER_LEN..],
+        offset + RECORD_HEADER_LEN as u64,
+    )?;
     Ok(bytes)
 }
 
@@ -683,13 +729,10 @@ pub(super) mod tests {
         writer.mapping.file.unlock().unwrap();
         assert!(reader.next_batch().is_err());
         assert_eq!(reader.checkpoint().next_sequence, 1);
-        drop(writer);
-        drop(store);
-        let (_store, _writer) = fixture.start(4096);
-        // Recovery clears the damaged cache; journal is read only up to its committed boundary.
+        // It had validated the committed end before the damaged copy was refused, so it reads
+        // that record from the journal now, which is intact.
         assert_eq!(reader.next_batch().unwrap().unwrap(), batch(1));
         let mut reader = fixture.reader();
-        use std::os::unix::fs::FileExt;
         OpenOptions::new()
             .write(true)
             .open(&fixture.log)
@@ -698,6 +741,61 @@ pub(super) mod tests {
             .unwrap();
         assert!(reader.next_batch().is_err());
         assert_eq!(reader.checkpoint().next_sequence, 1);
+    }
+
+    /// Behind the last committed end it validated, a reader reads records from the journal
+    /// without consulting the stream. They are committed and never change, so it delivers them
+    /// even when the stream breaks meanwhile, and notices the break once it reaches that end.
+    #[test]
+    fn a_reader_behind_reads_committed_records_without_consulting_the_stream() {
+        let fixture = Fixture::new();
+        // A one-byte window caches nothing, so every batch is read from the journal.
+        let (mut store, mut writer) = fixture.start(1);
+        for seq in [1, 3, 5] {
+            append(&mut store, &mut writer, seq);
+        }
+        let mut reader = fixture.reader();
+        writer.mapping.file.lock().unwrap();
+        writer.mapping.ready().store(0, Ordering::SeqCst);
+        writer.mapping.file.unlock().unwrap();
+
+        for seq in [1, 3, 5] {
+            assert_eq!(reader.next_batch().unwrap().unwrap(), batch(seq));
+        }
+        assert!(reader.next_batch().is_err());
+        assert_eq!(reader.checkpoint().next_sequence, 7);
+    }
+
+    /// What a promotion must still find in the journal: the end in any header with a valid
+    /// checksum, even mid-publication, as the writer itself trusts it. Never waiting for a writer,
+    /// and falling back to the last end the reader validated when the header cannot be used.
+    #[test]
+    fn the_published_end_is_read_as_the_writer_trusts_it_and_never_waits() {
+        let fixture = Fixture::new();
+        let (mut store, mut writer) = fixture.start(4096);
+        let reader = fixture.reader();
+        append(&mut store, &mut writer, 1);
+        let published = store.file().metadata().unwrap().len();
+        let validated = JOURNAL_HEADER_LEN as u64;
+        assert_eq!(reader.published_end(), published);
+
+        // An interrupted publication clears the ready marker, but the header is whole.
+        writer.mapping.file.lock().unwrap();
+        writer.mapping.ready().store(0, Ordering::SeqCst);
+        assert_eq!(
+            reader.published_end(),
+            validated,
+            "a writer holds the stream"
+        );
+        writer.mapping.file.unlock().unwrap();
+        assert_eq!(reader.published_end(), published);
+
+        // A torn header proves nothing.
+        writer.mapping.file.lock().unwrap();
+        let checksum_byte = writer.mapping.copy(64, 1)[0];
+        writer.mapping.write(64, &[!checksum_byte]);
+        writer.mapping.file.unlock().unwrap();
+        assert_eq!(reader.published_end(), validated);
     }
 
     /// A checkpoint is checked where it points: a restart reads the record there, never the
@@ -716,7 +814,6 @@ pub(super) mod tests {
         reader.next_batch().unwrap().unwrap();
         reader.next_batch().unwrap().unwrap();
         let checkpoint = reader.checkpoint();
-        use std::os::unix::fs::FileExt;
         OpenOptions::new()
             .write(true)
             .open(&fixture.log)

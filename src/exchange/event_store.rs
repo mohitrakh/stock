@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::unix::fs::{FileExt, OpenOptionsExt},
+    os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -50,13 +50,16 @@ pub enum EventStoreError {
         expected: Uuid,
         actual: Uuid,
     },
-    /// The journal's complete records end before the bytes a warm replica already applied from
-    /// it: it lost committed history, most likely because an older copy with the same id
-    /// replaced it.
+    /// The journal is shorter than the bytes already published or applied from it: by the stream,
+    /// a warm replica, or into a snapshot. It lost committed history, most likely because an older
+    /// copy with the same id replaced it.
     ShorterThanApplied {
         length: u64,
         applied: u64,
     },
+    /// At promotion, the journal path names a different file from the one the warm replica read,
+    /// even if it is a copy: the warm replica's core vouches only for the file it read.
+    NotTheFollowedFile,
 }
 
 impl std::fmt::Display for EventStoreError {
@@ -76,7 +79,10 @@ impl std::fmt::Display for EventStoreError {
             ),
             Self::ShorterThanApplied { length, applied } => write!(
                 f,
-                "event log is {length} bytes, shorter than the {applied} bytes already applied from it: it may be an older copy of the journal"
+                "event log is {length} bytes, shorter than the {applied} bytes already published or applied from it: it may be an older copy of the journal"
+            ),
+            Self::NotTheFollowedFile => f.write_str(
+                "the event log path names a different file from the one this warm replica followed; start a warm replica on it, then promote that one",
             ),
         }
     }
@@ -136,23 +142,16 @@ pub(crate) fn journal_id_of(file: &File) -> io::Result<Uuid> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
-/// CRC-32 (IEEE 802.3, reflected) over `data`.
+/// CRC-32 (IEEE 802.3, reflected, as zlib computes it) over `data`.
 ///
-/// Hand-rolled rather than pulled in as a dependency: it is ten lines, and `crc32_matches_known_vector`
-/// pins it to the standard check value so a mistake here cannot go unnoticed.
+/// The `crc` crate, which sqlx already brings in, with its 16-table implementation. It replaced a
+/// hand-rolled loop that went bit by bit: at about 200 MB/s it was a quarter of the time of
+/// writing a snapshot, and a seventh of a warm replica's replay (milestone 23 part 3).
+/// `crc32_matches_known_vector` pins the standard check value.
 pub(super) fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-
-    for &byte in data {
-        crc ^= byte as u32;
-
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-
-    !crc
+    const CRC32: crc::Crc<u32, crc::Table<16>> =
+        crc::Crc::<u32, crc::Table<16>>::new(&crc::CRC_32_ISO_HDLC);
+    CRC32.checksum(data)
 }
 
 /// An append-only file of durable records, one record per processed command.
@@ -206,55 +205,18 @@ impl EventStore {
     /// the truncation has to happen before anything is appended — handing out a store that has not
     /// been recovered yet would let a caller append after a torn tail.
     pub fn open(path: impl AsRef<Path>) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
-        Self::open_inner(path, true, None)
-    }
-
-    /// Opens an already-existing journal for warm promotion, and only if it is the exact file the
-    /// follower read. It never creates or initializes a journal: a follower's in-memory state
-    /// is not a durability authority, so a missing or empty journal is an error, not a fresh start.
-    ///
-    /// The id is compared as soon as the exclusive lock is held and before any recovery read or
-    /// torn-tail truncation. Recovery can shorten the file, so a path that now names a different
-    /// journal must be refused before recovery can touch it — this is the only way promotion
-    /// opens a journal, deliberately, so there is no unchecked variant left to call by mistake. A
-    /// byte-identical copy of the journal is the same journal.
-    ///
-    /// `applied` is the journal length the follower already applied. The id cannot tell an older
-    /// copy of the same journal from the journal itself, but a journal whose complete records end
-    /// before what was applied lost committed history, so it is refused untouched too.
-    pub(crate) fn open_existing_matching(
-        path: impl AsRef<Path>,
-        expected: Uuid,
-        applied: u64,
-    ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
-        Self::open_inner(path, false, Some((expected, applied)))
-    }
-
-    fn open_inner(
-        path: impl AsRef<Path>,
-        allow_initialize_empty: bool,
-        expected: Option<(Uuid, u64)>,
-    ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
-        let path = path.as_ref().to_path_buf();
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).truncate(false).mode(0o600);
-        if allow_initialize_empty {
-            options.create(true);
-        }
-        let mut file = options.open(&path)?;
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)?;
 
         // One writer owns recovery/truncation as well as appends. Independent stream readers
         // never take this lifetime lock; they read only the published, immutable prefix.
         file.try_lock().map_err(std::io::Error::from)?;
-
-        if let Some((expected, _)) = expected {
-            if file.metadata()?.len() == 0 {
-                return Err(EventStoreError::Corrupt(
-                    "existing journal is empty".to_string(),
-                ));
-            }
-            check_journal_id(&file, expected)?;
-        }
 
         // ponytail: reads the whole log into memory. Fine while history is small; stream it, or
         // add snapshots, when startup time actually starts to hurt.
@@ -262,11 +224,6 @@ impl EventStore {
         file.read_to_end(&mut bytes)?;
 
         if bytes.is_empty() {
-            if !allow_initialize_empty {
-                return Err(EventStoreError::Corrupt(
-                    "existing journal is empty".to_string(),
-                ));
-            }
             // A new journal names itself once, here, for its whole life.
             let journal_id = Uuid::new_v4();
             let mut header = FILE_MAGIC.to_vec();
@@ -287,17 +244,6 @@ impl EventStore {
             decode_records(&bytes[JOURNAL_HEADER_LEN..], JOURNAL_HEADER_LEN)?;
         let good_len = JOURNAL_HEADER_LEN + decoded_len;
 
-        // A torn tail is not history: complete records ending before what the follower applied
-        // mean committed commands are gone, so refuse before the tail is dropped.
-        if let Some((_, applied)) = expected {
-            if (good_len as u64) < applied {
-                return Err(EventStoreError::ShorterThanApplied {
-                    length: good_len as u64,
-                    applied,
-                });
-            }
-        }
-
         // Drop a torn tail so the next append cannot be written after damaged bytes.
         if good_len < bytes.len() {
             file.set_len(good_len as u64)?;
@@ -310,29 +256,52 @@ impl EventStore {
     }
 
     /// Opens the writer-owned journal at an already committed command boundary and recovers only
-    /// records after it. A validated core snapshot supplies the skipped prefix; the journal still
-    /// owns truncation of a torn suffix and remains the only authoritative history. Like
-    /// promotion, it checks that the locked file is the expected journal before reading on.
+    /// the records after it: the boundary of a validated core snapshot at startup, or the position
+    /// a warm replica had applied at promotion. That core supplies the skipped prefix; the journal
+    /// still owns truncation of a torn suffix and remains the only authoritative history.
+    ///
+    /// Everything is checked while holding the writer lock and before anything is read or
+    /// repaired, so a file that is not the expected one is left untouched:
+    /// - `followed`, at promotion, is the warm replica's own handle on the journal, and the end the
+    ///   stream published. Promotion takes over only the file the warm replica read: its core,
+    ///   with the snapshot it started from, stands for that file's first `boundary` bytes, which
+    ///   nothing rewrites, while another file at the same path, even a copy, could differ there.
+    /// - The id must be the expected journal's.
+    /// - The journal must still reach the boundary and, at promotion, the published end. Every
+    ///   published record was synced first, and readers may already have consumed it, so a
+    ///   shorter journal lost committed history, most likely because an older copy replaced it.
     pub(crate) fn open_suffix(
         path: impl AsRef<Path>,
         expected: Uuid,
         boundary: u64,
+        followed: Option<(&File, u64)>,
     ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
-        let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(false)
-            .open(&path)?;
+            .open(path)?;
         file.try_lock().map_err(std::io::Error::from)?;
+        if let Some((followed, _)) = followed {
+            let (locked, followed) = (file.metadata()?, followed.metadata()?);
+            if (locked.dev(), locked.ino()) != (followed.dev(), followed.ino()) {
+                return Err(EventStoreError::NotTheFollowedFile);
+            }
+        }
         check_journal_id(&file, expected)?;
 
         let file_len = file.metadata()?.len();
-        if boundary < JOURNAL_HEADER_LEN as u64 || boundary > file_len {
+        if boundary < JOURNAL_HEADER_LEN as u64 {
             return Err(EventStoreError::Corrupt(format!(
-                "snapshot boundary {} is outside the journal length {}",
-                boundary, file_len
+                "boundary {boundary} is inside the journal header"
             )));
+        }
+        let must_reach = followed.map_or(boundary, |(_, published)| published.max(boundary));
+        if must_reach > file_len {
+            return Err(EventStoreError::ShorterThanApplied {
+                length: file_len,
+                applied: must_reach,
+            });
         }
 
         file.seek(SeekFrom::Start(boundary))?;
@@ -516,6 +485,11 @@ mod tests {
         // The canonical CRC-32/ISO-HDLC check value; matches zlib.crc32 exactly.
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
         assert_eq!(crc32(b""), 0);
+        // Long enough for the 16-bytes-at-a-time loop, not only its tail.
+        assert_eq!(
+            crc32(b"The quick brown fox jumps over the lazy dog"),
+            0x414F_A339
+        );
     }
 
     #[test]
@@ -558,29 +532,29 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// Startup from a snapshot and promotion open an existing journal; neither may start a new one.
     #[test]
-    fn promotion_open_never_creates_or_initializes_a_missing_or_empty_journal() {
-        let missing = temp_path("promotion-missing");
+    fn the_suffix_opener_never_creates_or_initializes_a_missing_or_empty_journal() {
+        let boundary = JOURNAL_HEADER_LEN as u64;
+        let missing = temp_path("suffix-missing");
         assert!(matches!(
-            EventStore::open_existing_matching(&missing, Uuid::new_v4(), 0),
+            EventStore::open_suffix(&missing, Uuid::new_v4(), boundary, None),
             Err(EventStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
         ));
         assert!(!missing.exists());
 
-        // Emptiness is checked before the id, so any expected id reaches the refusal to
-        // initialize it.
-        let empty = temp_path("promotion-empty");
+        let empty = temp_path("suffix-empty");
         std::fs::File::create(&empty).unwrap();
         assert!(matches!(
-            EventStore::open_existing_matching(&empty, Uuid::new_v4(), 0),
-            Err(EventStoreError::Corrupt(detail)) if detail == "existing journal is empty"
+            EventStore::open_suffix(&empty, Uuid::new_v4(), boundary, None),
+            Err(EventStoreError::BadMagic)
         ));
         assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
         std::fs::remove_file(empty).unwrap();
     }
 
     #[test]
-    fn promotion_checks_identity_before_it_repairs_a_foreign_torn_tail() {
+    fn the_suffix_opener_checks_identity_before_it_repairs_a_foreign_torn_tail() {
         let expected = temp_path("promotion-expected-identity");
         let foreign = temp_path("promotion-foreign-identity");
         let expected_id = {
@@ -601,16 +575,17 @@ mod tests {
             .set_len(foreign_len - 4)
             .unwrap();
         let foreign_before = std::fs::read(&foreign).unwrap();
+        let boundary = JOURNAL_HEADER_LEN as u64;
 
         assert!(matches!(
-            EventStore::open_existing_matching(&foreign, expected_id, 0),
+            EventStore::open_suffix(&foreign, expected_id, boundary, None),
             Err(EventStoreError::JournalIdentityMismatch { expected, actual })
                 if expected == expected_id && actual == foreign_id
         ));
         assert_eq!(std::fs::read(&foreign).unwrap(), foreign_before);
 
         let (store, recovered) =
-            EventStore::open_existing_matching(&foreign, foreign_id, 0).unwrap();
+            EventStore::open_suffix(&foreign, foreign_id, boundary, None).unwrap();
         assert!(recovered.is_empty());
         drop(store);
         assert_eq!(
@@ -639,26 +614,23 @@ mod tests {
         drop(store);
 
         std::fs::copy(&path, &copy).unwrap();
-        let applied = std::fs::metadata(&copy).unwrap().len();
+        let boundary = JOURNAL_HEADER_LEN as u64;
         let (store, recovered) =
-            EventStore::open_existing_matching(&copy, journal_id, applied).unwrap();
+            EventStore::open_suffix(&copy, journal_id, boundary, None).unwrap();
         assert_eq!(recovered, deposit_batch(1, 10));
         drop(store);
 
         // Another id is refused before anything is read or repaired: the torn tail stays.
+        let full_len = std::fs::metadata(&copy).unwrap().len();
         OpenOptions::new()
             .write(true)
             .open(&copy)
             .unwrap()
-            .set_len(applied - 4)
+            .set_len(full_len - 4)
             .unwrap();
         let torn = std::fs::read(&copy).unwrap();
         assert!(matches!(
-            EventStore::open_existing_matching(&copy, Uuid::new_v4(), 0),
-            Err(EventStoreError::JournalIdentityMismatch { .. })
-        ));
-        assert!(matches!(
-            EventStore::open_suffix(&copy, Uuid::new_v4(), JOURNAL_HEADER_LEN as u64),
+            EventStore::open_suffix(&copy, Uuid::new_v4(), boundary, None),
             Err(EventStoreError::JournalIdentityMismatch { .. })
         ));
         assert_eq!(std::fs::read(&copy).unwrap(), torn);
@@ -667,37 +639,57 @@ mod tests {
         std::fs::remove_file(copy).unwrap();
     }
 
-    /// An older copy of the journal keeps its id, so promotion also refuses a journal shorter
-    /// than what the follower already applied, and leaves it as it found it.
+    /// An older copy of the journal keeps its id, so a journal shorter than what was already
+    /// applied from it is refused too, and left as it was found.
     #[test]
-    fn promotion_refuses_a_journal_shorter_than_what_was_applied_untouched() {
+    fn a_journal_shorter_than_what_was_applied_is_refused_untouched() {
         let path = temp_path("shorter-than-applied");
-        let (journal_id, first_end, applied) = {
+        let (journal_id, applied) = {
             let (mut store, _) = EventStore::open(&path).unwrap();
             store.append(&deposit_batch(1, 10)).unwrap();
-            let first_end = store.file.metadata().unwrap().len();
             store.append(&deposit_batch(3, 20)).unwrap();
-            let applied = store.file.metadata().unwrap().len();
-            (store.journal_id(), first_end, applied)
+            (store.journal_id(), store.file.metadata().unwrap().len())
         };
-        let full = std::fs::read(&path).unwrap();
+        let older = std::fs::read(&path).unwrap()[..applied as usize - 4].to_vec();
+        std::fs::write(&path, &older).unwrap();
 
-        // One older copy is cut inside its last record. The other's last record claims more bytes
-        // than it has, so the file is as long as what was applied, but that record is torn.
-        let mut torn_across = full.clone();
-        let at = first_end as usize;
-        let claimed = u32::from_le_bytes(full[at..at + 4].try_into().unwrap()) + 100;
-        torn_across[at..at + 4].copy_from_slice(&claimed.to_le_bytes());
+        assert!(matches!(
+            EventStore::open_suffix(&path, journal_id, applied, None),
+            Err(EventStoreError::ShorterThanApplied { length, applied: a })
+                if length == applied - 4 && a == applied
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), older);
+        std::fs::remove_file(path).unwrap();
+    }
 
-        for copy in [full[..full.len() - 4].to_vec(), torn_across] {
-            std::fs::write(&path, &copy).unwrap();
-            assert!(matches!(
-                EventStore::open_existing_matching(&path, journal_id, applied),
-                Err(EventStoreError::ShorterThanApplied { length, applied: a })
-                    if length == first_end && a == applied
-            ));
-            assert_eq!(std::fs::read(&path).unwrap(), copy);
-        }
+    /// Promotion takes over only the file the warm replica read. Even a byte-identical copy put
+    /// in its place is refused, before its torn tail is repaired, while the followed file opens.
+    #[test]
+    fn promotion_opens_only_the_file_the_warm_replica_followed() {
+        let path = temp_path("followed");
+        let moved = temp_path("followed-moved");
+        let (journal_id, applied) = {
+            let (mut store, _) = EventStore::open(&path).unwrap();
+            store.append(&deposit_batch(1, 10)).unwrap();
+            (store.journal_id(), store.file.metadata().unwrap().len())
+        };
+        let followed = File::open(&path).unwrap();
+
+        std::fs::rename(&path, &moved).unwrap();
+        let mut copy = std::fs::read(&moved).unwrap();
+        copy.extend_from_slice(&encode_record(&deposit_batch(3, 20)).unwrap()[..10]);
+        std::fs::write(&path, &copy).unwrap();
+        assert!(matches!(
+            EventStore::open_suffix(&path, journal_id, applied, Some((&followed, applied))),
+            Err(EventStoreError::NotTheFollowedFile)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), copy);
+
+        std::fs::rename(&moved, &path).unwrap();
+        let (_store, suffix) =
+            EventStore::open_suffix(&path, journal_id, applied, Some((&followed, applied)))
+                .unwrap();
+        assert!(suffix.is_empty());
         std::fs::remove_file(path).unwrap();
     }
 
@@ -818,7 +810,7 @@ mod tests {
             journal_id = store.journal_id();
         }
 
-        let (_store, suffix) = EventStore::open_suffix(&path, journal_id, boundary).unwrap();
+        let (_store, suffix) = EventStore::open_suffix(&path, journal_id, boundary, None).unwrap();
         assert_eq!(suffix, deposit_batch(3, 20));
         std::fs::remove_file(path).unwrap();
     }
@@ -842,7 +834,7 @@ mod tests {
             .set_len(full - 4)
             .unwrap();
 
-        let (_store, suffix) = EventStore::open_suffix(&path, journal_id, boundary).unwrap();
+        let (_store, suffix) = EventStore::open_suffix(&path, journal_id, boundary, None).unwrap();
         assert!(suffix.is_empty());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), boundary);
         std::fs::remove_file(path).unwrap();

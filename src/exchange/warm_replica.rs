@@ -3,14 +3,14 @@
 //! This process deterministically rebuilds the exchange core from complete committed batches but
 //! deliberately owns no journal writer, mmap writer, command queue, customer HTTP routes, or
 //! database connection. Its only listener is a loopback-only operator control endpoint. A manual
-//! promotion first acquires the journal's exclusive writer lock, then fully revalidates the
-//! authoritative journal before creating a primary runtime.
+//! promotion first acquires the journal's exclusive writer lock, then hands its own core to the
+//! new primary, which replays only the records this replica had not applied yet.
 //!
 //! It is also the exchange's snapshot writer. It reads every batch from the durable journal (the
-//! mmap stream supplies only the committed watermark), checks each one by deterministic replay, and
-//! every `snapshot_every` commands, and right after each open, writes the journal-bound core
-//! snapshot the primary loads on restart. The primary's trading thread therefore never stops to
-//! serialize its whole state.
+//! mmap stream supplies only the committed watermark), checks each one by deterministic replay,
+//! and writes the journal-bound core snapshot the primary loads on restart: right after each open,
+//! and whenever the journal has grown by `snapshot_growth` times the last snapshot's size. The
+//! primary's trading thread therefore never stops to serialize its whole state.
 
 use std::{
     error::Error,
@@ -56,15 +56,15 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
-/// The fenced ownership hand-off returned to `main`, which creates the normal primary runtime.
-/// It contains a complete writer-locked journal recovery, not the warm core: promotion rebuilds
-/// from the whole journal. (Reusing the warm's own snapshot to promote faster is future work.)
+/// The fenced ownership hand-off returned to `main`, which creates the primary runtime from it:
+/// the writer-locked journal, this replica's core, and the records after the core's position
+/// that the replica had not applied yet (`suffix`, recovered from the same journal file).
 pub(crate) struct WarmPromotion {
     pub(crate) store: EventStore,
-    pub(crate) recovered: Vec<EventEnvelope>,
+    pub(crate) replica: ReplicaCore,
+    pub(crate) suffix: Vec<EventEnvelope>,
     pub(crate) journal_path: PathBuf,
     pub(crate) stream_path: PathBuf,
-    pub(crate) snapshot_path: PathBuf,
 }
 
 /// The state which belongs exclusively to the follower thread. `applied_checkpoint` is separate
@@ -87,8 +87,16 @@ struct WarmReplica {
 struct SnapshotWriter {
     /// Read-only handle, used to bind each snapshot to the journal's identity and length.
     journal: File,
-    every_commands: u64,
-    commands_since: u64,
+    /// A snapshot is due once the journal has grown, since the last one, by `growth` times that
+    /// snapshot's size. Writing a snapshot costs about its size, so snapshots stay a fixed share
+    /// of the replica's work however big the day's state gets. While they are written, a restart
+    /// replays at most about `growth` snapshot sizes of journal past the last one, plus whatever
+    /// this replica had not applied yet.
+    growth: u64,
+    /// The journal position of the last attempt, and the size that sets the next interval: the
+    /// last snapshot's size, raised after a failed attempt.
+    last_offset: u64,
+    last_size: u64,
 }
 
 impl WarmReplica {
@@ -96,25 +104,28 @@ impl WarmReplica {
         journal_path: impl AsRef<Path>,
         stream_path: impl AsRef<Path>,
         snapshot_path: impl AsRef<Path>,
-        snapshot_every: u64,
+        snapshot_growth: u64,
     ) -> Result<Self, String> {
         let journal_path = journal_path.as_ref().to_path_buf();
         let stream_path = stream_path.as_ref().to_path_buf();
         let snapshot_path = snapshot_path.as_ref().to_path_buf();
+        let snapshot_size = std::fs::metadata(&snapshot_path).map_or(0, |metadata| metadata.len());
 
-        let from_start = || -> Result<(ReplicaCore, StreamReader, ReaderCheckpoint), String> {
-            let reader = StreamReader::open(&journal_path, &stream_path, None)
-                .map_err(|error| format!("could not open committed stream: {error}"))?;
-            let checkpoint = reader.checkpoint();
-            Ok((ReplicaCore::new(), reader, checkpoint))
-        };
+        // The last value is the size of the snapshot the replica starts from: none here.
+        let from_start =
+            || -> Result<(ReplicaCore, StreamReader, ReaderCheckpoint, u64), String> {
+                let reader = StreamReader::open(&journal_path, &stream_path, None)
+                    .map_err(|error| format!("could not open committed stream: {error}"))?;
+                let checkpoint = reader.checkpoint();
+                Ok((ReplicaCore::new(), reader, checkpoint, 0))
+            };
 
         let mut snapshot_is_safe_to_replace = true;
         let mut invalid_snapshot = |error: String| {
             eprintln!("ignoring snapshot and rebuilding warm replica from sequence 1: {error}");
             snapshot_is_safe_to_replace = false;
         };
-        let (replica, reader, applied_checkpoint) =
+        let (replica, reader, applied_checkpoint, start_size) =
             match snapshot::load(&snapshot_path, &journal_path) {
                 Ok(Some(loaded)) => {
                     let checkpoint = StreamReader::checkpoint_from_parts(
@@ -130,7 +141,7 @@ impl WarmReplica {
                         ) {
                             Ok(reader) => {
                                 match ReplicaCore::from_snapshot(core, checkpoint.next_sequence) {
-                                    Ok(replica) => (replica, reader, checkpoint),
+                                    Ok(replica) => (replica, reader, checkpoint, snapshot_size),
                                     Err(error) => {
                                         invalid_snapshot(format!("{error:?}"));
                                         from_start()?
@@ -162,8 +173,9 @@ impl WarmReplica {
             Some(SnapshotWriter {
                 journal: File::open(&journal_path)
                     .map_err(|error| format!("could not open journal for snapshots: {error}"))?,
-                every_commands: snapshot_every,
-                commands_since: 0,
+                growth: snapshot_growth,
+                last_offset: applied_checkpoint.byte_offset(),
+                last_size: start_size,
             })
         } else {
             eprintln!(
@@ -186,20 +198,27 @@ impl WarmReplica {
         })
     }
 
-    /// Counts one applied command and, every `every_commands` or right after an open, writes the
-    /// snapshot at exactly the applied checkpoint: the state and the journal position it matches
-    /// are taken together. An open has just cleared the previous day, so the snapshot is at its
-    /// smallest and a restart replays only the new day. A failed write keeps the previous snapshot
-    /// and is retried after another full interval.
+    /// After each applied command, writes the snapshot at exactly the applied checkpoint when one
+    /// is due: right after an open, or once the journal has grown by `growth` times the last
+    /// snapshot's size. The state and the journal position it matches are taken together. An open
+    /// has just cleared the previous day, so that snapshot is at its smallest and a restart
+    /// replays only the new day.
+    ///
+    /// A failed attempt keeps the previous snapshot. It costs about as much as a written one, so
+    /// the next attempt waits for `growth` times as much journal as this one did: each failure
+    /// multiplies the wait, and a persistent failure costs a few attempts a day, not every command
+    /// (unless `growth` is 0). After a failed attempt at an open, the next usually comes at the
+    /// next open.
     fn maybe_write_snapshot(&mut self, opened: bool) {
         let (Some(writer), Some(replica)) = (self.snapshots.as_mut(), self.replica.as_ref()) else {
             return;
         };
-        writer.commands_since += 1;
-        if !opened && writer.commands_since < writer.every_commands {
+        let offset = self.applied_checkpoint.byte_offset();
+        let grown = offset.saturating_sub(writer.last_offset);
+        if !opened && grown < writer.growth.saturating_mul(writer.last_size) {
             return;
         }
-        writer.commands_since = 0;
+        writer.last_offset = offset;
         let started = Instant::now();
         let journal_id = self.applied_checkpoint.journal_id();
         // If the journal at this path was moved aside and replaced by another journal, a snapshot
@@ -208,6 +227,7 @@ impl WarmReplica {
         match File::open(&self.journal_path).and_then(|journal| journal_id_of(&journal)) {
             Ok(id) if id == journal_id => {}
             _ => {
+                writer.last_size = writer.last_size.max(grown);
                 eprintln!(
                     "not writing a snapshot: the journal path no longer names the journal this warm replica follows"
                 );
@@ -216,7 +236,7 @@ impl WarmReplica {
         }
         let boundary = SnapshotBoundary {
             journal_id,
-            byte_offset: self.applied_checkpoint.byte_offset(),
+            byte_offset: offset,
             next_event_sequence: self.applied_checkpoint.next_sequence,
         };
         match snapshot::write(
@@ -226,12 +246,18 @@ impl WarmReplica {
             boundary,
             replica.snapshot(),
         ) {
-            Ok(()) => println!(
-                "warm replica wrote a snapshot through event sequence {} in {} ms",
-                self.applied_checkpoint.next_sequence - 1,
-                started.elapsed().as_millis()
-            ),
-            Err(error) => eprintln!("snapshot checkpoint was not updated: {error}"),
+            Ok(size) => {
+                writer.last_size = size;
+                println!(
+                    "warm replica wrote a snapshot through event sequence {} in {} ms",
+                    self.applied_checkpoint.next_sequence - 1,
+                    started.elapsed().as_millis()
+                );
+            }
+            Err(error) => {
+                writer.last_size = writer.last_size.max(grown);
+                eprintln!("snapshot checkpoint was not updated: {error}");
+            }
         }
     }
 
@@ -286,15 +312,16 @@ impl WarmReplica {
     }
 
     /// Fence first. A `WouldBlock` result leaves every field intact, so the caught-up warm can
-    /// continue following the old primary. Once the lock succeeds, the entire durable journal is
-    /// re-read and later deterministically replayed by the primary factory. Any error after the
-    /// fence is terminal and fails closed.
+    /// continue following the old primary. Once the lock succeeds, only the journal after the
+    /// applied checkpoint is read; the primary factory replays it into this replica's core. Any
+    /// error after the fence is terminal and fails closed.
     fn try_promote(&mut self) -> Result<WarmPromotion, PromotionFailure> {
         let checkpoint = self.applied_checkpoint.clone();
-        let replica = self
-            .replica
-            .as_ref()
-            .ok_or_else(|| PromotionFailure::Fatal("warm replica was already promoted".into()))?;
+        let (Some(reader), Some(replica)) = (self.reader.as_ref(), self.replica.as_ref()) else {
+            return Err(PromotionFailure::Fatal(
+                "warm replica was already promoted".into(),
+            ));
+        };
         if replica.next_event_sequence() != checkpoint.next_sequence {
             return Err(PromotionFailure::Fatal(
                 "warm replica core and applied checkpoint disagree".into(),
@@ -302,26 +329,27 @@ impl WarmReplica {
         }
 
         // Fence, prove identity, then recover — strictly in that order. Recovery can repair a torn
-        // tail, which truncates the file; if the path now names a different journal, that repair
-        // would destroy history this follower never read. `open_existing_matching` refuses a
-        // mismatched file while holding the lock and before it reads past the header, leaving it
-        // untouched.
-        let (store, recovered) = EventStore::open_existing_matching(
+        // tail, which truncates the file; if the path now names another file, that repair would
+        // destroy history this follower never read. `open_suffix` refuses a file other than the
+        // one this replica read, a different journal, or one shorter than what the stream
+        // published or this replica applied, while holding the lock and before it reads anything
+        // after the header.
+        let (store, suffix) = EventStore::open_suffix(
             &self.journal_path,
             checkpoint.journal_id(),
             checkpoint.byte_offset(),
+            Some((reader.journal(), reader.published_end())),
         )
         .map_err(PromotionFailure::from_store)?;
-        // The lock is held and the full journal has been physically recovered. Drop the reader and
-        // warm core: `ExchangeRuntime` will rebuild solely from `recovered` before it writes.
+        // The lock is held and the journal after the checkpoint has been recovered. The core moves
+        // to the primary factory, which replays `suffix` into it before anything is written.
         self.reader.take();
-        self.replica.take();
         Ok(WarmPromotion {
             store,
-            recovered,
+            replica: self.replica.take().expect("checked above"),
+            suffix,
             journal_path: self.journal_path.clone(),
             stream_path: self.stream_path.clone(),
-            snapshot_path: self.snapshot_path.clone(),
         })
     }
 }
@@ -492,8 +520,9 @@ fn follow(
 /// Runs a local, read-only warm replica until an operator POSTs `/promote`. The returned hand-off
 /// has already fenced the prior writer; `main` must immediately build the normal primary runtime
 /// from it. This function never opens PostgreSQL or the customer-facing exchange routes. While it
-/// follows, it writes a core snapshot every `snapshot_every` commands and right after each open.
-pub async fn run(args: &[String], snapshot_every: u64) -> WarmResult<WarmPromotion> {
+/// follows, it writes a core snapshot right after each open, and whenever the journal has grown
+/// by `snapshot_growth` times the last snapshot's size.
+pub async fn run(args: &[String], snapshot_growth: u64) -> WarmResult<WarmPromotion> {
     if !(3..=4).contains(&args.len()) {
         return Err(
             invalid("usage: stock --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR]").into(),
@@ -508,7 +537,7 @@ pub async fn run(args: &[String], snapshot_every: u64) -> WarmResult<WarmPromoti
         return Err(invalid("warm-replica management listener must use a loopback address").into());
     }
 
-    let mut warm = WarmReplica::open(&args[0], &args[1], &args[2], snapshot_every)
+    let mut warm = WarmReplica::open(&args[0], &args[1], &args[2], snapshot_growth)
         .map_err(io::Error::other)?;
     warm.catch_up().map_err(io::Error::other)?;
     let initial_sequence = warm.next_event_sequence().map_err(io::Error::other)?;
@@ -591,7 +620,7 @@ mod tests {
             event_store::{EventStore, EventStoreError, JOURNAL_HEADER_LEN, encode_record},
             event_stream::{StreamReader, tests::Fixture},
             runtime::{
-                promote_replica_with_stream_and_snapshot, recover_runtime_with_stream,
+                promote_replica, recover_runtime_with_stream,
                 recover_runtime_with_stream_and_snapshot, replay_event_log,
             },
         },
@@ -788,7 +817,7 @@ mod tests {
         let (mut store, mut writer) =
             fixture.start(crate::exchange::event_stream::DEFAULT_CAPACITY);
         // Snapshot after every command: a batch that fails replay must not produce one.
-        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 1).unwrap();
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 0).unwrap();
         let checkpoint_before = warm.applied_checkpoint.clone();
         let core_before = warm.replica.as_ref().unwrap().snapshot();
         let batch = vec![
@@ -818,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn warm_follows_and_promotion_rebuilds_from_the_journal_not_a_differing_valid_mmap_cache() {
+    fn warm_follows_and_promotes_from_the_journal_not_a_differing_valid_mmap_cache() {
         let fixture = Fixture::new();
         let snapshot = fixture.dir.join("events.snapshot");
         let journal_batch = vec![
@@ -872,6 +901,10 @@ mod tests {
             ExchangeCore::new().snapshot(),
         )
         .unwrap();
+        // Caught up with the empty journal, the warm replica stands at the stream's committed end,
+        // where a reader is offered the next record from the stream's cache window.
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
+        warm.catch_up().unwrap();
         store.append_record(&journal_record).unwrap();
         writer.append(&journal_record, 2).unwrap();
         drop(writer);
@@ -879,8 +912,7 @@ mod tests {
 
         // This simulates an impossible-under-the-cooperative-protocol but still structurally
         // valid cache disagreement. The warm reads batches from the journal, so the cache never
-        // reaches its core — which is what makes that core safe to snapshot — and a promotion
-        // rebuilds from the journal regardless.
+        // reaches its core — which is what makes that core safe to snapshot, and to promote.
         let stream = OpenOptions::new()
             .read(true)
             .write(true)
@@ -889,7 +921,6 @@ mod tests {
         stream.lock().unwrap();
         stream.write_all_at(&cache_record, 80).unwrap();
         stream.unlock().unwrap();
-        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
         warm.catch_up().unwrap();
         assert_eq!(
             warm.replica.as_ref().unwrap().snapshot(),
@@ -902,21 +933,14 @@ mod tests {
 
         let WarmPromotion {
             store,
-            recovered,
-            journal_path,
+            replica,
+            suffix,
             stream_path,
-            snapshot_path,
+            ..
         } = warm.try_promote().unwrap();
+        assert!(suffix.is_empty());
         let (_tx, rx) = tokio::sync::mpsc::channel(8);
-        let promoted = promote_replica_with_stream_and_snapshot(
-            rx,
-            store,
-            recovered,
-            &journal_path,
-            &stream_path,
-            &snapshot_path,
-        )
-        .unwrap();
+        let promoted = promote_replica(rx, store, replica, suffix, &stream_path).unwrap();
         assert_eq!(
             promoted.core_snapshot_for_test(),
             replay_event_log(&journal_batch).unwrap().snapshot()
@@ -924,7 +948,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loopback_promote_endpoint_hands_a_writer_locked_full_journal_to_the_primary_factory() {
+    async fn loopback_promote_endpoint_hands_the_locked_journal_and_the_core_to_the_primary() {
         let fixture = Fixture::new();
         let snapshot = fixture.dir.join("events.snapshot");
         let batch = vec![
@@ -968,26 +992,18 @@ mod tests {
         assert!(body.contains("promotion fenced the old writer"));
         let WarmPromotion {
             store,
-            recovered,
-            journal_path,
+            replica,
+            suffix,
             stream_path,
-            snapshot_path,
+            ..
         } = handoff.await.unwrap().unwrap();
         assert!(matches!(
-            EventStore::open_existing_matching(&fixture.log, store.journal_id(), 0),
+            EventStore::open(&fixture.log),
             Err(EventStoreError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock
         ));
 
         let (_tx, rx) = tokio::sync::mpsc::channel(8);
-        let promoted = promote_replica_with_stream_and_snapshot(
-            rx,
-            store,
-            recovered,
-            &journal_path,
-            &stream_path,
-            &snapshot_path,
-        )
-        .unwrap();
+        let promoted = promote_replica(rx, store, replica, suffix, &stream_path).unwrap();
         assert_eq!(promoted.next_event_sequence(), 3);
         assert_eq!(
             promoted.core_snapshot_for_test(),
@@ -1026,21 +1042,24 @@ mod tests {
                 user_id: "buyer".into(),
                 amount: 7,
             },
-            ExchangeInputEvent::FundsDepositRequested {
-                user_id: "buyer".into(),
-                amount: 9,
-            },
         ] {
             primary.record_input_for_test(input).unwrap();
         }
         // Trading never touched the snapshot: only the warm replica writes them now.
         assert_eq!(std::fs::read(&snapshot).unwrap(), startup_snapshot);
 
-        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 2).unwrap();
+        // A snapshot after every command; the warm replica has applied seven of them when the
+        // eighth arrives.
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 0).unwrap();
         warm.catch_up().unwrap();
+        primary
+            .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 9,
+            })
+            .unwrap();
 
-        // Eight commands: a snapshot right after the open, then one every two commands after it,
-        // so the last was written after the seventh, at exactly the warm's applied position then.
+        // The last snapshot is at exactly the warm's applied position then: before the eighth.
         let loaded = snapshot::load(&snapshot, &fixture.log).unwrap().unwrap();
         let last_command_envelopes = 2;
         assert_eq!(
@@ -1093,8 +1112,9 @@ mod tests {
             primary.record_input_for_test(input).unwrap();
         }
 
-        // Seven commands against an interval of 1,000, yet the second open left a snapshot.
-        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 1_000).unwrap();
+        // No journal growth makes a snapshot due at this growth factor, yet the second open left
+        // one.
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
         warm.catch_up().unwrap();
         let loaded = snapshot::load(&snapshot, &fixture.log).unwrap().unwrap();
         assert_eq!(
@@ -1129,7 +1149,7 @@ mod tests {
         let corrupt = b"not an exchange snapshot";
         std::fs::write(&snapshot, corrupt).unwrap();
 
-        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 1).unwrap();
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 0).unwrap();
         warm.catch_up().unwrap();
 
         assert_eq!(
@@ -1154,7 +1174,7 @@ mod tests {
             })
             .unwrap();
         // A first warm replica writes a snapshot after that command, past the empty startup one.
-        let mut first = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 1).unwrap();
+        let mut first = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, 0).unwrap();
         first.catch_up().unwrap();
         drop(first);
         let loaded = snapshot::load(&snapshot, &fixture.log).unwrap().unwrap();
@@ -1237,7 +1257,7 @@ mod tests {
 
         // An operator moves the followed journal aside, and a different journal — torn in the
         // middle of its only record — appears at the same path. The follower still holds the
-        // original file open, so only the journal id in its checkpoint can tell the two apart.
+        // original file open, so promotion sees that the path now names another file.
         std::fs::rename(&fixture.log, fixture.dir.join("events.moved")).unwrap();
         {
             let (mut replacement, _) = EventStore::open(&fixture.log).unwrap();
@@ -1271,7 +1291,7 @@ mod tests {
 
         assert!(matches!(
             warm.try_promote(),
-            Err(PromotionFailure::Fatal(_))
+            Err(PromotionFailure::Fatal(message)) if message.contains("different file")
         ));
 
         // The refusal must come before any recovery read or torn-tail repair. A journal that is
@@ -1294,18 +1314,208 @@ mod tests {
         let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
         warm.catch_up().unwrap();
         drop(primary);
+        let current = std::fs::read(&fixture.log).unwrap();
 
-        // A copy taken after the first deposit is put back in place. It has the same id, so only
-        // the length this follower already applied shows that it lost the second deposit.
+        // A copy taken after the first deposit is put back in place. It has the same id. Renamed
+        // into place, it is not the file this follower read; written over that file, it is
+        // shorter than what the follower applied. Either way it lost the second deposit, and it
+        // is refused untouched.
         let backup = fixture.dir.join("events.backup");
         std::fs::write(&backup, &older).unwrap();
         std::fs::rename(&backup, &fixture.log).unwrap();
+        assert!(matches!(
+            warm.try_promote(),
+            Err(PromotionFailure::Fatal(message)) if message.contains("different file")
+        ));
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), older);
+
+        // A new warm replica cannot even follow the copy: the stream published more than it holds.
+        assert!(WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).is_err());
+
+        std::fs::write(&fixture.log, &current).unwrap();
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
+        warm.catch_up().unwrap();
+        std::fs::write(&fixture.log, &older).unwrap();
+        assert!(matches!(
+            warm.try_promote(),
+            Err(PromotionFailure::Fatal(message)) if message.contains("shorter than")
+        ));
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), older);
+    }
+
+    /// A warm replica that lags has applied less than the stream published. An older copy written
+    /// over the followed file can then reach what the replica applied and still lack records that
+    /// were published, and that readers may already have consumed: promotion refuses it untouched.
+    #[test]
+    fn promotion_refuses_a_journal_shorter_than_what_the_stream_published() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.dir.join("events.snapshot");
+        let mut primary = runtime_for(&fixture);
+        let deposit = |amount| ExchangeInputEvent::FundsDepositRequested {
+            user_id: "buyer".into(),
+            amount,
+        };
+        primary.record_input_for_test(deposit(10)).unwrap();
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
+        warm.catch_up().unwrap();
+        primary.record_input_for_test(deposit(20)).unwrap();
+        let older = std::fs::read(&fixture.log).unwrap();
+        primary.record_input_for_test(deposit(30)).unwrap();
+        drop(primary);
+
+        // The replica applied only the first deposit; the copy holds two of the three published.
+        std::fs::write(&fixture.log, &older).unwrap();
+        assert!(matches!(
+            warm.try_promote(),
+            Err(PromotionFailure::Fatal(message)) if message.contains("shorter than")
+        ));
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), older);
+    }
+
+    /// The file is the one the warm replica followed, but it now holds another journal: the id
+    /// check on the promotion path refuses it untouched.
+    #[test]
+    fn promotion_refuses_another_journal_written_over_the_followed_file() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.dir.join("events.snapshot");
+        let other = fixture.dir.join("other.log");
+        let mut primary = runtime_for(&fixture);
+        primary
+            .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 10,
+            })
+            .unwrap();
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
+        warm.catch_up().unwrap();
+        drop(primary);
+        {
+            let (mut store, _) = EventStore::open(&other).unwrap();
+            for seq in [1, 3] {
+                store
+                    .append(&[
+                        EventEnvelope {
+                            seq_num: seq,
+                            event: ExchangeEvent::Input(
+                                ExchangeInputEvent::FundsDepositRequested {
+                                    user_id: "someone-else".into(),
+                                    amount: 99,
+                                },
+                            ),
+                        },
+                        EventEnvelope {
+                            seq_num: seq + 1,
+                            event: ExchangeEvent::Output(ExchangeOutputEvent::FundsDeposited {
+                                user_id: "someone-else".into(),
+                                amount: 99,
+                            }),
+                        },
+                    ])
+                    .unwrap();
+            }
+        }
+        let replacement = std::fs::read(&other).unwrap();
+        std::fs::write(&fixture.log, &replacement).unwrap();
 
         assert!(matches!(
             warm.try_promote(),
-            Err(PromotionFailure::Fatal(message)) if message.contains("already applied")
+            Err(PromotionFailure::Fatal(message)) if message.contains("identity changed")
         ));
-        assert_eq!(std::fs::read(&fixture.log).unwrap(), older);
+        assert_eq!(std::fs::read(&fixture.log).unwrap(), replacement);
+    }
+
+    /// A snapshot that cannot be written costs about as much as one that is, so failed attempts
+    /// back off: each waits for the growth factor times as much journal as the one before, rather
+    /// than coming after every command. Both ways an attempt fails: the write itself, and a
+    /// journal path that no longer names the journal the replica follows.
+    #[test]
+    fn failed_snapshots_are_retried_less_and_less_often() {
+        for journal_replaced in [false, true] {
+            let fixture = Fixture::new();
+            let snapshot = if journal_replaced {
+                fixture.dir.join("events.snapshot")
+            } else {
+                // Its directory does not exist, so every write fails.
+                fixture.dir.join("missing").join("events.snapshot")
+            };
+            let mut primary = runtime_for(&fixture);
+            let growth = 4;
+            let mut warm =
+                WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, growth).unwrap();
+            if journal_replaced {
+                // The primary and the replica keep their own handles on the journal they use.
+                std::fs::rename(&fixture.log, fixture.dir.join("events.moved")).unwrap();
+                drop(EventStore::open(&fixture.log).unwrap());
+            }
+            let mut attempts = vec![warm.snapshots.as_ref().unwrap().last_offset];
+            for user in 0..200 {
+                primary
+                    .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                        user_id: format!("user-{user}"),
+                        amount: 1,
+                    })
+                    .unwrap();
+                warm.catch_up().unwrap();
+                let attempted = warm.snapshots.as_ref().unwrap().last_offset;
+                if attempts.last() != Some(&attempted) {
+                    attempts.push(attempted);
+                }
+            }
+            assert!(!snapshot.exists());
+            assert!(
+                (4..10).contains(&attempts.len()),
+                "{journal_replaced}: {attempts:?}"
+            );
+            assert!(
+                attempts
+                    .windows(3)
+                    .all(|gaps| gaps[2] - gaps[1] >= growth * (gaps[1] - gaps[0])),
+                "{journal_replaced}: {attempts:?}"
+            );
+        }
+    }
+
+    /// The growth rule, command by command: a snapshot is written exactly when the journal has
+    /// grown by the growth factor times the last snapshot's size. Every deposit adds a user, so
+    /// the state, and with it the gap between snapshots, keeps growing.
+    #[test]
+    fn warm_replica_snapshots_once_the_journal_grows_by_the_factor_times_the_last_snapshot() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.dir.join("events.snapshot");
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut primary =
+            recover_runtime_with_stream_and_snapshot(rx, &fixture.log, &fixture.bus, &snapshot)
+                .unwrap();
+        let growth = 3;
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, growth).unwrap();
+        let size = || std::fs::metadata(&snapshot).unwrap().len();
+        let boundary = || {
+            snapshot::load(&snapshot, &fixture.log)
+                .unwrap()
+                .unwrap()
+                .boundary
+                .byte_offset
+        };
+        let (mut last_offset, mut last_size) = (boundary(), size());
+        let mut gaps = Vec::new();
+        for user in 0..200 {
+            primary
+                .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                    user_id: format!("user-{user}"),
+                    amount: 1,
+                })
+                .unwrap();
+            warm.catch_up().unwrap();
+            let offset = std::fs::metadata(&fixture.log).unwrap().len();
+            let due = offset - last_offset >= growth * last_size;
+            assert_eq!(boundary() == offset, due, "after deposit {user}");
+            if due {
+                gaps.push(offset - last_offset);
+                (last_offset, last_size) = (offset, size());
+            }
+        }
+        assert!(gaps.len() >= 3, "{gaps:?}");
+        assert!(gaps.windows(2).all(|pair| pair[0] < pair[1]), "{gaps:?}");
     }
 
     #[test]
@@ -1343,22 +1553,15 @@ mod tests {
         drop(primary);
         let WarmPromotion {
             store,
-            recovered,
-            journal_path,
+            replica,
+            suffix,
             stream_path,
-            snapshot_path,
+            ..
         } = warm.try_promote().unwrap();
-        assert_eq!(recovered.len(), 4);
+        // Only the durable batch the warm replica never saw is read and replayed.
+        assert_eq!(suffix.len(), 2);
         let (_tx, rx) = tokio::sync::mpsc::channel(8);
-        let mut promoted = promote_replica_with_stream_and_snapshot(
-            rx,
-            store,
-            recovered,
-            &journal_path,
-            &stream_path,
-            &snapshot_path,
-        )
-        .unwrap();
+        let mut promoted = promote_replica(rx, store, replica, suffix, &stream_path).unwrap();
         assert_eq!(
             promoted.core_snapshot_for_test(),
             expected_after_hidden_tail

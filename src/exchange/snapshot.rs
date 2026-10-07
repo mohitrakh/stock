@@ -142,15 +142,16 @@ pub(crate) fn load(
 }
 
 /// Publishes a complete checkpoint by replacing the old snapshot only after the new bytes have
-/// been fully synchronized. If this returns an error before `rename`, the prior checkpoint stays
-/// usable and the authoritative journal already contains the command that triggered the attempt.
+/// been fully synchronized, and returns its size in bytes. If this returns an error before
+/// `rename`, the prior checkpoint stays usable and the authoritative journal already contains the
+/// command that triggered the attempt.
 pub(crate) fn write(
     path: impl AsRef<Path>,
     journal: &File,
     protected_path: impl AsRef<Path>,
     boundary: SnapshotBoundary,
     core: CoreSnapshot,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     write_inner(path, journal, protected_path, boundary, core, false)
 }
 
@@ -161,7 +162,7 @@ fn write_inner(
     boundary: SnapshotBoundary,
     core: CoreSnapshot,
     fail_before_rename: bool,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let path = path.as_ref();
     let protected_path = protected_path.as_ref();
     let journal_meta = journal
@@ -234,7 +235,7 @@ fn write_inner(
         File::open(parent(path))
             .and_then(|directory| directory.sync_all())
             .map_err(|error| format!("could not synchronize snapshot directory: {error}"))?;
-        Ok(())
+        Ok(bytes.len() as u64)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);

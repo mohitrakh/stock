@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::{
     exchange::{
@@ -34,10 +34,13 @@ pub struct ExchangeRuntime {
     stream: Option<StreamWriter>,
 }
 
-/// Commands between core snapshots. Since milestone 20 the warm replica writes them, not this
-/// runtime: a snapshot serializes the whole core, and doing that on the trading thread froze
-/// trading for seconds. See `docs/performance/04-snapshots-off-the-trading-thread.md`.
-pub const DEFAULT_SNAPSHOT_INTERVAL: u64 = 10_000;
+/// How much the journal grows between core snapshots, as a multiple of the last snapshot's size.
+/// Since milestone 20 the warm replica writes them, not this runtime: a snapshot serializes the
+/// whole core, and doing that on the trading thread froze trading for seconds (see
+/// `docs/performance/04-snapshots-off-the-trading-thread.md`). Since milestone 23 part 3 the rule
+/// is journal growth rather than a fixed 10,000 commands, which made a day's snapshot work grow
+/// with the square of its length (see `docs/performance/09-promotion-from-the-warm-replica.md`).
+pub const DEFAULT_SNAPSHOT_GROWTH: u64 = 4;
 
 /// Most commands that may share one journal sync. Below this cap a group is simply whatever was
 /// already queued; the cap bounds how long the first command waits for the last to be prepared.
@@ -189,6 +192,11 @@ impl ReplicaCore {
     /// The normalized core state, as the warm replica writes it to a snapshot.
     pub(crate) fn snapshot(&self) -> crate::exchange::core::CoreSnapshot {
         self.core.snapshot()
+    }
+
+    /// The core and the next sequence, which a promotion hands to the new primary.
+    pub(crate) fn into_parts(self) -> (ExchangeCore, u64) {
+        (self.core, self.next_event_seq)
     }
 }
 
@@ -739,6 +747,7 @@ impl ExchangeRuntime {
             boundary,
             self.core.snapshot(),
         )
+        .map(|_| ())
     }
 
     pub fn run(mut self) {
@@ -1130,14 +1139,7 @@ pub fn recover_runtime_with_stream(
     stream_path: impl AsRef<Path>,
 ) -> Result<ExchangeRuntime, StartupError> {
     let mut runtime = recover_runtime(rx, journal_path)?;
-    let stream = StreamWriter::open(
-        stream_path,
-        runtime.store.as_ref().unwrap().file(),
-        runtime.next_event_seq - 1,
-        DEFAULT_CAPACITY,
-    )
-    .map_err(StartupError::Stream)?;
-    runtime.stream = Some(stream);
+    attach_stream(&mut runtime, stream_path.as_ref())?;
     Ok(runtime)
 }
 
@@ -1175,75 +1177,73 @@ pub fn recover_runtime_with_stream_and_snapshot(
             }
         };
 
-    attach_stream_and_snapshot(
-        &mut runtime,
-        stream_path,
-        snapshot_path,
-        snapshot_is_safe_to_replace,
-    )?;
-    Ok(runtime)
-}
-
-/// Turns a read-only warm follower into the next primary after the caller has acquired the
-/// journal's exclusive writer lock and recovered the *entire* authoritative journal. The warm
-/// core is not reused: full durable recovery is repeated before this process can write or
-/// publish, so promotion never depends on how the follower got its state.
-pub(crate) fn promote_replica_with_stream_and_snapshot(
-    rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
-    store: EventStore,
-    recovered: Vec<EventEnvelope>,
-    journal_path: impl AsRef<Path>,
-    stream_path: impl AsRef<Path>,
-    snapshot_path: impl AsRef<Path>,
-) -> Result<ExchangeRuntime, StartupError> {
-    let journal_path = journal_path.as_ref().to_path_buf();
-    let stream_path = stream_path.as_ref().to_path_buf();
-    let snapshot_path = snapshot_path.as_ref().to_path_buf();
-    let mut runtime =
-        ExchangeRuntime::from_store(rx, store, recovered).map_err(StartupError::Replay)?;
-
-    // Preserve a bad snapshot for diagnosis just as ordinary primary recovery does. A valid or
-    // absent checkpoint may be refreshed after promotion because the full journal is still held.
-    let snapshot_is_safe_to_replace = match snapshot::load(&snapshot_path, &journal_path) {
-        Ok(_) => true,
-        Err(error) => {
-            eprintln!("preserving invalid snapshot during warm promotion: {error}");
-            false
-        }
-    };
-    attach_stream_and_snapshot(
-        &mut runtime,
-        stream_path,
-        snapshot_path,
-        snapshot_is_safe_to_replace,
-    )?;
-    Ok(runtime)
-}
-
-/// Opens the mmap stream and, when it is safe to replace, writes ONE fresh snapshot of the
-/// recovered core before the exchange accepts any command. From then on the trading thread writes
-/// no snapshots; the warm replica keeps the checkpoint current.
-fn attach_stream_and_snapshot(
-    runtime: &mut ExchangeRuntime,
-    stream_path: PathBuf,
-    snapshot_path: PathBuf,
-    snapshot_is_safe_to_replace: bool,
-) -> Result<(), StartupError> {
-    let stream = StreamWriter::open(
-        &stream_path,
-        runtime.store.as_ref().unwrap().file(),
-        runtime.next_event_seq - 1,
-        DEFAULT_CAPACITY,
-    )
-    .map_err(StartupError::Stream)?;
-    runtime.stream = Some(stream);
+    attach_stream(&mut runtime, &stream_path)?;
+    // ONE fresh snapshot of the recovered core before the exchange accepts any command. From then
+    // on the trading thread writes no snapshots; the warm replica keeps the checkpoint current.
     if snapshot_is_safe_to_replace
         && let Err(error) = runtime.write_snapshot(&snapshot_path, &stream_path)
     {
         // This does not affect a durable, replayable exchange. An older snapshot, if any, stays.
         eprintln!("snapshot checkpoint was not updated during startup: {error}");
     }
+    Ok(runtime)
+}
+
+/// Turns a read-only warm follower into the next primary, once the caller has fenced the old
+/// writer and recovered the records the follower had not applied yet (`suffix`). The follower's
+/// core is reused: it was built from this same journal file and checked output by output, on top
+/// of the snapshot it started from, which is trusted exactly as a restart from that snapshot
+/// trusts it. Promotion replays only the suffix and costs the follower's lag, not the journal's
+/// history.
+///
+/// No startup snapshot is written: that would cost seconds late in a day. The warm replica's last
+/// snapshot stays the restart point.
+pub(crate) fn promote_replica(
+    rx: tokio::sync::mpsc::Receiver<ExchangeCommand>,
+    store: EventStore,
+    replica: ReplicaCore,
+    suffix: Vec<EventEnvelope>,
+    stream_path: impl AsRef<Path>,
+) -> Result<ExchangeRuntime, StartupError> {
+    let (core, next_event_seq) = replica.into_parts();
+    let (core, next_event_seq) =
+        replay_suffix(core, next_event_seq, &suffix).map_err(StartupError::Replay)?;
+    let mut runtime =
+        ExchangeRuntime::from_snapshot_suffix(rx, store, core, suffix, next_event_seq);
+    attach_stream(&mut runtime, stream_path.as_ref())?;
+    Ok(runtime)
+}
+
+/// Opens the mmap stream at the recovered end. It refuses a journal that ends before what the
+/// stream already published.
+fn attach_stream(runtime: &mut ExchangeRuntime, stream_path: &Path) -> Result<(), StartupError> {
+    let stream = StreamWriter::open(
+        stream_path,
+        runtime.store.as_ref().unwrap().file(),
+        runtime.next_event_seq - 1,
+        DEFAULT_CAPACITY,
+    )
+    .map_err(StartupError::Stream)?;
+    runtime.stream = Some(stream);
     Ok(())
+}
+
+/// Replays the records after a core's position, checking every output, and returns the core
+/// with the next sequence to assign.
+fn replay_suffix(
+    core: ExchangeCore,
+    next_event_seq: u64,
+    suffix: &[EventEnvelope],
+) -> Result<(ExchangeCore, u64), ReplayError> {
+    let core = replay_event_log_from_core(core, next_event_seq, suffix)?;
+    let next_event_seq = match suffix.last() {
+        Some(envelope) => envelope
+            .seq_num
+            .checked_add(1)
+            .ok_or_else(|| ReplayError::InternalFault("journal sequence overflow".to_string()))?,
+        None => next_event_seq,
+    };
+    Ok((core, next_event_seq))
 }
 
 fn recover_snapshot_state(
@@ -1255,20 +1255,11 @@ fn recover_snapshot_state(
         journal_path,
         loaded.boundary.journal_id,
         loaded.boundary.byte_offset,
+        None,
     )
     .map_err(|error| error.to_string())?;
-    let core = replay_event_log_from_core(core, loaded.boundary.next_event_sequence, &suffix)
+    let (core, next_event_seq) = replay_suffix(core, loaded.boundary.next_event_sequence, &suffix)
         .map_err(|error| format!("snapshot suffix did not replay deterministically: {error:?}"))?;
-    let next_event_seq = suffix
-        .last()
-        .map(|envelope| {
-            envelope
-                .seq_num
-                .checked_add(1)
-                .ok_or_else(|| "journal sequence overflow".to_string())
-        })
-        .transpose()?
-        .unwrap_or(loaded.boundary.next_event_sequence);
     Ok((store, core, suffix, next_event_seq))
 }
 
