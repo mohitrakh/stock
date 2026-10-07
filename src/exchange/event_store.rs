@@ -2,7 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -186,6 +186,8 @@ pub(super) fn crc32_of_file(file: &File, mut from: u64, to: u64) -> io::Result<u
 pub struct EventStore {
     file: File,
     journal_id: Uuid,
+    /// Where it was opened, for the files kept beside it.
+    path: PathBuf,
     /// Syncs through this handle, so a test can prove that a group shares one.
     #[cfg(test)]
     pub(crate) syncs: u64,
@@ -201,10 +203,11 @@ impl Drop for EventStore {
 }
 
 impl EventStore {
-    fn from_file(file: File, journal_id: Uuid) -> Self {
+    fn from_file(file: File, journal_id: Uuid, path: &Path) -> Self {
         Self {
             file,
             journal_id,
+            path: path.to_path_buf(),
             #[cfg(test)]
             syncs: 0,
         }
@@ -212,14 +215,18 @@ impl EventStore {
 
     #[cfg(test)]
     pub(crate) fn open_read_only_for_test(path: impl AsRef<Path>) -> Result<Self, EventStoreError> {
-        let file = OpenOptions::new().read(true).open(path)?;
+        let file = OpenOptions::new().read(true).open(path.as_ref())?;
         let journal_id = journal_id_of(&file)?;
-        Ok(Self::from_file(file, journal_id))
+        Ok(Self::from_file(file, journal_id, path.as_ref()))
     }
 
     /// The id this journal was created with.
     pub(crate) fn journal_id(&self) -> Uuid {
         self.journal_id
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Opens (or creates) the log at `path`, recovers the events already in it, and truncates any
@@ -256,7 +263,7 @@ impl EventStore {
             file.sync_all()?;
             sync_parent_dir(path)?;
 
-            return Ok((Self::from_file(file, journal_id), Vec::new()));
+            return Ok((Self::from_file(file, journal_id, path), Vec::new()));
         }
 
         let journal_id = parse_header(&bytes)?;
@@ -274,7 +281,7 @@ impl EventStore {
 
         file.seek(SeekFrom::End(0))?;
 
-        Ok((Self::from_file(file, journal_id), events))
+        Ok((Self::from_file(file, journal_id, path), events))
     }
 
     /// Opens the writer-owned journal at an already committed command boundary and recovers only
@@ -298,6 +305,7 @@ impl EventStore {
         boundary: u64,
         followed: Option<(&File, u64)>,
     ) -> Result<(Self, Vec<EventEnvelope>), EventStoreError> {
+        let path = path.as_ref();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -340,7 +348,7 @@ impl EventStore {
         // As in `open`: what was recovered may still be in the page cache only.
         file.sync_all()?;
         file.seek(SeekFrom::End(0))?;
-        Ok((Self::from_file(file, expected), events))
+        Ok((Self::from_file(file, expected, path), events))
     }
 
     /// Writes one command's envelopes as a single framed record and synchronizes it to disk.
@@ -844,7 +852,7 @@ mod tests {
         // A real write failure: a handle that cannot write. The runtime treats this as fatal.
         let read_only = OpenOptions::new().read(true).open(&path).unwrap();
         let journal_id = journal_id_of(&read_only).unwrap();
-        let mut store = EventStore::from_file(read_only, journal_id);
+        let mut store = EventStore::from_file(read_only, journal_id, &path);
 
         assert!(store.append(&deposit_batch(3, 250)).is_err());
 

@@ -17,7 +17,15 @@
 //! When no replica confirms, the worker waits: commands queue and nothing is acknowledged. The
 //! operator can tell the primary to run alone. It returns to synchronous mode by itself once a
 //! replica holds everything the primary has synced. The operator must never both promote a replica
-//! and let the primary run alone; epochs (part 5) will enforce that.
+//! and let the primary run alone.
+//!
+//! Epochs (part 5) fence primaries that were replaced. Each promotion starts a term with the next
+//! epoch (see `terms`), and both sides say their latest epoch. A primary refuses a replica that has
+//! seen a later term than its own: it was replaced, and must never be confirmed again. A replica
+//! from an earlier term must have committed nothing past the point where its term ended in this
+//! journal; otherwise it acknowledged commands after the promotion, which means an old primary ran
+//! alone while another took over, and the two histories split. What it holds beyond that point it
+//! never acknowledged, and the usual cut back drops it.
 //!
 //! The primary sends the commit point at least every second, and the replica answers every frame.
 //! Either side drops a link that stays silent for 10 s, as when the other machine lost power or
@@ -26,9 +34,10 @@
 //! Frames are `[body length: u32 LE][kind: u8][body]`:
 //! - `HELLO`, replica to primary: journal id (16 bytes, zero for an empty journal); its committed
 //!   end and the next sequence there; its length and the next sequence there (u64 each); the
-//!   checksum of the bytes between them (u32);
+//!   checksum of the bytes between them (u32); its latest epoch (u64);
 //! - `WELCOME`, primary to replica: journal id, where the replica resumes (u64), and the next
-//!   sequence there (u64): its length, or its committed end if it must cut back;
+//!   sequence there (u64): its length, or its committed end if it must cut back; the primary's
+//!   epoch (u64);
 //! - `REFUSE`, primary to replica: the reason, as UTF-8;
 //! - `RECORDS`, primary to replica: offset (u64), commit point (u64), then whole journal records,
 //!   possibly none;
@@ -54,6 +63,7 @@ use uuid::Uuid;
 use super::{
     event_store::{JOURNAL_HEADER_LEN, MAX_RECORD_LEN, RECORD_HEADER_LEN, crc32_of_file},
     event_stream::{decode_batch, read_record, record_length},
+    terms::Term,
 };
 
 pub(super) const HELLO: u8 = 1;
@@ -67,7 +77,7 @@ const CHUNK: usize = 1024 * 1024;
 /// The largest body: offset and commit point, then one whole record of the largest size.
 pub(super) const MAX_BODY: usize = 16 + RECORD_HEADER_LEN + MAX_RECORD_LEN as usize;
 /// The hello's body, and the largest answer to it: a welcome, or a refusal and its reason.
-pub(super) const HELLO_LEN: usize = 52;
+pub(super) const HELLO_LEN: usize = 60;
 pub(super) const MAX_ANSWER: usize = 4096;
 /// A replica must say hello within this long after connecting.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -137,7 +147,8 @@ pub(super) fn u64_at(body: &[u8], offset: usize) -> io::Result<u64> {
 }
 
 /// What a replica says when it connects: the journal it holds (none while empty), how far its copy
-/// is committed, how long it is, the next sequence at each, and the checksum of the bytes between.
+/// is committed, how long it is, the next sequence at each, the checksum of the bytes between, and
+/// the latest epoch it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Hello {
     pub(super) journal_id: Option<Uuid>,
@@ -146,6 +157,7 @@ pub(super) struct Hello {
     pub(super) end: u64,
     pub(super) end_next: u64,
     pub(super) tail_crc: u32,
+    pub(super) epoch: u64,
 }
 
 impl Hello {
@@ -161,6 +173,7 @@ impl Hello {
                 &self.end.to_le_bytes(),
                 &self.end_next.to_le_bytes(),
                 &self.tail_crc.to_le_bytes(),
+                &self.epoch.to_le_bytes(),
             ],
         )
     }
@@ -177,16 +190,19 @@ impl Hello {
             end: u64_at(body, 32)?,
             end_next: u64_at(body, 40)?,
             tail_crc: u32::from_le_bytes(body[48..52].try_into().unwrap()),
+            epoch: u64_at(body, 52)?,
         })
     }
 }
 
-/// Where a replica resumes: the journal, the end, and the next sequence there. Sent as `WELCOME`.
+/// Where a replica resumes: the journal, the end, the next sequence there, and the primary's epoch.
+/// Sent as `WELCOME`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Position {
     pub(super) journal_id: Option<Uuid>,
     pub(super) end: u64,
     pub(super) next_sequence: u64,
+    pub(super) epoch: u64,
 }
 
 impl Position {
@@ -199,12 +215,13 @@ impl Position {
                 &id,
                 &self.end.to_le_bytes(),
                 &self.next_sequence.to_le_bytes(),
+                &self.epoch.to_le_bytes(),
             ],
         )
     }
 
     pub(super) fn parse(body: &[u8]) -> io::Result<Self> {
-        if body.len() != 32 {
+        if body.len() != 40 {
             return Err(invalid("replication position has the wrong length"));
         }
         let id = Uuid::from_bytes(body[..16].try_into().unwrap());
@@ -212,6 +229,7 @@ impl Position {
             journal_id: (!id.is_nil()).then_some(id),
             end: u64_at(body, 16)?,
             next_sequence: u64_at(body, 24)?,
+            epoch: u64_at(body, 32)?,
         })
     }
 }
@@ -222,6 +240,8 @@ pub struct ReplicationStatus {
     /// "synchronous", "paused" (no replica, or the worker has waited for it over a second), or
     /// "running alone".
     pub mode: &'static str,
+    /// This primary's term.
+    pub epoch: u64,
     pub replica_connected: bool,
     pub journal_end: u64,
     pub replica_end: Option<u64>,
@@ -242,7 +262,16 @@ struct Shared {
     /// A read handle on the journal: the sender reads back what the worker wrote.
     journal: File,
     journal_id: Uuid,
+    /// The journal's terms; the last is this primary's. A promotion adds its own before it
+    /// listens, so they never change while it does.
+    terms: Vec<Term>,
     stopped: AtomicBool,
+}
+
+impl Shared {
+    fn epoch(&self) -> u64 {
+        self.terms.last().map_or(0, |term| term.epoch)
+    }
 }
 
 struct State {
@@ -291,7 +320,7 @@ impl State {
             .filter(|link| link.connection == connection)
     }
 
-    fn status(&self) -> ReplicationStatus {
+    fn status(&self, epoch: u64) -> ReplicationStatus {
         let waited = self.waiting_since.map(|since| since.elapsed());
         let mode = if self.run_alone {
             "running alone"
@@ -302,6 +331,7 @@ impl State {
         };
         ReplicationStatus {
             mode,
+            epoch,
             replica_connected: self.replica.is_some(),
             journal_end: self.written,
             replica_end: self.replica.as_ref().map(|link| link.confirmed),
@@ -312,13 +342,15 @@ impl State {
 
 impl Replication {
     /// Listens for the replica on `address`. `journal` is a read handle on the journal, whose
-    /// complete records end at `end`, followed by `next_sequence`; all of it is synced.
+    /// complete records end at `end`, followed by `next_sequence`; all of it is synced. `terms`
+    /// are its terms, the last being this primary's.
     pub(crate) fn listen(
         address: SocketAddr,
         journal: File,
         journal_id: Uuid,
         end: u64,
         next_sequence: u64,
+        terms: Vec<Term>,
     ) -> io::Result<Arc<Self>> {
         let listener = TcpListener::bind(address)?;
         let address = listener.local_addr()?;
@@ -335,6 +367,7 @@ impl Replication {
             changed: Condvar::new(),
             journal,
             journal_id,
+            terms,
             stopped: AtomicBool::new(false),
         });
         let accepting = Arc::clone(&shared);
@@ -363,22 +396,23 @@ impl Replication {
 
     /// The worker synced up to `end`. Returns once the replica has confirmed it too, or the
     /// primary runs alone; until then the worker waits, and so does every command behind it.
-    pub(crate) fn confirm(&self, end: u64) {
+    /// True when it was let through by running alone, before the replica held it.
+    pub(crate) fn confirm(&self, end: u64) -> bool {
         let mut state = self.lock();
         state.synced = state.synced.max(end);
         self.shared.changed.notify_all();
-        if state.confirmed() >= end || state.run_alone {
-            return;
+        if state.confirmed() < end && !state.run_alone {
+            state.waiting_since = Some(Instant::now());
+            while state.confirmed() < end && !state.run_alone {
+                state = self.shared.changed.wait(state).unwrap();
+            }
+            state.waiting_since = None;
         }
-        state.waiting_since = Some(Instant::now());
-        while state.confirmed() < end && !state.run_alone {
-            state = self.shared.changed.wait(state).unwrap();
-        }
-        state.waiting_since = None;
+        state.confirmed() < end
     }
 
     pub fn status(&self) -> ReplicationStatus {
-        self.lock().status()
+        self.lock().status(self.shared.epoch())
     }
 
     /// Nothing can be acknowledged now: no replica, or the worker has waited too long for it,
@@ -398,7 +432,7 @@ impl Replication {
         }
         state.run_alone = true;
         self.shared.changed.notify_all();
-        state.status()
+        state.status(self.shared.epoch())
     }
 
     /// Cuts the link to the replica, as a network fault would, and keeps listening.
@@ -524,11 +558,17 @@ fn attach(shared: &Arc<Shared>, mut socket: TcpStream) -> io::Result<()> {
 /// what it holds only if this journal holds the same bytes, ending at a command boundary; any
 /// difference means this primary never synced those bytes, so the replica cuts back. `written` is
 /// this journal's end and the next sequence there.
+///
+/// The epochs come first. A replica that has seen a later term than this primary's means this
+/// primary was replaced: it is refused, so nothing confirms this primary again. A replica from an
+/// earlier term must have committed only records from before the next term started here.
 fn resume_point(shared: &Shared, written: (u64, u64), hello: Hello) -> Result<Position, String> {
+    let epoch = shared.epoch();
     let resume = |end, next_sequence| Position {
         journal_id: Some(shared.journal_id),
         end,
         next_sequence,
+        epoch,
     };
     let Some(journal_id) = hello.journal_id else {
         return if hello.end == 0 {
@@ -541,6 +581,20 @@ fn resume_point(shared: &Shared, written: (u64, u64), hello: Hello) -> Result<Po
         return Err(format!(
             "the replica holds journal {journal_id}, not this primary's journal {}",
             shared.journal_id
+        ));
+    }
+    if hello.epoch > epoch {
+        return Err(format!(
+            "the replica has seen term {}, later than this primary's term {epoch}: this primary was replaced",
+            hello.epoch
+        ));
+    }
+    if let Some(next) = shared.terms.iter().find(|term| term.epoch > hello.epoch)
+        && hello.committed_next > next.first_sequence
+    {
+        return Err(format!(
+            "the replica committed records after its term {} ended here, at sequence {}: it acknowledged commands while another primary took over, so the two histories have split",
+            hello.epoch, next.first_sequence
         ));
     }
     if hello.committed < JOURNAL_HEADER_LEN as u64 || hello.committed > hello.end {
@@ -702,6 +756,7 @@ mod tests {
             event_stream::StreamReader,
             replica::{Ended, Replica},
             runtime::{recover_replicated_runtime, recover_runtime_with_stream},
+            terms::{Term, Terms},
         },
         types::{
             exchange_event::{
@@ -736,6 +791,23 @@ mod tests {
                 self.path("primary.snapshot"),
             )
             .unwrap();
+            let replication = runtime.replicate("127.0.0.1:0".parse().unwrap()).unwrap();
+            thread::spawn(move || runtime.run());
+            (tx, replication)
+        }
+
+        /// The replica's machine after a promotion: a primary on its copy that starts the next
+        /// term before it listens, as `main` does.
+        fn promoted(&self) -> (mpsc::Sender<ExchangeCommand>, Arc<Replication>) {
+            let (tx, rx) = mpsc::channel(64);
+            let mut runtime = recover_replicated_runtime(
+                rx,
+                self.path("primary.log"),
+                self.path("primary.mmap"),
+                self.path("primary.snapshot"),
+            )
+            .unwrap();
+            runtime.begin_term().unwrap();
             let replication = runtime.replicate("127.0.0.1:0".parse().unwrap()).unwrap();
             thread::spawn(move || runtime.run());
             (tx, replication)
@@ -825,6 +897,19 @@ mod tests {
                     user_id: "buyer".into(),
                     amount,
                 }),
+            },
+        ]
+    }
+
+    fn term_batch(seq: u64, epoch: u64) -> Vec<EventEnvelope> {
+        vec![
+            EventEnvelope {
+                seq_num: seq,
+                event: ExchangeEvent::Input(ExchangeInputEvent::TermStarted { epoch }),
+            },
+            EventEnvelope {
+                seq_num: seq + 1,
+                event: ExchangeEvent::Output(ExchangeOutputEvent::TermStarted { epoch }),
             },
         ]
     }
@@ -921,12 +1006,15 @@ mod tests {
             Some(Ok(()))
         );
         assert!(!replication.paused());
+        // The worker learns that it answers on this machine only, and syncs its stream's end.
+        assert!(replication.confirm(replication.status().journal_end));
 
         // A replica catches up on both, which turns running alone off by itself.
         let session = machines.replica(&replication);
         eventually("synchronous again", || {
             replication.status().mode == "synchronous"
         });
+        assert!(!replication.confirm(replication.status().journal_end));
         let mut third = deposit(&exchange, 30);
         assert_eq!(
             reply_within(&mut third, Duration::from_secs(10)),
@@ -1067,6 +1155,7 @@ mod tests {
             journal_id: Some(Uuid::new_v4()),
             end: 1234,
             next_sequence: 77,
+            epoch: 3,
         };
         let mut bytes = Vec::new();
         position.send(&mut bytes, HELLO).unwrap();
@@ -1080,6 +1169,7 @@ mod tests {
             end: 999,
             end_next: 9,
             tail_crc: 0xDEAD_BEEF,
+            epoch: 2,
         };
         bytes.clear();
         hello.send(&mut bytes).unwrap();
@@ -1132,6 +1222,7 @@ mod tests {
             journal_id: Some(Uuid::from_bytes(journal[8..24].try_into().unwrap())),
             end: 0,
             next_sequence: 1,
+            epoch: 0,
         }
         .send(&mut primary, WELCOME)
         .unwrap();
@@ -1181,6 +1272,7 @@ mod tests {
                 end: committed + tail.len() as u64,
                 end_next: 7,
                 tail_crc: crc32(tail),
+                epoch: 0,
             }
             .send(&mut replica)
             .unwrap();
@@ -1230,6 +1322,7 @@ mod tests {
             journal_id: Some(Uuid::new_v4()),
             end: 0,
             next_sequence: 1,
+            epoch: 0,
         }
         .send(&mut silent_primary, WELCOME)
         .unwrap();
@@ -1246,6 +1339,7 @@ mod tests {
             end: 0,
             end_next: 1,
             tail_crc: 0,
+            epoch: 0,
         }
         .send(&mut silent_replica)
         .unwrap();
@@ -1368,6 +1462,7 @@ mod tests {
             journal_id: Some(Uuid::from_bytes(header[8..24].try_into().unwrap())),
             end: start,
             next_sequence: 1,
+            epoch: 0,
         }
         .send(&mut primary, WELCOME)
         .unwrap();
@@ -1394,6 +1489,374 @@ mod tests {
         assert_eq!(
             reply_within(&mut reply, HANDSHAKE_TIMEOUT - Duration::from_secs(1)),
             Some(Ok(()))
+        );
+        replication.shutdown();
+        assert!(session.join().unwrap().is_err());
+    }
+
+    /// The ends of a journal's records, in order.
+    fn record_ends(journal: &[u8]) -> Vec<u64> {
+        let mut ends = Vec::new();
+        let mut at = JOURNAL_HEADER_LEN;
+        while at < journal.len() {
+            at += record_length(&journal[at..]).unwrap();
+            ends.push(at as u64);
+        }
+        ends
+    }
+
+    /// The epochs in the handshake, with the test playing replicas of different terms against a
+    /// primary in term 1, which began after two deposits.
+    #[test]
+    fn epochs_fence_a_replaced_primary_and_refuse_a_split_history() {
+        let machines = Machines::new();
+        {
+            let (_tx, rx) = mpsc::channel(1);
+            let mut runtime = recover_runtime_with_stream(
+                rx,
+                machines.path("primary.log"),
+                machines.path("primary.mmap"),
+            )
+            .unwrap();
+            let deposit = |amount| ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount,
+            };
+            for input in [
+                deposit(1),
+                deposit(2),
+                ExchangeInputEvent::TermStarted { epoch: 1 },
+                deposit(3),
+            ] {
+                runtime.record_input_for_test(input).unwrap();
+            }
+        }
+        let journal = fs::read(machines.path("primary.log")).unwrap();
+        let journal_id = Some(Uuid::from_bytes(journal[8..24].try_into().unwrap()));
+        // After the second deposit term 1 begins, at sequence 5; the third deposit ends the journal.
+        let ends = record_ends(&journal);
+        let (_exchange, replication) = machines.primary();
+        assert_eq!(replication.status().epoch, 1);
+        let answer = |epoch: u64, committed: u64, committed_next: u64| {
+            let mut replica = TcpStream::connect(replication.address()).unwrap();
+            Hello {
+                journal_id,
+                committed,
+                committed_next,
+                end: committed,
+                end_next: committed_next,
+                tail_crc: 0,
+                epoch,
+            }
+            .send(&mut replica)
+            .unwrap();
+            let (kind, body) = read_frame(&mut replica, MAX_ANSWER).unwrap();
+            match kind {
+                WELCOME => Ok(Position::parse(&body).unwrap()),
+                _ => Err(String::from_utf8(body).unwrap()),
+            }
+        };
+
+        // A replica that has seen a later term: this primary was replaced, and is never confirmed.
+        assert!(answer(2, ends[3], 9).unwrap_err().contains("was replaced"));
+        // From term 0 it committed only what came before term 1 began: welcome, in term 1.
+        let welcome = answer(0, ends[1], 5).unwrap();
+        assert_eq!((welcome.end, welcome.epoch), (ends[1], 1));
+        // From term 0 but committed past where term 1 began here: the histories split.
+        assert!(answer(0, ends[3], 9).unwrap_err().contains("split"));
+        // In term 1, anything this journal holds.
+        assert_eq!(answer(1, ends[3], 9).unwrap().end, ends[3]);
+        replication.shutdown();
+    }
+
+    /// The test plays a primary of term 0 that a replica holding term 1 dials: it refuses it.
+    #[test]
+    fn a_replica_refuses_a_primary_from_an_earlier_term() {
+        let machines = Machines::new();
+        {
+            let (_tx, rx) = mpsc::channel(1);
+            let mut runtime = recover_runtime_with_stream(
+                rx,
+                machines.path("replica.log"),
+                machines.path("replica.mmap"),
+            )
+            .unwrap();
+            runtime
+                .record_input_for_test(ExchangeInputEvent::TermStarted { epoch: 1 })
+                .unwrap();
+        }
+        let journal = fs::read(machines.path("replica.log")).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let (copy, stream) = (machines.path("replica.log"), machines.path("replica.mmap"));
+        let session = thread::spawn(move || Replica::open(copy, stream).unwrap().follow(&address));
+        let (mut primary, _) = listener.accept().unwrap();
+        let (_, body) = read_frame(&mut primary, HELLO_LEN).unwrap();
+        assert_eq!(Hello::parse(&body).unwrap().epoch, 1);
+        Position {
+            journal_id: Some(Uuid::from_bytes(journal[8..24].try_into().unwrap())),
+            end: journal.len() as u64,
+            next_sequence: 3,
+            epoch: 0,
+        }
+        .send(&mut primary, WELCOME)
+        .unwrap();
+        assert!(matches!(
+            session.join().unwrap(),
+            Err(Ended::Refused(reason)) if reason.contains("was replaced")
+        ));
+    }
+
+    /// A failover. The old primary acknowledged two deposits, which the replica holds, and wrote a
+    /// third that was never confirmed. The replica's machine promotes its copy into term 1, and the
+    /// old primary rejoins as its replica: it drops the third deposit, which it never acknowledged,
+    /// and takes the new term's records.
+    #[test]
+    fn a_promoted_replica_starts_a_term_and_the_old_primary_rejoins_as_its_replica() {
+        let machines = Machines::new();
+        journal_with(&machines.path("old.log"), &machines.path("old.mmap"), 2);
+        fs::copy(machines.path("old.log"), machines.path("primary.log")).unwrap();
+        let mut unconfirmed = fs::OpenOptions::new()
+            .append(true)
+            .open(machines.path("old.log"))
+            .unwrap();
+        unconfirmed
+            .write_all(&encode_record(&deposit_batch(5, 3)).unwrap())
+            .unwrap();
+        drop(unconfirmed);
+
+        let (exchange, replication) = machines.promoted();
+        assert_eq!(replication.status().epoch, 1);
+        let (old, old_stream) = (machines.path("old.log"), machines.path("old.mmap"));
+        let address = replication.address().to_string();
+        let rejoined =
+            thread::spawn(move || Replica::open(old, old_stream).unwrap().follow(&address));
+        let mut reply = deposit(&exchange, 4);
+        assert_eq!(
+            reply_within(&mut reply, Duration::from_secs(10)),
+            Some(Ok(()))
+        );
+        let promoted = fs::read(machines.path("primary.log")).unwrap();
+        assert_eq!(fs::read(machines.path("old.log")).unwrap(), promoted);
+        // Two deposits, the start of term 1, and the deposit of term 1.
+        assert_eq!(record_ends(&promoted).len(), 4);
+        let old = File::open(machines.path("old.log")).unwrap();
+        assert_eq!(
+            Terms::load(&machines.path("old.log"), &old)
+                .unwrap()
+                .epoch(),
+            1
+        );
+        replication.shutdown();
+        assert!(rejoined.join().unwrap().is_err());
+    }
+
+    /// A promotion that stopped after beginning its term and before journaling it, here before
+    /// `run`: restarted as an ordinary primary, it journals that term first, byte for byte as it
+    /// would have.
+    #[test]
+    fn a_term_begun_but_never_journaled_is_journaled_when_the_primary_restarts() {
+        let machines = Machines::new();
+        journal_with(
+            &machines.path("primary.log"),
+            &machines.path("primary.mmap"),
+            1,
+        );
+        {
+            let (_tx, rx) = mpsc::channel(1);
+            let mut runtime = recover_replicated_runtime(
+                rx,
+                machines.path("primary.log"),
+                machines.path("primary.mmap"),
+                machines.path("primary.snapshot"),
+            )
+            .unwrap();
+            assert_eq!(runtime.begin_term().unwrap(), 1);
+        }
+
+        let (exchange, replication) = machines.primary();
+        assert_eq!(replication.status().epoch, 1);
+        let session = machines.replica(&replication);
+        let mut reply = deposit(&exchange, 5);
+        assert_eq!(
+            reply_within(&mut reply, Duration::from_secs(10)),
+            Some(Ok(()))
+        );
+        // The first deposit, the start of term 1, then the new deposit.
+        let journal = fs::read(machines.path("primary.log")).unwrap();
+        let ends = record_ends(&journal);
+        assert_eq!(ends.len(), 3);
+        assert_eq!(
+            journal[ends[0] as usize..ends[1] as usize],
+            encode_record(&term_batch(3, 1)).unwrap()
+        );
+        assert!(machines.same_journal());
+        replication.shutdown();
+        assert!(session.join().unwrap().is_err());
+    }
+
+    /// A replica that indexed the start of term 1 and stopped before writing its record holds no
+    /// such term: it forgets the entry, follows the primary of term 0, and takes the term again only
+    /// when a primary sends it. But its epoch may be another primary's: promoted later, this copy
+    /// takes the epoch after it.
+    #[test]
+    fn a_replica_forgets_a_term_it_indexed_but_never_wrote() {
+        let machines = Machines::new();
+        journal_with(
+            &machines.path("primary.log"),
+            &machines.path("primary.mmap"),
+            1,
+        );
+        let journal = fs::read(machines.path("primary.log")).unwrap();
+        fs::write(machines.path("replica.log"), &journal).unwrap();
+        let journal_id = Uuid::from_bytes(journal[8..24].try_into().unwrap());
+        fs::write(
+            machines.path("replica.log.terms"),
+            format!(
+                r#"{{"journal_id":"{journal_id}","highest_epoch":1,"terms":[{{"epoch":1,"first_sequence":3,"offset":{}}}]}}"#,
+                journal.len()
+            ),
+        )
+        .unwrap();
+
+        let (exchange, replication) = machines.primary();
+        let session = machines.replica(&replication);
+        let mut reply = deposit(&exchange, 5);
+        assert_eq!(
+            reply_within(&mut reply, Duration::from_secs(10)),
+            Some(Ok(()))
+        );
+        assert!(machines.same_journal());
+        replication.shutdown();
+        assert!(matches!(session.join().unwrap(), Err(Ended::Lost(_))));
+
+        let (_tx, rx) = mpsc::channel(1);
+        let mut promoted = recover_replicated_runtime(
+            rx,
+            machines.path("replica.log"),
+            machines.path("replica.mmap"),
+            machines.path("replica.snapshot"),
+        )
+        .unwrap();
+        assert_eq!(promoted.begin_term().unwrap(), 2);
+    }
+
+    /// A copy whose index ends with a term start it never wrote, as a replica that indexed another
+    /// primary's term start and then failed leaves it, is promoted: the new term takes the epoch
+    /// after it, never that one.
+    #[test]
+    fn a_promotion_takes_the_epoch_after_a_term_its_copy_indexed_but_never_wrote() {
+        let machines = Machines::new();
+        journal_with(
+            &machines.path("primary.log"),
+            &machines.path("primary.mmap"),
+            1,
+        );
+        let journal = fs::read(machines.path("primary.log")).unwrap();
+        let journal_id = Uuid::from_bytes(journal[8..24].try_into().unwrap());
+        fs::write(
+            machines.path("primary.log.terms"),
+            format!(
+                r#"{{"journal_id":"{journal_id}","highest_epoch":1,"terms":[{{"epoch":1,"first_sequence":3,"offset":{}}}]}}"#,
+                journal.len()
+            ),
+        )
+        .unwrap();
+
+        let (exchange, replication) = machines.promoted();
+        assert_eq!(replication.status().epoch, 2);
+        let session = machines.replica(&replication);
+        let mut reply = deposit(&exchange, 5);
+        assert_eq!(
+            reply_within(&mut reply, Duration::from_secs(10)),
+            Some(Ok(()))
+        );
+        let journal = fs::read(machines.path("primary.log")).unwrap();
+        let ends = record_ends(&journal);
+        assert_eq!(
+            journal[ends[0] as usize..ends[1] as usize],
+            encode_record(&term_batch(3, 2)).unwrap()
+        );
+        replication.shutdown();
+        assert!(session.join().unwrap().is_err());
+    }
+
+    /// A replica holding the start of term 1, not even committed yet, dials a primary of term 0:
+    /// refused, so nothing confirms a primary that was replaced.
+    #[test]
+    fn a_primary_refuses_a_replica_that_holds_a_later_term() {
+        let machines = Machines::new();
+        journal_with(
+            &machines.path("primary.log"),
+            &machines.path("primary.mmap"),
+            1,
+        );
+        let mut copy = fs::read(machines.path("primary.log")).unwrap();
+        copy.extend_from_slice(&encode_record(&term_batch(3, 1)).unwrap());
+        fs::write(machines.path("replica.log"), copy).unwrap();
+
+        let (_exchange, replication) = machines.primary();
+        assert_eq!(replication.status().epoch, 0);
+        let session = machines.replica(&replication);
+        // The primary's own refusal, before the replica could refuse it in turn.
+        assert!(matches!(
+            session.join().unwrap(),
+            Err(Ended::Refused(reason)) if reason.contains("later than this primary's term")
+        ));
+        replication.shutdown();
+    }
+
+    /// A replica whose tail holds the start of term 1 where the primary has another record: the
+    /// cut back drops it from the replica's index too, and the replica takes term 1 where the
+    /// primary started it.
+    #[test]
+    fn a_term_start_cut_back_is_forgotten_and_taken_again() {
+        let machines = Machines::new();
+        {
+            let (_tx, rx) = mpsc::channel(1);
+            let mut runtime = recover_runtime_with_stream(
+                rx,
+                machines.path("primary.log"),
+                machines.path("primary.mmap"),
+            )
+            .unwrap();
+            let deposit_input = |amount| ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount,
+            };
+            for input in [
+                deposit_input(1),
+                deposit_input(2),
+                ExchangeInputEvent::TermStarted { epoch: 1 },
+            ] {
+                runtime.record_input_for_test(input).unwrap();
+            }
+        }
+        let journal = fs::read(machines.path("primary.log")).unwrap();
+        let ends = record_ends(&journal);
+        let mut copy = journal[..ends[0] as usize].to_vec();
+        copy.extend_from_slice(&encode_record(&term_batch(3, 1)).unwrap());
+        fs::write(machines.path("replica.log"), &copy).unwrap();
+
+        let (exchange, replication) = machines.primary();
+        assert_eq!(replication.status().epoch, 1);
+        let session = machines.replica(&replication);
+        let mut reply = deposit(&exchange, 7);
+        assert_eq!(
+            reply_within(&mut reply, Duration::from_secs(10)),
+            Some(Ok(()))
+        );
+        assert!(machines.same_journal());
+        let copy = File::open(machines.path("replica.log")).unwrap();
+        assert_eq!(
+            Terms::load(&machines.path("replica.log"), &copy)
+                .unwrap()
+                .list(),
+            [Term {
+                epoch: 1,
+                first_sequence: 5,
+                offset: ends[1],
+            }]
         );
         replication.shutdown();
         assert!(session.join().unwrap().is_err());

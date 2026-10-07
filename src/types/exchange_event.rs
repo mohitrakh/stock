@@ -38,6 +38,11 @@ pub enum ExchangeInputEvent {
     },
     /// Ends the current trading day.
     MarketCloseRequested,
+    /// Starts a primary term: a promotion journals it, with the next epoch, before anything else
+    /// it writes. It changes no business state; the epochs order the primaries of one journal.
+    TermStarted {
+        epoch: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,6 +107,10 @@ pub enum ExchangeOutputEvent {
     /// for one journal record. Nothing changed.
     SessionRejected {
         reason: String,
+    },
+    /// A primary term started.
+    TermStarted {
+        epoch: u64,
     },
 }
 

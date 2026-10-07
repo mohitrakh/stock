@@ -118,8 +118,14 @@ async fn main() {
             eprintln!("Preserve the durable history and resolve the reported error.");
             std::process::exit(1);
         });
+        // A new primary term, journaled before anything else this primary writes. With
+        // replication, its epoch fences the old primary from now on.
+        let epoch = runtime.begin_term().unwrap_or_else(|error| {
+            eprintln!("could not start a new term: {error}");
+            std::process::exit(1);
+        });
         println!(
-            "Warm replica promoted through event sequence {}",
+            "Warm replica promoted through event sequence {}, starting term {epoch}",
             runtime.next_event_sequence().saturating_sub(1)
         );
         let replication = replicate_or_exit(&mut runtime, replicating);

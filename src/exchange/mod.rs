@@ -12,4 +12,5 @@ pub mod replication;
 pub mod reporter;
 pub mod runtime;
 pub mod snapshot;
+pub mod terms;
 pub mod warm_replica;

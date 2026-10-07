@@ -10,6 +10,7 @@ use crate::{
         event_stream::{DEFAULT_CAPACITY, StreamWriter, already_published},
         replication::Replication,
         snapshot::{self, SnapshotBoundary},
+        terms::{Term, Terms},
     },
     types::{
         exchange_event::{EventEnvelope, ExchangeEvent, ExchangeInputEvent, ExchangeOutputEvent},
@@ -40,6 +41,10 @@ pub struct ExchangeRuntime {
     /// may not hold the rest. This is the journal's recovered end and last sequence, published,
     /// and served, once the replica confirms it.
     held: Option<(u64, u64)>,
+    /// The journal's terms, read at startup (the first time, by one pass over the journal).
+    terms: Option<Terms>,
+    /// The epoch a promotion starts: `run` journals it before anything else.
+    pending_term: Option<u64>,
 }
 
 /// How much the journal grows between core snapshots, as a multiple of the last snapshot's size.
@@ -60,6 +65,7 @@ pub enum StartupError {
     Store(EventStoreError),
     Replay(ReplayError),
     Stream(std::io::Error),
+    Terms(std::io::Error),
 }
 
 #[derive(Debug)]
@@ -84,6 +90,7 @@ impl std::fmt::Display for StartupError {
         match self {
             Self::Store(err) => write!(f, "{}", err),
             Self::Stream(err) => write!(f, "event stream: {}", err),
+            Self::Terms(err) => write!(f, "term index: {}", err),
             Self::Replay(err) => write!(
                 f,
                 "stored history did not replay deterministically: {:?}",
@@ -100,6 +107,7 @@ enum InputEventResult {
     PlaceOrder(Result<OrderView, String>),
     CancelOrder(Result<(), String>),
     Session(Result<SessionView, String>),
+    TermStarted,
 }
 enum PreparedCommit {
     None,
@@ -437,6 +445,13 @@ fn prepare_input_event(
             })
         }
         ExchangeInputEvent::MarketCloseRequested => prepare_close(core, MAX_RECORD_LEN as usize),
+        // A term start changes no business state: its record only marks where the term began.
+        ExchangeInputEvent::TermStarted { epoch } => Ok(PreparedInput {
+            result: InputEventResult::TermStarted,
+            output_events: vec![ExchangeOutputEvent::TermStarted { epoch }],
+            commit: PreparedCommit::None,
+            executions: Vec::new(),
+        }),
     }
 }
 
@@ -675,6 +690,8 @@ impl ExchangeRuntime {
             stream: None,
             replication: None,
             held: None,
+            terms: None,
+            pending_term: None,
         }
     }
 
@@ -716,6 +733,8 @@ impl ExchangeRuntime {
             stream: None,
             replication: None,
             held: None,
+            terms: None,
+            pending_term: None,
         })
     }
 
@@ -737,6 +756,8 @@ impl ExchangeRuntime {
             stream: None,
             replication: None,
             held: None,
+            terms: None,
+            pending_term: None,
         }
     }
 
@@ -767,6 +788,7 @@ impl ExchangeRuntime {
     /// Replicates the journal from now on: listens on `address` for the replica on the other
     /// machine. Called before `run`; every group then waits for the replica's confirmation.
     pub fn replicate(&mut self, address: SocketAddr) -> std::io::Result<Arc<Replication>> {
+        let terms = self.terms()?.list().to_vec();
         let store = self
             .store
             .as_ref()
@@ -780,9 +802,86 @@ impl ExchangeRuntime {
             store.journal_id(),
             end,
             self.next_event_seq,
+            terms,
         )?;
         self.replication = Some(Arc::clone(&replication));
         Ok(replication)
+    }
+
+    /// The journal's terms, read from the index beside it the first time.
+    fn terms(&mut self) -> std::io::Result<&mut Terms> {
+        if self.terms.is_none() {
+            let store = self
+                .store
+                .as_ref()
+                .ok_or_else(|| std::io::Error::other("an in-memory exchange has no journal"))?;
+            self.terms = Some(Terms::load(store.path(), store.file())?);
+        }
+        Ok(self.terms.as_mut().expect("loaded above"))
+    }
+
+    /// A promotion's first step as the new primary: a new term, one epoch after every epoch the
+    /// index has listed. It is added to the index now, before replication starts, so a replica
+    /// that connects meanwhile already meets the new epoch; `run` journals its `TermStarted`
+    /// record before anything else, where the journal ends now. Returns the epoch.
+    pub fn begin_term(&mut self) -> std::io::Result<u64> {
+        let offset = self
+            .store
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("an in-memory exchange has no journal"))?
+            .end()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let first_sequence = self.next_event_seq;
+        let terms = self.terms()?;
+        // After every term the index has listed, including one begun at the journal's end and
+        // never journaled, or since cut or dropped: on a replica's copy that may be another
+        // primary's term, which the replica indexed and then failed to write, so the new term
+        // must not take its epoch.
+        let epoch = terms.next_epoch();
+        terms.cut(offset)?;
+        terms.add(Term {
+            epoch,
+            first_sequence,
+            offset,
+        })?;
+        self.pending_term = Some(epoch);
+        Ok(epoch)
+    }
+
+    /// Startup's look at the journal's terms. A term begun where the journal ends, by a promotion
+    /// that stopped before journaling it, is begun again: `run` journals it first, byte for byte
+    /// as it would have. A replica that already holds that record keeps it if it connects after
+    /// the record is journaled; before, it cuts the record back and takes it again. A promotion
+    /// skips this: its `begin_term` starts a newer term instead.
+    fn resume_term(&mut self) -> std::io::Result<()> {
+        let end = self
+            .store
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("an in-memory exchange has no journal"))?
+            .end()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        match self.terms()?.pending(end) {
+            Some(term) if term.first_sequence == self.next_event_seq => {
+                eprintln!("resuming term {}, begun but never journaled", term.epoch);
+                self.pending_term = Some(term.epoch);
+            }
+            Some(_) => self.terms()?.cut(end)?,
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// Journals the term a promotion began. With replication it waits, like any command, for the
+    /// replica or for the operator to let this primary run alone.
+    fn start_pending_term(&mut self) -> Result<(), RuntimeFailure> {
+        let Some(epoch) = self.pending_term.take() else {
+            return Ok(());
+        };
+        let mut staged = Vec::new();
+        self.stage_input_event(ExchangeInputEvent::TermStarted { epoch }, &mut staged)?;
+        self.flush(staged)?;
+        eprintln!("term {epoch} started");
+        Ok(())
     }
 
     /// Startup's last step with replication: waits until the replica holds the whole recovered
@@ -791,18 +890,22 @@ impl ExchangeRuntime {
         let Some((end, last_sequence)) = self.held.take() else {
             return Ok(());
         };
-        if let Some(replication) = &self.replication {
-            replication.confirm(end);
-        }
-        self.stream
-            .as_mut()
-            .expect("a held runtime has a stream")
+        let alone = self
+            .replication
+            .as_ref()
+            .is_some_and(|replication| replication.confirm(end));
+        let stream = self.stream.as_mut().expect("a held runtime has a stream");
+        stream
             .publish_through(end, last_sequence)
-            .map_err(RuntimeFailure::Stream)
+            .map_err(RuntimeFailure::Stream)?;
+        if alone {
+            stream.sync_header().map_err(RuntimeFailure::Stream)?;
+        }
+        Ok(())
     }
 
     pub fn run(mut self) {
-        if let Err(err) = self.release_held() {
+        if let Err(err) = self.release_held().and_then(|()| self.start_pending_term()) {
             eprintln!("exchange worker halted: {err}. No further commands accepted.");
             return;
         }
@@ -1063,12 +1166,14 @@ impl ExchangeRuntime {
         if staged.is_empty() {
             return Ok(()); // a group of reads changed nothing
         }
+        let mut alone = false;
         if let Some(store) = self.store.as_mut() {
             let records: Vec<&[u8]> = staged.iter().map(|s| s.record.as_slice()).collect();
             let records = records.concat();
             if let Some(replication) = &self.replication {
                 // The group goes to the replica while this disk syncs, then waits for both:
-                // nothing that exists on one machine only is ever published or answered.
+                // nothing that exists on one machine only is ever published or answered, unless
+                // the operator lets this primary run alone.
                 store
                     .write_records(&records)
                     .map_err(RuntimeFailure::Store)?;
@@ -1076,7 +1181,7 @@ impl ExchangeRuntime {
                 let next_sequence = staged.last().expect("a group").last_sequence + 1;
                 replication.written(end, next_sequence);
                 store.sync().map_err(RuntimeFailure::Store)?;
-                replication.confirm(end);
+                alone = replication.confirm(end);
             } else {
                 store
                     .append_record(&records)
@@ -1093,6 +1198,12 @@ impl ExchangeRuntime {
                     .map_err(RuntimeFailure::Stream)?;
             }
             self.core.notify_executions(&command.executions);
+        }
+        // Answered on this machine only: its stream's end, which says what it acknowledged, must
+        // survive a power loss, so that if this primary was replaced meanwhile, the handshake
+        // refuses it when it rejoins rather than cutting what it acknowledged.
+        if alone && let Some(stream) = self.stream.as_ref() {
+            stream.sync_header().map_err(RuntimeFailure::Stream)?;
         }
         Ok(())
     }
@@ -1281,6 +1392,7 @@ fn recover_from_files(
         };
 
     attach_stream(&mut runtime, &stream_path, hold)?;
+    runtime.resume_term().map_err(StartupError::Terms)?;
     // ONE fresh snapshot of the recovered core before the exchange accepts any command. From then
     // on the trading thread writes no snapshots; the warm replica keeps the checkpoint current.
     // None while records are held back: it would stand beyond what the stream published, and a
@@ -2422,6 +2534,7 @@ mod tests {
         drop(restarted);
         let _ = std::fs::remove_file(&snapshot);
         let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(format!("{}.terms", path.display()));
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2455,6 +2568,7 @@ mod tests {
         drop(restarted);
         let _ = std::fs::remove_file(&snapshot);
         let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(format!("{}.terms", path.display()));
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2487,6 +2601,7 @@ mod tests {
         drop(recovered);
         let _ = std::fs::remove_file(&snapshot);
         let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(format!("{}.terms", path.display()));
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2921,6 +3036,7 @@ mod tests {
         drop(replayed);
         let _ = std::fs::remove_file(&snapshot);
         let _ = std::fs::remove_file(&stream);
+        let _ = std::fs::remove_file(format!("{}.terms", path.display()));
         std::fs::remove_file(path).unwrap();
     }
 

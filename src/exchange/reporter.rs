@@ -446,6 +446,14 @@ pub async fn run(args: &[String]) -> ReporterResult<()> {
         None => (None, None),
     };
     ensure_consistent_saved_state(&pool, checkpoint.as_ref()).await?;
+    match &checkpoint {
+        Some(checkpoint) => println!(
+            "Reporter resuming journal {} at sequence {}",
+            checkpoint.journal_id(),
+            checkpoint.next_sequence
+        ),
+        None => println!("Reporter building the report from sequence 1"),
+    }
     let mut reader = StreamReader::open(&args[0], &args[1], checkpoint)?;
     // Catch-up uses the same grouping, so its last group commits before the listener binds.
     let advanced = apply_available(&mut reader, &pool, &mut trading_day).await? > 0;

@@ -16,6 +16,11 @@
 //!
 //! A failed write or sync of its own files stops the replica, which could otherwise confirm what
 //! is not on its disk. It holds the journal's writer lock, so nothing else writes the copy.
+//!
+//! It keeps the index of its copy's terms (see `terms`), adding a term before the record that
+//! starts it is written, and says its latest epoch when it connects. It refuses a primary in an
+//! earlier term than one it has seen: that primary was replaced (part 5). The old primary of a
+//! failover rejoins as a replica this way, and drops what it held beyond what it acknowledged.
 
 use std::{
     collections::VecDeque,
@@ -42,7 +47,9 @@ use super::{
         Hello, LINK_TIMEOUT, MAX_ANSWER, MAX_BODY, Position, RECORDS, REFUSE, SYNCED, WELCOME,
         invalid, read_frame, u64_at, write_frame,
     },
+    terms::{Term, Terms},
 };
+use crate::types::exchange_event::{ExchangeEvent, ExchangeInputEvent};
 
 const RECONNECT_AFTER: Duration = Duration::from_secs(1);
 /// A dial that gets no answer is given up after this long, rather than the minutes the system's
@@ -95,6 +102,8 @@ pub(crate) struct Replica {
     /// not cut since: without its stream, its checksum covers the whole copy, and the replica may
     /// dial many times before the primary answers.
     last_hello: Option<Hello>,
+    /// The terms this copy holds.
+    terms: Terms,
 }
 
 impl Replica {
@@ -125,6 +134,7 @@ impl Replica {
             unpublished: VecDeque::new(),
             stream_synced: (Instant::now(), 0),
             last_hello: None,
+            terms: Terms::empty(journal_path),
         };
         let len = replica.journal.metadata()?.len();
         if len < JOURNAL_HEADER_LEN as u64 {
@@ -163,6 +173,10 @@ impl Replica {
             replica.journal.set_len(replica.end)?;
         }
         replica.journal.sync_all()?;
+        // After the cut: a term whose record was torn is dropped from the index quietly, and so is
+        // one indexed but never written, which the primary sends again.
+        replica.terms = Terms::load(journal_path, &replica.journal)?;
+        replica.terms.cut(replica.end)?;
         replica.open_stream()?;
         replica.stream_synced.1 = replica.published.0;
         Ok(replica)
@@ -180,8 +194,17 @@ impl Replica {
     }
 
     /// Checks one whole record, which starts at this copy's end, and counts it as unpublished.
-    fn accept(&mut self, record: &[u8]) -> io::Result<()> {
+    /// Returns the term it starts, if it is a term start.
+    fn accept(&mut self, record: &[u8]) -> io::Result<Option<Term>> {
         let batch = decode_batch(record, self.next_sequence)?;
+        let term = match batch[0].event {
+            ExchangeEvent::Input(ExchangeInputEvent::TermStarted { epoch }) => Some(Term {
+                epoch,
+                first_sequence: batch[0].seq_num,
+                offset: self.end,
+            }),
+            _ => None,
+        };
         let last_sequence = batch.last().unwrap().seq_num;
         self.end += record.len() as u64;
         self.next_sequence = last_sequence + 1;
@@ -189,23 +212,36 @@ impl Replica {
             end: self.end,
             last_sequence,
         });
-        Ok(())
+        Ok(term)
     }
 
-    /// Checks the records the primary sent, which must be whole.
-    fn accept_records(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+    /// Checks the records the primary sent, which must be whole, and returns the terms they
+    /// start, each after every term this copy holds. A term out of order ends the replica: its
+    /// primary and this copy disagree about the history, and dialing again would not help.
+    fn accept_records(&mut self, mut bytes: &[u8]) -> Result<Vec<Term>, Ended> {
+        let mut terms = Vec::new();
+        let mut latest = self.terms.epoch();
         while !bytes.is_empty() {
             let record = bytes
                 .get(..record_length(bytes)?)
                 .ok_or_else(|| invalid("the primary sent an incomplete record"))?;
-            self.accept(record)?;
+            if let Some(term) = self.accept(record)? {
+                if term.epoch <= latest {
+                    return Err(Ended::Refused(format!(
+                        "the primary sent the start of term {}, which does not come after term {latest} that this copy holds",
+                        term.epoch
+                    )));
+                }
+                latest = term.epoch;
+                terms.push(term);
+            }
             bytes = &bytes[record.len()..];
         }
-        Ok(())
+        Ok(terms)
     }
 
-    /// What this copy says when it connects: how far it is committed, which is on both disks, and
-    /// what it holds beyond that, by its checksum.
+    /// What this copy says when it connects: how far it is committed, which is on both disks, what
+    /// it holds beyond that, by its checksum, and the latest term it holds.
     fn hello(&mut self) -> io::Result<Hello> {
         let unchanged =
             |hello: &Hello| (hello.committed, hello.end) == (self.published.0, self.end);
@@ -219,6 +255,7 @@ impl Replica {
             end: self.end,
             end_next: self.next_sequence,
             tail_crc: crc32_of_file(&self.journal, self.published.0, self.end)?,
+            epoch: self.terms.epoch(),
         };
         self.last_hello = Some(hello);
         Ok(hello)
@@ -238,6 +275,7 @@ impl Replica {
         self.unpublished.clear();
         self.end = committed;
         self.next_sequence = self.published.1 + 1;
+        self.terms.cut(committed)?;
         // Refilled to the same length, the copy may hold different bytes: describe it afresh.
         self.last_hello = None;
         Ok(())
@@ -259,6 +297,7 @@ impl Replica {
                 .write_all_at(header, 0)
                 .map_err(Ended::Failed)?;
             self.journal_id = Some(journal_id);
+            self.terms.name(journal_id);
             self.end = JOURNAL_HEADER_LEN as u64;
             self.published = (self.end, 0);
             bytes = &bytes[JOURNAL_HEADER_LEN..];
@@ -266,11 +305,18 @@ impl Replica {
         let checked_from = self.end;
         let previous_sequence = self.next_sequence;
         let unpublished = self.unpublished.len();
-        if let Err(error) = self.accept_records(bytes) {
-            self.end = checked_from;
-            self.next_sequence = previous_sequence;
-            self.unpublished.truncate(unpublished);
-            return Err(error.into());
+        let terms = match self.accept_records(bytes) {
+            Ok(terms) => terms,
+            Err(ended) => {
+                self.end = checked_from;
+                self.next_sequence = previous_sequence;
+                self.unpublished.truncate(unpublished);
+                return Err(ended);
+            }
+        };
+        // Indexed before its record is written, so the index never misses a term the copy holds.
+        for term in terms {
+            self.terms.add(term).map_err(Ended::Failed)?;
         }
         self.journal
             .write_all_at(bytes, checked_from)
@@ -337,6 +383,13 @@ impl Replica {
                 "the primary holds another journal than this replica".to_string(),
             ));
         }
+        if resume.epoch < self.terms.epoch() {
+            return Err(Ended::Refused(format!(
+                "the primary is in term {}, but this replica holds term {}: that primary was replaced",
+                resume.epoch,
+                self.terms.epoch()
+            )));
+        }
         // The primary keeps this copy whole, or cuts it back to what is committed.
         let whole = (resume.end, resume.next_sequence) == (self.end, self.next_sequence);
         let committed = self.journal_id.is_some()
@@ -351,8 +404,8 @@ impl Replica {
         // the network, is gone.
         socket.set_read_timeout(Some(LINK_TIMEOUT))?;
         eprintln!(
-            "replica: following {primary} from journal byte {}",
-            self.end
+            "replica: following {primary}, in term {}, from journal byte {}",
+            resume.epoch, self.end
         );
         loop {
             let (kind, body) = read_frame(&mut socket, MAX_BODY)?;

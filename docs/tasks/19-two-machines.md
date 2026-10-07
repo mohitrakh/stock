@@ -795,3 +795,281 @@ Measured, with both containers sharing the machine's 2 cores and its SSD
 With the replica's files in memory there is no difference beyond the noise: on this machine the
 whole cost is the replica's sync waiting for the same disk as the primary's. After each replicated
 run the two journals were byte-identical.
+
+## Part 5 - Epoch-fenced promotion on the second machine
+
+### Why Part 5 came next
+
+After Part 4 every acknowledged command is on both machines, but nothing could use the second copy:
+losing the primary's machine still stopped the exchange. This part promotes the replica's machine,
+fences the old primary so that it can never acknowledge anything again, and lets it rejoin as the
+new primary's replica. The owner's decisions for it:
+- the epochs are compared in the replication handshake, not only journaled;
+- promotion on the second machine reuses Part 3's: stop the replica process, then promote the warm
+  replica there.
+
+### What changed
+
+- **Terms.** Each promotion starts a primary term with the next epoch, one after the highest its
+  copy's index has ever listed, and journals it: a `TermStarted { epoch }` record, before anything
+  else the new primary writes. The first primary's
+  term is epoch 0 and has no record. The record changes no business state, so replay, the warm
+  replica, the market-data process and the reporter pass it by, and snapshots keep their format.
+- **A term index beside every journal copy,** `<journal>.terms`: each term's epoch, the sequence of
+  its record and the record's offset. Whoever writes a term start saves the index first: the
+  promoted primary before it journals its term, the replica before it appends a term start it
+  received. When the index is loaded, an entry beyond the journal's end is dropped, and one exactly
+  at the end is a term begun whose record was never written (see below). The index also keeps the
+  highest epoch it has ever listed, which no cut or drop lowers. An index that is missing, names
+  another journal, or lists a record that is not the term start it says, is rebuilt by one pass
+  over the journal; that pass reads only the first 136 bytes of each record, and decodes a record
+  only where they name a term start. A rebuilt index knows the epochs its journal holds, and the
+  highest of the index it replaces if that one names this journal. An index that misses a later
+  term is not noticed; only an older index copied in its place could. The index sits beside the
+  journal's real path, so processes reaching the journal through a link share it.
+- **Epochs in the handshake.** The replica's hello carries the latest epoch its copy holds, and the
+  welcome carries the primary's. The primary refuses:
+  - a replica that has seen a later term than its own: this primary was replaced, and nothing may
+    confirm it again;
+  - a replica from an earlier term whose committed records go past the point where the next term
+    began in this journal: it acknowledged commands after the promotion, so the two histories split.
+
+  The replica, for its part, refuses a primary from an earlier term than one it holds. A replica
+  from an earlier term whose committed records all precede the next term is welcome. What it holds
+  beyond them it never acknowledged, and the usual cut back drops it.
+- **Promotion on the second machine.** The operator stops the replica process there, then asks the
+  warm replica there to promote (`POST 127.0.0.1:4003/promote`). The replica process holds the
+  copy's writer lock, so the promotion answers 409 until it has stopped; nothing then confirms the
+  old primary. The promoted primary takes the next epoch, adds it to the index before it listens
+  for a replica, and journals `TermStarted` before any other command. With
+  `REPLICATION_LISTEN_ADDR` set it then waits, like any replicated primary, for a replica or for the
+  operator to let it run alone.
+- **The old primary rejoins as the replica:** `stock --replica NEW_PRIMARY JOURNAL STREAM` on its own
+  journal and its own stream file. Its committed end is what its stream published, which is what
+  it acknowledged; the handshake checks that it ends before the new term began, cuts back what it
+  held beyond, and the new primary sends it the rest, term start included.
+- **A promotion that stops before its term is journaled is not lost.** The term's entry in the
+  index then sits exactly at the journal's end. A later plain restart of a primary on that journal
+  takes it as a term begun and journals it first, byte for byte as it would have been. A replica
+  that already holds that record keeps it if it connects after the record is journaled; before, it
+  cuts it back and takes it again. A new promotion instead takes the epoch after it: on a replica's
+  copy, such an entry may be another primary's term start, indexed and never written.
+- **A primary running alone syncs its stream's end before it answers.** That end is what the split
+  check reads when it rejoins. A stream is otherwise never synced, so after a power loss it could
+  claim less than was acknowledged, and the commands acknowledged alone would be cut instead of the
+  rejoin being refused.
+- **The reporter resumes where it was.** Its checkpoint in PostgreSQL names the journal by its id,
+  and the new primary's journal is the same journal, so a reporter started on the new primary's
+  machine continues from it. It now prints where it resumes. The market-data process starts there
+  like any market-data process.
+- **`/replication` shows the epoch.**
+
+### The operator's failover
+
+1. On the replica's machine, stop the replica process.
+2. `POST 127.0.0.1:4003/promote` to the warm replica there, until it answers 202.
+3. With replication on, the new primary waits: `POST 127.0.0.1:4004/replication/run-alone` there, or
+   bring a replica.
+4. Stop the reporter on the old machine if it still runs. Once the new primary's `/health` answers
+   200, start the reporter, and market data, on the new primary's machine. Before that, the new
+   primary may still hold back records the old reporter already read, and the reporter would refuse
+   a stream that published less than its checkpoint.
+5. When the old machine returns, start it as `stock --replica NEW_PRIMARY:PORT JOURNAL STREAM` on its
+   own journal and stream file, never as a primary. Started as a replicated primary it would only
+   wait, since nothing will confirm it again. Started without replication it would serve at once,
+   and its history would split from the new primary's.
+
+Never let the old primary run alone after a promotion. It can, since it cannot know the promotion
+happened, and it would then acknowledge commands the new primary never sees. The epochs cannot
+prevent that, but they detect it: when it tries to rejoin, its committed records go past the start
+of the new term, and it is refused rather than silently cut. That rests on its stream's end, which
+a primary running alone syncs before every answer, so it must rejoin with its own stream file.
+
+### Why the epochs fence the old primary
+
+A command is acknowledged only once a replica confirms it, or while the operator lets the primary
+run alone. After a promotion the old primary's only replica has become the new primary, so nothing
+confirms it. Any other copy that has received the new term's start refuses it, because its epoch is
+older. What the old primary wrote after the promotion it could not acknowledge, and the rejoin
+cuts it.
+
+A rejoining replica's committed records are what it acknowledged as a primary, or what was confirmed
+in its own term. Each was confirmed by the replica that is now the new primary, so they all lie
+before the point where the new term began. Committed records past that point can only come from
+running alone during the new term, which is exactly what the handshake refuses.
+
+### Options considered and rejected
+
+- **Journal the epochs, but fence by ownership and a checksum.** Smaller: the replica's machine
+  stops its replica before the promotion, so the old primary gets no confirmation, and a checksum of
+  the rejoining replica's last committed bytes detects a split. The owner chose real epoch fencing:
+  this one does not refuse an old primary that a copy holding the new term dials by mistake. (No
+  epoch helps against a copy that never saw the new term: it does not know there is one.)
+- **One standby process on the second machine,** the replica and the warm replica together, with a
+  single `/promote`. One step less for the operator, but it rewrites tested code from Parts 3 and
+  4. The replica's writer lock already orders the two steps.
+- **The epoch in the core, carried by snapshots.** The core has no use for it, and the replica
+  process, which has no core, needs it too. The index serves both, and can always be rebuilt from
+  the journal.
+- **The epoch in every record.** Every record would grow, and a replica would still have to find its
+  last committed record to read it.
+- **Finding the term starts by reading the whole journal at every start.** Restarts would again cost
+  the journal's history; the index costs one small file per copy.
+
+### Compatibility
+
+- **A new event, `term_started`, in input and output.** A journal that holds one cannot be read by an
+  older binary. A primary and its replica must run the same version, as before.
+- **The handshake frames grew by the epoch,** so an older replica cannot talk to this primary, nor
+  the reverse.
+- **A `.terms` file now appears beside every journal** a primary or a replica opens, after one pass
+  over the journal the first time.
+- **The reporter prints the sequence it resumes from.**
+
+### Found by the independent review
+
+It found nothing that lets an old primary be confirmed after a promotion. Its findings, all fixed
+except where noted:
+- **A promotion that stopped before its term was journaled forgot it.** The term's entry sat
+  exactly at the journal's end and was dropped on load, so the primary restarted in the old term.
+  Many failures land in that window: a port in use, PostgreSQL unreachable, a crash. After a power
+  loss it was worse: the replica had already synced the term start, so its epoch was the later one,
+  and the restarted primary refused its only replica for good. Now an entry at the end with the
+  next sequence is a term begun, and a primary restarted on that journal journals it, byte for byte
+  as it would have been.
+- **The split check rested on a stream end that a primary never syncs.** An old primary that ran
+  alone after the promotion, then lost power, could claim less than it had acknowledged, and its
+  rejoin would cut what it acknowledged alone instead of being refused. A primary running alone now
+  syncs its stream's end before it answers, and the docs say to rejoin with its own stream file.
+- **The index path depended on the path's spelling:** it now sits beside the journal's real path.
+  A term start out of order, which means the replica and its primary disagree about the history,
+  now stops the replica instead of making it dial again forever. Not fixed: an index that misses a
+  later term is not noticed; the index is saved before every term start, so only an older copy put
+  in its place could do that.
+- **Tests:**
+  - no test cut back a term start;
+  - no test had a real replica holding a later term dial a real primary;
+  - no test used an epoch that came from a term start not yet committed;
+  - no test restarted a primary between beginning its term and journaling it.
+
+  Each has one now.
+- **Docs:**
+  - the rejoin command lacked its stream argument;
+  - "started as a primary it would only wait" holds only with replication;
+  - the reporter must start on the new primary only once it serves, after the old reporter stops;
+  - a claim about a third copy was wrong;
+  - "nothing prevents it until Part 5" was left in the limitations.
+
+### Found by re-checking the fixes
+
+The re-check confirmed the fixes. Its findings, all fixed:
+- **A promotion could take another primary's epoch.** The first version of the fix made a promotion
+  reuse a term begun at the journal's end. On a replica's copy, that entry can be another primary's
+  term start, which the replica indexed and then failed to write. A promotion now always takes the
+  epoch after every term its index holds, begun ones included; only a plain restart journals a term
+  begun. The final checks, below, found a gap in this fix.
+- **Two tests proved less than they claimed.** The test of a primary refusing a replica that holds
+  a later term passed even without the primary's check, because the replica refuses in turn with a
+  similar message; it now checks the primary's own words. The running-alone test now checks that
+  the worker is told when it answers alone, which is what makes it sync its stream's end; nothing
+  tested that.
+- **Docs:**
+  - a replica holding the term start a restarted primary journals again keeps it only if it
+    connects afterwards, and otherwise takes it again;
+  - a primary started without replication does not sync its stream's end either;
+  - the replica's reasons to stop now include the epochs.
+
+  The runtime's tests no longer leave index files behind.
+
+### Found by the final checks
+
+A last independent check of the final changes, and my own last pass over them:
+- **A copy could forget another primary's epoch, then take it.** The re-check's fix took the epoch
+  after every term the index held. But a replica's index stops holding a term start it never wrote:
+  - the replica's next start cuts that entry;
+  - an entry past the journal's end is dropped on load, when a power loss cut the write short;
+  - a promotion that failed between its two saves of the index left neither entry.
+
+  A promotion of that copy then took the other primary's epoch, with a term start byte-identical to
+  that primary's. When that primary rejoined, the equal epochs skipped the split check, and only the
+  byte checks stood between the two histories and a silent fork. Now the index also keeps the
+  highest epoch it has ever listed, which no cut or drop lowers, and a promotion takes the epoch
+  after it. `a_replica_forgets_a_term_it_indexed_but_never_wrote` now promotes that copy afterwards
+  and expects term 2.
+- **A promotion ran a plain restart's check first** (my own pass). It looked for a term begun, to
+  journal it again, so on a copy holding one it printed "resuming term N" and then started term
+  N + 1. Only a plain restart runs that check now.
+- **Docs:**
+  - a new term is one after the highest epoch the index listed, not one after the journal's last;
+  - "killed under load" was a kill after trading days;
+  - a primary started directly on the replica's copy is no promotion: it begins no term of its
+    own, so the epochs cannot fence the old primary. That is now among the limitations.
+
+The handshake still compares the epochs the journal holds, not the highest the index listed. Say a
+promotion fails after saving term 1, and the operator restarts that machine's replica so that the
+old primary, paused in term 0, can go on. The replica forgets the entry. If the highest counted in
+the handshake, each side would refuse the other, and the old primary would stay paused for good.
+A promotion's epoch is the only place the highest is used.
+
+Not covered by a test: the stream sync of a primary running alone. Removing it fails no test, since
+showing it needs a power loss.
+
+### Verification
+
+Tests:
+- `the_index_is_rebuilt_from_the_journal_and_kept_in_step_with_it`: the index is built by one pass;
+  an entry at the journal's end is a term begun and one beyond it is dropped; a later epoch is
+  required; a cut forgets the terms it removed; neither a cut nor a drop lowers the next epoch; a
+  wrong index is rebuilt, still above the highest epoch it listed; and a record that only mentions
+  a term start is not one;
+- `a_term_start_changes_no_order_and_must_match_its_output`;
+- `epochs_fence_a_replaced_primary_and_refuse_a_split_history`: against a primary in term 1, a
+  replica that has seen term 2 is refused, one from term 0 that committed only what came before
+  term 1 is welcomed in term 1, one from term 0 that committed past it is refused as a split, and
+  one in term 1 may have committed anything;
+- `a_replica_refuses_a_primary_from_an_earlier_term`;
+- `a_primary_refuses_a_replica_that_holds_a_later_term`: a real replica whose copy holds the start
+  of term 1, not yet committed, dials a real primary of term 0;
+- `a_promoted_replica_starts_a_term_and_the_old_primary_rejoins_as_its_replica`: the old primary
+  acknowledged two deposits and wrote a third that was never confirmed; the replica's copy, promoted
+  into term 1, answers a new deposit once the old primary, rejoined as its replica, confirms it. The
+  old primary dropped its third deposit, holds the term start, and its journal is byte-identical to
+  the new primary's;
+- `a_term_begun_but_never_journaled_is_journaled_when_the_primary_restarts`;
+- `a_promotion_takes_the_epoch_after_a_term_its_copy_indexed_but_never_wrote`;
+- `a_replica_forgets_a_term_it_indexed_but_never_wrote`: and that copy, promoted afterwards, takes
+  term 2;
+- `a_term_start_cut_back_is_forgotten_and_taken_again`.
+
+`cargo fmt -- --check` is clean. `cargo test --locked` passes: 207 unit tests and the executable
+integration tests.
+
+Live, on the office Ubuntu machine (`~/stock-scripts/m23p5-live.sh`): machine A, the primary, with a
+reporter beside it; machine B, the replica and a warm replica on B's copy; two containers, each with
+its own volume and network address.
+1. **Trading on A.** Days opened and closed through A's operator port: 57 commands acknowledged, the
+   last opening 2026-01-30. A's reporter had saved its checkpoint at sequence 115.
+2. **A and its reporter were killed,** as a machine lost.
+3. **Promotion on B.** While B's replica ran, `/promote` answered 409. The replica was killed, the
+   warm replica promoted into term 1, and it paused, waiting for a replica: `/health` 503. Run
+   alone, it journaled the term and served 375 ms after the replica was stopped.
+4. **B held every acknowledged command:** its session showed 2026-01-30 open, A's last answer. A
+   reporter started on B printed "resuming ... at sequence 115", A's reporter's checkpoint, and
+   moved on to 117, past the term start.
+5. **A restarted as a primary** in term 0: paused, `/health` 503, and an open sent to it got no
+   answer. It had written that open, but nothing would ever confirm it.
+6. **A rejoined as B's replica.** It cut the 247 bytes of that open, which it never acknowledged,
+   and followed B in term 1 from byte 13,072. B turned synchronous, and the two journals were
+   byte-identical, 13,737 bytes. A's term index holds term 1, starting at sequence 115.
+
+Run again after each round of fixes, the last time with the final build: the same six steps. That
+time A acknowledged 57 commands, the last opening 2026-01-30; its reporter had saved sequence 115
+and resumed there on B; B served 426 ms after its replica was stopped; and A cut the 247 bytes of
+the open it wrote as a primary. The journals were identical at 13,737 bytes, and A's index recorded
+1 as the highest epoch it has listed. Over the five runs B served 375 to 697 ms after its replica
+was stopped; the figure includes the script's own polling, each check a `docker exec` with 0.2 s
+between checks. The scripts remove the fencing's checks and each round's fixes one at a time, and
+each removal makes the test that covers it fail: eighteen removals, one check removed under two
+tests (`~/stock-scripts/m23p5-mutate.sh`, `m23p5-mutate2.sh`, `m23p5-mutate3.sh` and
+`m23p5-mutate4.sh`). All three PostgreSQL acceptance tests pass, and the
+release build still has its 12 warnings.

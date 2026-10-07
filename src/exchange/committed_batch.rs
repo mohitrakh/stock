@@ -60,7 +60,8 @@ pub enum CommittedCommand {
         trading_day: NaiveDate,
         expired: Vec<ExpiredOrder>,
     },
-    /// Anything that changes no order: deposits, risk limits, a refused open or close.
+    /// Anything that changes no order: deposits, risk limits, a refused open or close, the start
+    /// of a primary term.
     Other,
 }
 
@@ -90,6 +91,12 @@ pub fn decode(batch: &[EventEnvelope]) -> Result<CommittedCommand, String> {
             decode_open(*trading_day, &outputs)
         }
         ExchangeInputEvent::MarketCloseRequested => decode_close(&outputs),
+        ExchangeInputEvent::TermStarted { epoch } => match outputs.as_slice() {
+            [(_, ExchangeOutputEvent::TermStarted { epoch: started })] if started == epoch => {
+                Ok(CommittedCommand::Other)
+            }
+            _ => Err("term batch has no matching start".into()),
+        },
         ExchangeInputEvent::FundsDepositRequested { .. }
         | ExchangeInputEvent::SharesDepositRequested { .. }
         | ExchangeInputEvent::RiskLimitSetRequested { .. } => Ok(CommittedCommand::Other),
@@ -312,6 +319,24 @@ mod tests {
             }),
         ));
         assert!(decode(&malformed).is_err());
+    }
+
+    #[test]
+    fn a_term_start_changes_no_order_and_must_match_its_output() {
+        let term = |epoch| {
+            vec![
+                envelope(
+                    1,
+                    ExchangeEvent::Input(ExchangeInputEvent::TermStarted { epoch: 2 }),
+                ),
+                envelope(
+                    2,
+                    ExchangeEvent::Output(ExchangeOutputEvent::TermStarted { epoch }),
+                ),
+            ]
+        };
+        assert_eq!(decode(&term(2)).unwrap(), CommittedCommand::Other);
+        assert!(decode(&term(3)).is_err());
     }
 
     fn close(outputs: Vec<ExchangeOutputEvent>) -> Vec<EventEnvelope> {
