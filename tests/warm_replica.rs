@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    os::unix::process::ExitStatusExt,
+    os::unix::{fs::FileExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -246,4 +246,32 @@ fn warm_replica_process_refuses_promotion_while_another_process_owns_the_journal
     assert_eq!(fs::read(&fixture.journal).unwrap(), journal_before);
     assert_eq!(fs::read(&fixture.stream).unwrap(), stream_before);
     primary_lock.unlock().unwrap();
+}
+
+/// A writer killed while publishing leaves the ready marker cleared. The warm replica process
+/// keeps running, says so on `/status`, and can still be promoted once the writer is gone.
+#[test]
+fn warm_replica_process_waits_out_an_interrupted_publication_and_stays_promotable() {
+    let fixture = Fixture::new();
+    fixture.initialize();
+    let address = unused_address();
+    let mut child = fixture.spawn(&address);
+    wait_for(&mut child, &address, "/status", |status, body| {
+        status == 200 && body.contains("\"stream_interrupted\":false")
+    });
+
+    OpenOptions::new()
+        .write(true)
+        .open(&fixture.stream)
+        .unwrap()
+        .write_all_at(&0u64.to_ne_bytes(), 72)
+        .unwrap();
+    let (_, status) = wait_for(&mut child, &address, "/status", |status, body| {
+        status == 200 && body.contains("\"stream_interrupted\":true")
+    });
+    assert!(status.contains("\"next_event_sequence\":3"));
+    wait_for(&mut child, &address, "/health", |status, _| status == 200);
+
+    let (status, body) = request(&address, "POST", "/promote").unwrap();
+    assert_eq!(status, 202, "{body}");
 }

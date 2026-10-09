@@ -58,6 +58,14 @@ ssh ubuntu@10.0.127.253 'docker run --rm --network stock-test-net -v ~/stock:/sr
 | `m23-after.sh` | the same startups on a new five-day journal built by the new binary |
 | `m23-copy.sh` | copies a journal with its stream, snapshot and market-data state to another directory, as onto another machine, and starts from the copies |
 | `m23-rollback.sh [in-place]` | puts an older copy of a two-day journal back in place, then tries to promote a warm replica onto it and to restart the primary on it. By default the copy is renamed into place; `in-place` copies it over the followed file |
+| `m23p6-load.py` | milestone 23 Part 6 customers: 16 HTTP users in the exchange's network namespace, every acknowledgement logged; also `verify` (each acknowledged order still there) and `failover` (promote, run alone, first order, timed) |
+| `m23p6-failover.sh [RUNS] [BINARY]` | the primary killed under load, repeatedly (every other run after a network cut); promotion on B, verify, reporter resume, A rejoins |
+| `m23p6-faults.sh [BINARY]` | the replica killed, then its network cut, under load; nothing acknowledged meanwhile |
+| `m23p6-gap.sh [KILLS] [BINARY]` | B's replica killed many times under load; counts warm-replica stops and interrupted publications; then a promotion |
+| `m23p6-bench.sh [RUNS] [BINARY]` | Part 4's `--bench` comparison on the current binary |
+| `m23p6-mutate.sh` | removes the Part 6 fix piece by piece; each covering test must fail |
+| `m23p6-all.sh`, `m23p6-all2.sh` | the Part 6 live runs in turn; output in `~/m23p6-out/` |
+| `stock-m23p5`, `stock-m23p6` | release builds of milestone 23 Parts 5 and 6 |
 | `stock-m21`, `stock-m22` | prebuilt binaries of earlier milestones, for before/after runs (`stock-m21` is commit `a4860c7`; `stock-m22` is the milestone 22 tree) |
 | `rep-*.sh`, `m22-*.sh` | benchmark scripts (see the performance docs) |
 
@@ -437,6 +445,51 @@ Its smaller findings, all fixed:
 - formatting clean; 172 unit tests and the process tests pass;
 - all 3 PostgreSQL tests pass, each refusal now checked by its reason;
 - the rollback live run passes both ways on the final code;
+- warnings still 12.
+
+### Milestone 23 Part 6: measurement and failure tests (2026-10-09)
+
+Parts 3 to 5 are recorded in `docs/tasks/19-two-machines.md` and their `m23p3-*`, `m23p4-*` and
+`m23p5-*` scripts, not here.
+
+**Before writing any code:** the office machine's `~/stock` matched the repo's HEAD, apart from
+line endings and older docs. Baseline `check.sh`: formatting clean, 207 unit tests and the process
+tests pass.
+
+**Reproduction first:** two new unit tests, a warm replica facing a cleared ready marker, run on the
+unchanged code. Both failed with `committed stream read failed: stream publication interrupted;
+restart the writer to recover`. That is the stop the known limitation described.
+
+**The fix and its tests:** the error became the type `PublicationInterrupted`, and the warm replica
+waits on it. Formatting clean; 209 unit tests and the process tests pass (the new process test
+included). `m23p6-mutate.sh`: all six removals fail their test.
+
+**Live runs** (`m23p6-all.sh`, then `m23p6-all2.sh` for the gap runs and the benchmark):
+
+| Script | Outcome |
+|---|---|
+| `m23p6-failover.sh 10` | 10/10 runs: every acknowledged order on B (83,186), B a prefix of A, reporter resumed, journals identical after A rejoined; tail cut in 3 network-cut runs; 26–74 ms promote to first order |
+| `m23p6-faults.sh` | 0 acknowledged while the replica was killed (3.4 s) or cut off (12.6 s); 27,308 acknowledged, all present; journals identical |
+| `m23p6-gap.sh 40 stock-m23p5` / `stock-m23p6` | the warm replica never met an interrupted publication with either binary; 49,555 and 65,342 acknowledged, all on B after the promotion |
+| `m23p6-bench.sh 2` | 45–56k orders/s alone, 34–36k replicated; journals identical |
+
+**Problems met, all in the scripts:**
+- a plain `docker kill` never left A with records B lacked, since the kernel delivers what a killed
+  process sent. Every other run now cuts A's network first;
+- `DROP DATABASE` failed while the last reporter still held a connection, and the next run's
+  reporter met old tables. Fixed with `WITH (FORCE)`. The batch it spoiled was thrown away and the
+  ten runs repeated;
+- the gap script's B had no `REPLICATION_LISTEN_ADDR`, so the client waited for "run alone" for
+  ever. Fixed, and every client step now gives up after 60 s;
+- the first batch's summary file was overwritten by run 10's per-run file of the same name
+  (`failover-10.txt`). The summary is now `failover.txt`.
+
+**Review:** the code was correct. Fixed: `/status` started as `false` before the follower's first
+loop. Documented: a warm replica *started* on an interrupted stream still exits. Docs updated.
+
+**Final:**
+- formatting clean; 209 unit tests and the process tests pass;
+- all 3 PostgreSQL tests pass;
 - warnings still 12.
 
 ---

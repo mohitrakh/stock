@@ -3,6 +3,7 @@
 //! truncate, replace, or modify either backing file while it is in use.
 
 use std::{
+    fmt,
     fs::{File, OpenOptions},
     io,
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
@@ -29,6 +30,27 @@ const MAX_CAPACITY: usize = 64 * 1024 * 1024;
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// A writer died between clearing the ready marker and setting it again: a reader holding the
+/// shared lock never sees a live writer's publication half done. The journal is intact, and a
+/// restarted writer repairs the stream.
+#[derive(Debug)]
+struct PublicationInterrupted;
+
+impl fmt::Display for PublicationInterrupted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("stream publication interrupted; restart the writer to recover")
+    }
+}
+
+impl std::error::Error for PublicationInterrupted {}
+
+/// Whether a reader's error is an interrupted publication rather than a damaged stream.
+pub(crate) fn is_publication_interrupted(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<PublicationInterrupted>())
 }
 
 fn word(bytes: &[u8], offset: usize) -> u64 {
@@ -124,8 +146,9 @@ impl Mapping {
         self.file.lock_shared()?;
         let _unlock = Unlock(&self.file);
         if self.ready().load(Ordering::Acquire) != READY {
-            return Err(invalid(
-                "stream publication interrupted; restart the writer to recover",
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                PublicationInterrupted,
             ));
         }
         let header = self.copy(0, 68);

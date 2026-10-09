@@ -41,7 +41,9 @@ use tokio::sync::{oneshot, watch};
 use super::{
     core::ExchangeCore,
     event_store::{EventStore, EventStoreError, journal_id_of},
-    event_stream::{ReaderCheckpoint, StreamReader, decode_batch, read_record},
+    event_stream::{
+        ReaderCheckpoint, StreamReader, decode_batch, is_publication_interrupted, read_record,
+    },
     runtime::{ReplayError, ReplicaCore},
     snapshot::{self, SnapshotBoundary},
 };
@@ -97,6 +99,8 @@ struct WarmReplica {
     /// `None` when snapshots must not be written: an existing snapshot file was invalid, and it is
     /// preserved for diagnosis exactly as primary recovery preserves it.
     snapshots: Option<SnapshotWriter>,
+    /// The stream's writer died while publishing, and has not repaired the stream since.
+    stream_interrupted: bool,
 }
 
 /// Writes the journal-bound core snapshot from this follower's verified core, so the primary's
@@ -231,6 +235,7 @@ impl WarmReplica {
             stream_path,
             snapshot_path,
             snapshots,
+            stream_interrupted: false,
         })
     }
 
@@ -303,12 +308,30 @@ impl WarmReplica {
     }
 
     fn follow_once(&mut self) -> Result<bool, String> {
-        let batch = self
+        let next = self
             .reader
             .as_mut()
             .ok_or("warm replica was already promoted")?
-            .next_batch()
-            .map_err(|error| format!("committed stream read failed: {error}"))?;
+            .next_batch();
+        // A writer killed while publishing leaves the stream unreadable until it restarts, but
+        // every record it published is in the journal. Waiting keeps this replica promotable: the
+        // promotion fences the writer and reads the rest from the journal, never the stream.
+        let interrupted = matches!(&next, Err(error) if is_publication_interrupted(error));
+        if interrupted != self.stream_interrupted {
+            self.stream_interrupted = interrupted;
+            if interrupted {
+                eprintln!(
+                    "the stream's writer stopped while publishing; waiting at event sequence {} until it restarts or a promotion",
+                    self.applied_checkpoint.next_sequence
+                );
+            } else {
+                eprintln!("the stream's writer repaired the stream; following again");
+            }
+        }
+        if interrupted {
+            return Ok(false);
+        }
+        let batch = next.map_err(|error| format!("committed stream read failed: {error}"))?;
         let Some(batch) = batch else {
             return Ok(false);
         };
@@ -428,6 +451,7 @@ struct PromotionRequest {
 struct ManagementState {
     available: Arc<AtomicBool>,
     next_event_sequence: Arc<AtomicU64>,
+    stream_interrupted: Arc<AtomicBool>,
     promotion_requests: mpsc::Sender<PromotionRequest>,
 }
 
@@ -435,6 +459,7 @@ struct ManagementState {
 struct WarmStatus {
     role: &'static str,
     next_event_sequence: u64,
+    stream_interrupted: bool,
 }
 
 async fn health(State(state): State<ManagementState>) -> impl IntoResponse {
@@ -454,6 +479,7 @@ async fn status(State(state): State<ManagementState>) -> Response {
         Json(WarmStatus {
             role: "warm-replica",
             next_event_sequence: state.next_event_sequence.load(Ordering::Acquire),
+            stream_interrupted: state.stream_interrupted.load(Ordering::Acquire),
         }),
     )
         .into_response()
@@ -499,6 +525,7 @@ fn follow(
     requests: mpsc::Receiver<PromotionRequest>,
     available: Arc<AtomicBool>,
     next_event_sequence: Arc<AtomicU64>,
+    stream_interrupted: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     promotion_result: oneshot::Sender<Result<WarmPromotion, String>>,
 ) {
@@ -539,7 +566,9 @@ fn follow(
             Err(mpsc::TryRecvError::Empty) => {}
         }
 
-        match warm.follow_once() {
+        let followed = warm.follow_once();
+        stream_interrupted.store(warm.stream_interrupted, Ordering::Release);
+        match followed {
             Ok(true) => match warm.next_event_sequence() {
                 Ok(sequence) => next_event_sequence.store(sequence, Ordering::Release),
                 Err(error) => {
@@ -585,11 +614,13 @@ pub async fn run(args: &[String], snapshot_growth: u64) -> WarmResult<WarmPromot
 
     let available = Arc::new(AtomicBool::new(true));
     let next_event_sequence = Arc::new(AtomicU64::new(initial_sequence));
+    let stream_interrupted = Arc::new(AtomicBool::new(warm.stream_interrupted));
     let (request_tx, request_rx) = mpsc::channel();
     let (promotion_tx, mut promotion_rx) = oneshot::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let follower_available = Arc::clone(&available);
     let follower_sequence = Arc::clone(&next_event_sequence);
+    let follower_interrupted = Arc::clone(&stream_interrupted);
     let follower_stop = Arc::clone(&stop);
     let follower = thread::Builder::new()
         .name("warm-replica-follower".into())
@@ -599,6 +630,7 @@ pub async fn run(args: &[String], snapshot_growth: u64) -> WarmResult<WarmPromot
                 request_rx,
                 follower_available,
                 follower_sequence,
+                follower_interrupted,
                 follower_stop,
                 promotion_tx,
             )
@@ -611,6 +643,7 @@ pub async fn run(args: &[String], snapshot_growth: u64) -> WarmResult<WarmPromot
         .with_state(ManagementState {
             available,
             next_event_sequence,
+            stream_interrupted,
             promotion_requests: request_tx,
         });
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -1688,5 +1721,113 @@ mod tests {
             ));
         }
         assert!(reader.next_batch().unwrap().is_none());
+    }
+
+    /// What a writer killed while publishing leaves behind: the record is in the journal and in
+    /// the stream, but the ready marker it cleared is never set again.
+    fn interrupt_stream_publication(fixture: &Fixture) {
+        OpenOptions::new()
+            .write(true)
+            .open(&fixture.bus)
+            .unwrap()
+            .write_all_at(&0u64.to_le_bytes(), 72)
+            .unwrap();
+    }
+
+    /// The replica process on the second machine can be killed while it publishes, and the
+    /// failover runbook kills it right before the promotion. The warm replica then waits where
+    /// it is, and the promotion reads the rest from the journal and repairs the stream.
+    #[test]
+    fn an_interrupted_publication_leaves_the_warm_replica_waiting_and_promotable() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.dir.join("events.snapshot");
+        let mut primary = runtime_for(&fixture);
+        primary
+            .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 10,
+            })
+            .unwrap();
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
+        warm.catch_up().unwrap();
+        primary
+            .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 20,
+            })
+            .unwrap();
+        let expected = primary.core_snapshot_for_test();
+        drop(primary);
+        interrupt_stream_publication(&fixture);
+
+        assert!(!warm.follow_once().unwrap());
+        assert!(!warm.follow_once().unwrap());
+        assert!(warm.stream_interrupted);
+        assert_eq!(warm.next_event_sequence().unwrap(), 3);
+
+        let WarmPromotion {
+            store,
+            replica,
+            suffix,
+            stream_path,
+            ..
+        } = warm.try_promote().unwrap();
+        assert_eq!(suffix.len(), 2);
+        let (_tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut promoted =
+            promote_replica(rx, store, replica, suffix, &stream_path, false).unwrap();
+        assert_eq!(promoted.core_snapshot_for_test(), expected);
+        promoted
+            .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 5,
+            })
+            .unwrap();
+        assert_eq!(promoted.next_event_sequence(), 7);
+        let mut reader = StreamReader::open(&fixture.log, &fixture.bus, None).unwrap();
+        for expected_amount in [10, 20, 5] {
+            let batch = reader.next_batch().unwrap().unwrap();
+            assert!(matches!(
+                &batch[1].event,
+                ExchangeEvent::Output(ExchangeOutputEvent::FundsDeposited { amount, .. })
+                    if *amount == expected_amount
+            ));
+        }
+        assert!(reader.next_batch().unwrap().is_none());
+    }
+
+    /// A writer that restarts repairs the stream, and the waiting warm replica follows it again.
+    #[test]
+    fn a_warm_replica_follows_again_once_a_restarted_writer_repairs_the_stream() {
+        let fixture = Fixture::new();
+        let snapshot = fixture.dir.join("events.snapshot");
+        let mut primary = runtime_for(&fixture);
+        primary
+            .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 10,
+            })
+            .unwrap();
+        let mut warm = WarmReplica::open(&fixture.log, &fixture.bus, &snapshot, u64::MAX).unwrap();
+        warm.catch_up().unwrap();
+        drop(primary);
+        interrupt_stream_publication(&fixture);
+        assert!(!warm.follow_once().unwrap());
+        assert!(warm.stream_interrupted);
+
+        let mut primary = runtime_for(&fixture);
+        primary
+            .record_input_for_test(ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 20,
+            })
+            .unwrap();
+        warm.catch_up().unwrap();
+        assert!(!warm.stream_interrupted);
+        assert_eq!(warm.next_event_sequence().unwrap(), 5);
+        assert_eq!(
+            warm.replica.as_ref().unwrap().snapshot(),
+            primary.core_snapshot_for_test()
+        );
     }
 }

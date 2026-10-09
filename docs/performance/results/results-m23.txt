@@ -1,0 +1,174 @@
+# Milestone 23 part 6 (2026-10-09): measurement and failure tests.
+# Machine: the office Ubuntu machine, an i3-7100 (2 cores, 4 threads) and a SATA SSD, with other
+# services running. Machines A and B are two containers on one Docker network, each with its own
+# volume; they share the CPU and the SSD.
+# Binary: ~/stock-scripts/stock-m23p6 (release build of the Part 6 tree); the gap runs also use
+# ~/stock-scripts/stock-m23p5. Scripts: ~/stock-scripts/m23p6-failover.sh 10, m23p6-faults.sh,
+# m23p6-gap.sh 40 [binary], m23p6-bench.sh 2, m23p6-mutate.sh; the customers are m23p6-load.py.
+# Write-up: docs/performance/11-failover-under-load.md and docs/tasks/19-two-machines.md, Part 6.
+
+### m23p6-failover: 10 runs of /scripts/stock-m23p6, 2026-10-09T09:57:04+05:30
+run 1: A killed after 6527 ms of load; acknowledged 9991
+  journals at the kill: A 7233117 bytes, B 7233117 bytes (A's unconfirmed tail 0 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=8.7 running_alone=58.1 first_order_accepted=74.2
+  verify: acknowledged 9991, found 9991, missing 0 []
+  reporter: A saved next sequence 32909; on B: Reporter resuming journal 29933703-2eea-4f23-9e69-31ec7e027b01 at sequence 32909
+  A rejoined: no cut reported; journals identical: yes
+run 2: A network cut, then killed 0.3 s later after 5384 ms of load; acknowledged 8603
+  journals at the kill: A 6312751 bytes, B 6305607 bytes (A's unconfirmed tail 7144 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=2.7 running_alone=24.3 first_order_accepted=26.1
+  verify: acknowledged 8603, found 8603, missing 0 []
+  reporter: A saved next sequence 13157; on B: Reporter resuming journal 9561617f-8e39-4479-84c2-dc31d29e2af4 at sequence 13157
+  A rejoined: replica: cut 7144 bytes the primary does not hold; journals identical: yes
+run 3: A killed after 2937 ms of load; acknowledged 6228
+  journals at the kill: A 4561953 bytes, B 4561953 bytes (A's unconfirmed tail 0 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=4.1 running_alone=25.7 first_order_accepted=28.3
+  verify: acknowledged 6228, found 6228, missing 0 []
+  reporter: A saved next sequence 6443; on B: Reporter resuming journal ec248e29-4fcc-4027-9ec0-9e9b1f9f7452 at sequence 6443
+  A rejoined: no cut reported; journals identical: yes
+run 4: A network cut, then killed 0.3 s later after 4836 ms of load; acknowledged 8680
+  journals at the kill: A 6325977 bytes, B 6320260 bytes (A's unconfirmed tail 5717 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=7.0 running_alone=28.7 first_order_accepted=30.5
+  verify: acknowledged 8680, found 8680, missing 0 []
+  reporter: A saved next sequence 13083; on B: Reporter resuming journal ab0f704e-2ef9-4714-84a6-1a04c5df5dc8 at sequence 13083
+  A rejoined: replica: cut 5717 bytes the primary does not hold; journals identical: yes
+run 5: A killed after 2162 ms of load; acknowledged 3982
+  journals at the kill: A 2839802 bytes, B 2839802 bytes (A's unconfirmed tail 0 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=6.5 running_alone=38.7 first_order_accepted=50.3
+  verify: acknowledged 3982, found 3982, missing 0 []
+  reporter: A saved next sequence 6571; on B: Reporter resuming journal 073db327-d52c-47c5-8228-3521d4f026a7 at sequence 6571
+  A rejoined: no cut reported; journals identical: yes
+run 6: A network cut, then killed 0.3 s later after 5799 ms of load; acknowledged 10895
+  journals at the kill: A 7997313 bytes, B 7997313 bytes (A's unconfirmed tail 0 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=11.8 running_alone=38.5 first_order_accepted=41.9
+  verify: acknowledged 10895, found 10895, missing 0 []
+  reporter: A saved next sequence 33279; on B: Reporter resuming journal 3692086a-665e-4e1a-8c9d-c51ff5dd4c2c at sequence 33279
+  A rejoined: no cut reported; journals identical: yes
+run 7: A killed after 3157 ms of load; acknowledged 5994
+  journals at the kill: A 4302163 bytes, B 4302163 bytes (A's unconfirmed tail 0 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=5.2 running_alone=37.6 first_order_accepted=56.3
+  verify: acknowledged 5994, found 5994, missing 0 []
+  reporter: A saved next sequence 13061; on B: Reporter resuming journal 611ffec9-ee78-485a-bd71-7e1d0cb30384 at sequence 13061
+  A rejoined: no cut reported; journals identical: yes
+run 8: A network cut, then killed 0.3 s later after 3535 ms of load; acknowledged 7494
+  journals at the kill: A 5464688 bytes, B 5464688 bytes (A's unconfirmed tail 0 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=4.2 running_alone=36.2 first_order_accepted=47.1
+  verify: acknowledged 7494, found 7494, missing 0 []
+  reporter: A saved next sequence 16471; on B: Reporter resuming journal 6b13c8e0-b95d-4d77-8952-a81f53466745 at sequence 16471
+  A rejoined: no cut reported; journals identical: yes
+run 9: A killed after 6685 ms of load; acknowledged 12100
+  journals at the kill: A 8862256 bytes, B 8862256 bytes (A's unconfirmed tail 0 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=2.6 running_alone=34.5 first_order_accepted=40.1
+  verify: acknowledged 12100, found 12100, missing 0 []
+  reporter: A saved next sequence 13017; on B: Reporter resuming journal 85208b8b-7307-493c-ac7e-bbcc8b678e64 at sequence 13017
+  A rejoined: no cut reported; journals identical: yes
+run 10: A network cut, then killed 0.3 s later after 5948 ms of load; acknowledged 9219
+  journals at the kill: A 6826263 bytes, B 6819126 bytes (A's unconfirmed tail 7137 bytes); B a prefix of A: yes
+  promotion (ms after the promote request): promote_accepted=8.4 running_alone=35.3 first_order_accepted=42.0
+  verify: acknowledged 9219, found 9219, missing 0 []
+  reporter: A saved next sequence 13187; on B: Reporter resuming journal b53b7640-272f-4ddc-aeec-dfca51431227 at sequence 13187
+  A rejoined: replica: cut 7137 bytes the primary does not hold; journals identical: yes
+### done
+
+### m23p6-faults: /scripts/stock-m23p6, 2026-10-09T09:59:51+05:30
+### 1. the replica is killed under load
+replication: {"mode":"paused","epoch":0,"replica_connected":false,"journal_end":2492548,"replica_end":null,"waiting_ms":3320} [200]
+health:      paused: waiting for the replica [503]
+run alone:   {"mode":"running alone","epoch":0,"replica_connected":false,"journal_end":2492548,"replica_end":null,"waiting_ms":3442} [200]
+acknowledged from 0.5 s after the kill until running alone (3438 ms): 0
+acknowledged in the 3 s running alone: 11024
+### 2. the replica restarts and catches up
+replication: {"mode":"synchronous","epoch":0,"replica_connected":true,"journal_end":11542569,"replica_end":11535540,"waiting_ms":0} [200]
+synchronous again 4026 ms after running alone began (3 s of it on purpose)
+### 3. the replica's network is cut
+the primary dropped the silent link 10554 ms after the cut
+health:      paused: waiting for the replica [503]
+synchronous again 997 ms after the network came back
+acknowledged from 0.5 s after the cut until the network came back (12619 ms): 0
+### 4. every acknowledged order is on the primary; the journals are identical
+acknowledged in all: 27308, over 30 s
+longest silence between acknowledgements: around the kill 3445 ms; around the cut 13482 ms; in the first 3 s 11 ms
+verify: acknowledged 27308, found 27308, missing 0 []
+journals: primary 41361f60b7344ec1 (20687517 bytes), replica 41361f60b7344ec1: identical
+### done
+
+### m23p6-gap: 40 kills of B's replica under load, /scripts/stock-m23p5, 2026-10-09T10:05:54+05:30
+kills: 40; the warm replica stopped after 0; waited out an interrupted publication after 0
+### the primary is lost; the warm replica is promoted
+failover ms: promote_accepted=7.3 running_alone=26.3 first_order_accepted=37.2
+verify: acknowledged 49555, found 49555, missing 0 []
+### done
+
+### m23p6-gap: 40 kills of B's replica under load, /scripts/stock-m23p6, 2026-10-09T10:06:59+05:30
+kills: 40; the warm replica stopped after 0; waited out an interrupted publication after 0
+### the primary is lost; the warm replica is promoted
+failover ms: promote_accepted=11.8 running_alone=28.1 first_order_accepted=35.8
+verify: acknowledged 65342, found 65342, missing 0 []
+### done
+
+### m23p6-bench: m23p6-bench.sh 2
+### max-alone: --bench --orders 200000 (replicated: no)
+  throughput : 56107 orders/s over 3.565 s
+  latency us : p50 194047  p90 207359  p99 231679  p99.9 233983  max 234495  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+### max-replicated: --bench --orders 200000 (replicated: yes)
+  throughput : 35782 orders/s over 5.589 s
+  latency us : p50 306175  p90 342015  p99 352767  p99.9 353791  max 354559  (queue-bound at max rate)
+  syncs      : 196 (1020.4 orders per sync)
+  journals   : primary a7ec5b9b6decd371, replica a7ec5b9b6decd371: identical
+### max-replica-in-memory: --bench --orders 200000 (replicated: tmpfs)
+  throughput : 44954 orders/s over 4.449 s
+  latency us : p50 227711  p90 322815  p99 365055  p99.9 373247  max 373503  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journals   : primary 510fd112364c8a5b, replica 510fd112364c8a5b: identical
+### 5000-alone: --bench --orders 100000 --rate 5000 (replicated: no)
+  throughput : 4998 orders/s over 20.009 s
+  latency us : p50 7871  p90 13623  p99 30383  p99.9 64991  max 75071
+  syncs      : 8267 (12.1 orders per sync)
+### 5000-replicated: --bench --orders 100000 --rate 5000 (replicated: yes)
+  throughput : 4997 orders/s over 20.013 s
+  latency us : p50 11399  p90 20575  p99 28751  p99.9 40895  max 49055
+  syncs      : 5230 (19.1 orders per sync)
+  journals   : primary fd7db06cb30ab802, replica fd7db06cb30ab802: identical
+### 5000-replica-in-memory: --bench --orders 100000 --rate 5000 (replicated: tmpfs)
+  throughput : 4998 orders/s over 20.009 s
+  latency us : p50 6659  p90 12207  p99 18703  p99.9 32863  max 42815
+  syncs      : 9705 (10.3 orders per sync)
+  journals   : primary 5b232fd089f575a4, replica 5b232fd089f575a4: identical
+### max-alone: --bench --orders 200000 (replicated: no)
+  throughput : 45193 orders/s over 4.425 s
+  latency us : p50 236415  p90 285183  p99 328191  p99.9 335615  max 335871  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+### max-replicated: --bench --orders 200000 (replicated: yes)
+  throughput : 34254 orders/s over 5.839 s
+  latency us : p50 310015  p90 397055  p99 449023  p99.9 454911  max 455167  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journals   : primary bb4047d5340772a3, replica bb4047d5340772a3: identical
+### max-replica-in-memory: --bench --orders 200000 (replicated: tmpfs)
+  throughput : 46501 orders/s over 4.301 s
+  latency us : p50 235391  p90 252927  p99 264703  p99.9 267263  max 267519  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journals   : primary d959a940c9f45d87, replica d959a940c9f45d87: identical
+### 5000-alone: --bench --orders 100000 --rate 5000 (replicated: no)
+  throughput : 4998 orders/s over 20.006 s
+  latency us : p50 7203  p90 11871  p99 16687  p99.9 27583  max 34079
+  syncs      : 7896 (12.7 orders per sync)
+### 5000-replicated: --bench --orders 100000 --rate 5000 (replicated: yes)
+  throughput : 4997 orders/s over 20.012 s
+  latency us : p50 12359  p90 24463  p99 49247  p99.9 88895  max 108671
+  syncs      : 3915 (25.5 orders per sync)
+  journals   : primary 570667e15aa1c5d0, replica 570667e15aa1c5d0: identical
+### 5000-replica-in-memory: --bench --orders 100000 --rate 5000 (replicated: tmpfs)
+  throughput : 4998 orders/s over 20.009 s
+  latency us : p50 7779  p90 13599  p99 23007  p99.9 47295  max 58271
+  syncs      : 6895 (14.5 orders per sync)
+  journals   : primary d10781459e7ecdc4, replica d10781459e7ecdc4: identical
+### done
+
+### m23p6-mutate: each removal fails the test that covers it
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 209 filtered out; finished in 0.01s  <- an_interrupted_publication_leaves_the_warm_replica_waiting_and_promotable (src/exchange/warm_replica.rs)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 209 filtered out; finished in 0.02s  <- a_warm_replica_follows_again_once_a_restarted_writer_repairs_the_stream (src/exchange/warm_replica.rs)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.04s  <- warm_replica_process_waits_out_an_interrupted_publication_and_stays_promotable (src/exchange/warm_replica.rs)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 209 filtered out; finished in 0.02s  <- an_interrupted_publication_leaves_the_warm_replica_waiting_and_promotable (src/exchange/event_stream.rs)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 5.03s  <- warm_replica_process_waits_out_an_interrupted_publication_and_stays_promotable (src/exchange/warm_replica.rs)
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 209 filtered out; finished in 0.02s  <- a_warm_replica_follows_again_once_a_restarted_writer_repairs_the_stream (src/exchange/warm_replica.rs)

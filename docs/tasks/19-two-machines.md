@@ -385,7 +385,7 @@ the protocol intends. Its findings, all fixed:
   - a few numbers that disagreed between the documents now agree.
 - **Older, not from this part:** if the primary dies while publishing to the stream, with its ready
   marker cleared, the warm replica stops when it reaches the end it validated, and cannot be
-  promoted. Recorded as a known limitation; Part 6's failure tests will cover it.
+  promoted. Recorded as a known limitation; fixed in Part 6, where the warm replica now waits.
 
 ### Found by re-checking the fixes
 
@@ -1073,3 +1073,149 @@ each removal makes the test that covers it fail: eighteen removals, one check re
 tests (`~/stock-scripts/m23p5-mutate.sh`, `m23p5-mutate2.sh`, `m23p5-mutate3.sh` and
 `m23p5-mutate4.sh`). All three PostgreSQL acceptance tests pass, and the
 release build still has its 12 warnings.
+
+## Part 6 - Measurement and failure tests
+
+### Why Part 6 came next
+
+Parts 4 and 5 were each verified live, but with commands sent one at a time from the operator
+port. Nothing had killed the primary while customers traded, and the time from a promote request
+to the first accepted order had never been measured. Two of the milestone's completion criteria
+waited on this part: no acknowledged command lost when the primary is killed at any moment under
+load, over repeated runs; and throughput, latency and recovery time measured and written up.
+
+One known limitation was also left to this part, from Part 3's review: if the stream's writer dies
+while it publishes, the warm replica stops for good and cannot be promoted. On the second machine
+that writer is the replica process, and the failover runbook kills it right before the promotion.
+
+### What changed
+
+- **The warm replica waits out an interrupted publication.** A writer clears the stream's ready
+  marker, copies the record and header, and sets the marker again, all under the stream's
+  exclusive lock. One killed in between leaves the marker cleared, and every reader got "stream
+  publication interrupted; restart the writer to recover". The warm replica made that fatal: it
+  exited, and the machine had nothing left to promote. Now that one error, and no other, means
+  wait: the warm replica stays where it is, keeps polling, and follows again once a restarted
+  writer has repaired the stream. `/status` reports `"stream_interrupted": true` meanwhile, and the
+  log says so once on each change. The error is a type of its own, `PublicationInterrupted` in
+  `src/exchange/event_stream.rs`, so the warm replica tells it apart without matching text; its
+  message is unchanged.
+- **A customer load client,** `~/stock-scripts/m23p6-load.py`. It signs tokens with the run's
+  throwaway `JWT_SECRET`, funds 16 users, and has them send orders back to back over HTTP, each
+  with its own `client_order_id`. It runs in a container that shares the exchange container's
+  network namespace, since the customer port binds loopback only, so it outlives a killed primary.
+  Every 201 goes to an acknowledgement file the moment it arrives. Afterwards it asks the surviving
+  exchange for every acknowledged order, as its user. On the promoted machine it also times the
+  failover itself.
+- **Four live scripts and a mutation script** on the office machine, described under Verification.
+
+### Why waiting is safe
+
+- **A live writer is never seen half done.** A reader takes the stream's shared lock before it
+  reads the marker, and the writer holds the exclusive lock from clearing it to setting it. A
+  cleared marker seen by a reader therefore means a writer died there, or, in a writer that is
+  still alive, panicked there; in that case it still holds the journal's writer lock, and a
+  promotion is refused with 409.
+- **Nothing moves while it waits.** No batch is applied and no snapshot is written; the applied
+  checkpoint stays at the last command the warm replica checked.
+- **The promotion never needed the stream.** It fences the journal's writer lock, takes the end the
+  stream published from a header whose checksum holds (a torn one falls back to the last end the
+  warm replica validated), and reads everything after its checkpoint from the journal. The
+  promoted primary opens the stream as its writer and publishes again, which repairs it.
+
+What it does not change:
+- a warm replica started, or restarted, while the stream is interrupted still refuses to start:
+  opening a reader checks the marker. With a snapshot present it first logs, misleadingly,
+  "snapshot ahead of the stream". Restart the stream's writer first, which repairs the stream;
+- the market-data process and the reporter still stop on an interrupted stream, as before. Neither
+  is on the failover path, and both resume from their own state once the writer has restarted.
+
+### Options considered and rejected
+
+- **Matching the error's text.** It works until someone rewords the message. A type of its own
+  cannot drift.
+- **`io::ErrorKind::Interrupted`.** It is std's signal for "retry the system call", and std's own
+  read loops retry it silently.
+- **Repairing the stream from the warm replica.** Only the stream's writer writes it; a reader that
+  writes would need the writer's lock and could race a writer that restarts.
+- **Promoting automatically when the stream stays interrupted.** Automatic failover is outside this
+  milestone.
+- **Driving the failover with `--bench`.** It runs in-process, so killing the primary kills the
+  client, and it keeps no acknowledged ids. A separate HTTP client does both.
+- **Timing the failover from the host.** Each `docker exec` check costs about 100 ms, more than the
+  failover; Part 5's 375 to 697 ms included that polling. The client in B's namespace retries every
+  5 ms.
+
+### Compatibility
+
+No file format changed. `/status` on the warm replica has a new field, `stream_interrupted`.
+
+### Found by the independent review
+
+The review found the code correct, and:
+- **(medium) the documents still said the warm replica cannot be promoted** after an interrupted
+  publication, and `/status`'s description lacked the new field. Updated with this part.
+- **(low) a warm replica started while the stream is interrupted still exits.** Not a regression,
+  and it fails closed; recorded above and among the known limitations rather than widened into a
+  change to how readers open.
+- **(low) `/status` started as `false`** even when the catch-up before the listener binds had just
+  found the stream interrupted, until the follower's first loop corrected it. It now starts from
+  the warm replica's own state.
+
+### Found by the live runs
+
+The scripts' own mistakes, fixed before the runs reported here:
+- the database was dropped while the last run's reporter still held a connection, so the drop
+  failed and the next reporter met old tables. The scripts now drop it with `WITH (FORCE)`;
+- the gap script's machine B had no `REPLICATION_LISTEN_ADDR`, so its promoted primary had no
+  replication to run alone from, and the client waited for ever. B now listens as in the failover
+  script, and every step of the client gives up after 60 s;
+- `docker kill` of the primary alone never left it with records the replica lacked: the kernel
+  still delivers what a killed process had sent. Every other failover run now cuts the primary's
+  network 0.3 s before the kill, as a lost machine would.
+
+### Verification
+
+Tests:
+- `an_interrupted_publication_leaves_the_warm_replica_waiting_and_promotable`: a deposit is
+  published after the warm replica caught up, then the marker is cleared. The warm replica waits,
+  twice, at sequence 3; the promotion picks up the two envelopes past it; the promoted primary
+  matches the old one, continues at sequence 7, and a fresh reader reads all three deposits from
+  the repaired stream. Before the fix it failed with the error above: the reproduction;
+- `a_warm_replica_follows_again_once_a_restarted_writer_repairs_the_stream`: the flag clears and
+  the warm replica catches up with the restarted writer;
+- `warm_replica_process_waits_out_an_interrupted_publication_and_stays_promotable` (in
+  `tests/warm_replica.rs`): the real executable keeps running, reports the interruption on
+  `/status`, answers `/health`, and is promoted (202).
+
+`cargo fmt -- --check` is clean. `cargo test --locked` passes: 209 unit tests and the executable
+integration tests. All three PostgreSQL acceptance tests pass, and the release build still has its
+12 warnings. `~/stock-scripts/m23p6-mutate.sh` removes the fix piece by piece (waiting, recognising
+the error, reporting it, clearing it): each of the six removals fails the test that covers it.
+
+Live, on the office Ubuntu machine, two containers each with its own volume and network address,
+sharing its 2 cores and SSD (`docs/performance/11-failover-under-load.md`, raw output in
+`docs/performance/results/results-m23.txt`):
+1. **The primary killed under load, ten times** (`~/stock-scripts/m23p6-failover.sh 10`). A traded
+   for 2.2 to 6.7 s with 16 customers, then was killed; in five runs its network was cut 0.3 s first.
+   In every run B's journal was a byte-identical prefix of A's, every acknowledged order was on B
+   (83,186 in all), the reporter resumed on B at A's reporter's checkpoint, and A rejoined as B's
+   replica with identical journals. In three runs A held 5.7 to 7.1 KB that B never received; on
+   rejoining it cut exactly that. From the promote request to the first accepted order: 26 to
+   74 ms, median 42 ms.
+2. **The replica killed, then its network cut, under load** (`m23p6-faults.sh`). Nothing was
+   acknowledged from 0.5 s after the kill until the operator ran the primary alone 3.4 s later,
+   nor from 0.5 s after the cut until the network came back 12.6 s later; `/health` answered 503
+   in both. The primary dropped the silent link after 10.6 s. Each time the replica was back and
+   the primary synchronous about 1 s later. All 27,308 acknowledged orders were on the primary,
+   and the journals were identical.
+3. **B's replica killed 40 times under load,** with the Part 5 and the Part 6 binary
+   (`m23p6-gap.sh 40`). With either binary the warm replica never met an interrupted publication:
+   the window is a copy of a few kilobytes per group, so live kills rarely hit it, and the tests
+   above create that state directly. After the kills A was lost and B promoted; all 49,555 and 65,342 acknowledged
+   orders were on B.
+4. **Throughput and latency** (`m23p6-bench.sh 2`). At the maximum rate, 45,000 to 56,000 orders/s
+   alone and 34,000 to 36,000 replicated; at 5,000 orders/s, a p50 of 7 to 8 ms alone and 11 to
+   12 ms replicated. With the replica's files in memory the difference disappears within the
+   noise: on this machine the cost is the replica's sync waiting for the same disk, as Part 4
+   found. The journals were byte-identical after every replicated run.

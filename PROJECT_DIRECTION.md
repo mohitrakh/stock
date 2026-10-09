@@ -1,4 +1,4 @@
-# Project Direction - Milestone 23 (Two Machines) In Progress
+# Project Direction - Milestone 23 (Two Machines) Complete; Next Not Selected
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -80,12 +80,12 @@ same-host warm replica process
 
 Order and execution prices use `Price(u64)` minor units throughout the critical path. The HTTP order request also accepts an integer minor-unit price; for a cent-based scale, `1025` means `$10.25`. Wallet notionals use checked integer multiplication.
 
-Latest verified status on 2026-10-07, on Linux (the office Ubuntu machine; the crate uses Unix-only APIs and does not build on Windows):
+Latest verified status on 2026-10-09, on Linux (the office Ubuntu machine; the crate uses Unix-only APIs and does not build on Windows):
 
 ```text
 cargo fmt -- --check
 cargo test --locked
-179 unit tests + the executable integration tests passed; 0 failed
+209 unit tests + the executable integration tests passed; 0 failed
 3 opt-in Reporter acceptance tests ignored by default (need REPORTER_TEST_DATABASE_URL);
   all passed against PostgreSQL 16 when run with it
 ```
@@ -103,6 +103,14 @@ Since milestone 23 part 3 a promotion takes over the warm replica's own core: 58
 journal instead of 25.8 s, and 0.5 s from the end of a maximum-rate run instead of 103 s.
 Throughput is unchanged (40,000 to 45,000 orders/s with no warm replica). See
 `docs/performance/07-trading-days-bound-the-state.md`.
+
+Since milestone 23, with replication on (`REPLICATION_LISTEN_ADDR`, `stock --replica`), every
+acknowledged command is on both machines' disks unless the operator runs the primary alone, and an
+operator can promote the second machine, fenced by epochs. With
+customers trading, killing the primary ten times lost none of 83,186 acknowledged orders, and the
+promote request to the first accepted order took 26 to 74 ms (two containers sharing one machine's
+2 cores and SSD). Replicated, the maximum rate is 34,000 to 36,000 orders/s. See
+`docs/performance/10-synchronous-replication.md` and `docs/performance/11-failover-under-load.md`.
 
 Warm Replica v1 was additionally verified by a live run of the real primary and warm executables against PostgreSQL: a refused promotion while the primary ran, live following, a `SIGKILL` of the primary, a successful promotion, identical balances, positions, and order state on the promoted primary, a new trade there, and one contiguous journal across the hand-off.
 
@@ -697,7 +705,7 @@ Both independent reviews' findings were fixed (parts 2 and 3).
 
 ## 23. Two Machines
 
-**Status: selected on 2026-10-05; Part 1 complete on 2026-10-05; Parts 2 and 3 complete on 2026-10-06; Parts 4 and 5 complete on 2026-10-07.** Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` for Part 1, then `docs/tasks/19-two-machines.md`. Part 2 as first specified was split in two on 2026-10-06, as recommended: the journal id and restarts in Part 2, promotion and the warm replica's lag in Part 3. Decisions confirmed by the owner:
+**Status: completed on 2026-10-09** (selected on 2026-10-05; Part 1 complete on 2026-10-05; Parts 2 and 3 on 2026-10-06; Parts 4 and 5 on 2026-10-07; Part 6 on 2026-10-09). Measurement of the whole: `docs/performance/11-failover-under-load.md`. Write-ups: `docs/tasks/18-one-order-cannot-stop-the-exchange.md` for Part 1, then `docs/tasks/19-two-machines.md`. Part 2 as first specified was split in two on 2026-10-06, as recommended: the journal id and restarts in Part 2, promotion and the warm replica's lag in Part 3. Decisions confirmed by the owner:
 - the primary waits for the replica: a command is answered, and becomes visible to anyone, only once it is on both machines' disks;
 - if the replica cannot be reached, the primary pauses until an operator either promotes the replica or tells the primary to run alone;
 - the machines talk over TCP;
@@ -918,6 +926,32 @@ Its re-check confirmed the fixes. It found that the first version of the first f
 
 A last independent check of the final changes found a gap left in that fix. A replica's index stops listing a term start it never wrote: when the replica restarts, when a load drops an entry past the journal's end, or when a promotion fails between its two saves. A promotion of that copy could then take the other primary's epoch, and equal epochs skip the split check. The index now keeps the highest epoch it has ever listed, which no cut or drop lowers, and a promotion takes the one after it; the handshake still compares the epochs the journal holds. A promotion also no longer runs a plain restart's check for a term begun. With the final build the live failover passed again (B serving 426 ms after its replica stopped, the journals byte-identical), and removing the fencing's checks and every round's fixes one at a time makes the covering test fail each time: eighteen removals, one check removed under two tests. Not covered by a test: a primary running alone syncing its stream's end, which only a power loss would show.
 
+**Part 6, complete (2026-10-09): measurement and failure tests.** Write-up: `docs/tasks/19-two-machines.md`; measurement: `docs/performance/11-failover-under-load.md`; raw output `docs/performance/results/results-m23.txt`. Decision confirmed by the owner: reproduce the warm replica's stop on an interrupted publication, then fix it.
+- **The warm replica waits out an interrupted publication.** A stream writer killed between clearing the ready marker and setting it again used to make the warm replica exit, so the machine had nothing to promote; on the second machine that writer is the replica process, which the runbook kills right before the promotion. Now that error alone (`PublicationInterrupted`, a type of its own in `event_stream.rs`) means wait: nothing is applied or snapshotted, `/status` reports `stream_interrupted`, a restarted writer lets it follow again, and a promotion works as before, since it fences the journal's writer lock and reads the rest from the journal. A warm replica *started* on an interrupted stream still refuses to start.
+- **Live failure tests with customers trading:** `~/stock-scripts/m23p6-load.py`, 16 HTTP users in a container sharing the exchange's network namespace, logging every acknowledgement as it arrives and afterwards checking each on the surviving exchange; `m23p6-failover.sh`, `m23p6-faults.sh`, `m23p6-gap.sh`, `m23p6-bench.sh` and `m23p6-mutate.sh` on the office machine.
+- **Compatibility.** No file format changed; `/status` on the warm replica has a new field.
+
+Verified on Linux: `cargo fmt -- --check`, `cargo test --locked` with 209 unit tests plus the integration tests, and all three PostgreSQL acceptance tests. The new tests failed before the fix (the reproduction), and each of six removals of the fix fails the test that covers it. Live, two containers sharing the office machine's 2 cores and one SSD:
+- the primary killed after 2.2 to 6.7 s of load, ten times, five of them 0.3 s after its network was cut: every one of 83,186 acknowledged orders was on B, B's journal was a byte-identical prefix of A's, the reporter resumed on B at A's checkpoint, and A rejoined as B's replica, cutting its unconfirmed tail (5.7 to 7.1 KB in three runs) to identical journals;
+- from the promote request to the first accepted order, 26 to 74 ms, median 42 ms, timed by a client on B (Part 5's 375 to 697 ms included the script's polling);
+- the replica killed under load: nothing acknowledged for the 3.4 s until the operator ran the primary alone, `/health` 503; the replica's network cut: nothing acknowledged for the 12.6 s until it came back, the silent link dropped after 10.6 s. Synchronous again about 1 s after each return; 27,308 acknowledged orders, all on the primary, identical journals;
+- B's replica killed 40 times under load with the Part 5 and the Part 6 binary: the warm replica never met an interrupted publication (the window is tiny; the tests create that state directly), and the promotion after each series kept every acknowledged order (49,555 and 65,342);
+- `--bench`: 45,000 to 56,000 orders/s alone and 34,000 to 36,000 replicated at the maximum rate; p50 7 to 8 ms alone and 11 to 12 ms replicated at 5,000 orders/s; no difference beyond the noise with the replica's files in memory. Journals byte-identical after every replicated run.
+
+The independent review found the code correct. Its findings: the documents still called the warm replica unpromotable after an interrupted publication (updated with this part); a warm replica started on an interrupted stream still exits (recorded among the limitations; it fails closed); and `/status` reported `false` until the follower's first loop even when the catch-up had found the stream interrupted (it now starts from the warm replica's state).
+
+**Milestone 23 complete (2026-10-09).** Every completion criterion above holds:
+- an order that would take more than 10,000 resting orders is refused and journaled, the largest order still accepted fits in one record with the gateway's longest ids, no deposit can overflow the totals, and the exchange and the warm replica refuse to start without `JWT_SECRET` (Part 1);
+- promotion and reader restart times no longer grow with the journal, measured on the five-day journal (Parts 2 and 3);
+- with replication on, killing the primary under load lost no acknowledged command over ten runs and two more promotions, and the replica's journal was a byte-identical prefix of the primary's each time (Part 6);
+- with the replica unreachable, killed or cut off, the primary acknowledged nothing until the operator acted or the replica returned (Parts 4 and 6);
+- after a promotion the old primary acknowledges nothing, and when it returns it drops its unconfirmed tail and follows the new primary (Parts 5 and 6);
+- the reporter continues after a failover from its checkpoint, without a rebuild (Parts 5 and 6);
+- throughput, latency and recovery time with replication are measured and written up (`docs/performance/10-synchronous-replication.md`, `11-failover-under-load.md`);
+- `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests and an independent review of each part pass.
+
+Not shown: a power loss, and two machines with their own disks and a real network. Every live figure is two containers on one machine.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -961,14 +995,14 @@ A last independent check of the final changes found a gap left in that fix. A re
 - promotion takes over only the file the warm replica followed: a journal replaced at its path, even by a byte-identical copy, needs a new warm replica on it first. It does not re-read the journal before the warm replica's position, so it would not notice that part being rewritten in place; never modify the journal
 - the warm replica opens its control port only after its first catch-up, so a promotion cannot be requested before that
 - a promotion binds the customer, operator and replication ports only after it has fenced the old primary: a port already in use then leaves no primary until the operator starts one
-- if the primary dies while publishing to the stream, leaving its ready marker cleared, the warm replica stops when it reaches the end it validated and cannot be promoted; restarting the primary repairs the stream from the journal. Part 6's failure tests will cover it
+- if the stream's writer (the primary, or the replica process on the second machine) dies while publishing, leaving the ready marker cleared, a running warm replica waits where it is and can still be promoted (milestone 23 part 6), but a warm replica *started* then refuses to start, and the market-data process and the reporter stop; restarting the writer repairs the stream from the journal
 - the warm replica's management API is unauthenticated and loopback-only; `202` from `/promote` means the old writer is fenced, not that the customer listener is ready
 - the crate uses Unix-only APIs (advisory file locks, positioned reads, mmap) and builds and tests on Linux only
 - the reporter applies about 1,600 commands/s: it keeps up at 1,000 orders/s but falls behind a sustained faster exchange and catches up afterwards; set-based writes or `COPY` are the next lever
 
 ## What Not To Work On Yet
 
-Milestone 23, two machines, is selected; its specification is the section above. Do not grow it into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it. After milestone 23, the recorded candidates in order are:
+Milestone 23, two machines, is complete; no next milestone is selected yet, which is the owner's call. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it. After milestone 23, the recorded candidates in order are:
 1. the gateway and trust boundary: risk limits and deposits set by the operator only, a product list so that only listed symbols trade, and per-user rate limiting;
 2. set-based reporter writes or `COPY`;
 3. pushed updates (WebSocket) of a user's own fills and the L2 book;
