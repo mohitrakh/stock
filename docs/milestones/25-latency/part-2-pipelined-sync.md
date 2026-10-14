@@ -418,6 +418,10 @@ record boundary at `written`, and that the gate tests are deterministic. Finding
    `SYSTEM_DOCUMENTATION.md`, and the claim that only one boolean changed on the normal path (the
    shipping fix also moved `Replication::written`). All corrected.
 
+**Not covered by any test** (checked by reading the code): a write failure with groups in flight
+(the drain before the halt), that the journaler never syncs again after a failure, and a
+publication failure after the first of several groups released together, or while running alone.
+
 ## Compatibility
 
 - **The journal, the stream, the snapshot, the replication protocol:** unchanged. A Part 2 primary
