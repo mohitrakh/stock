@@ -238,12 +238,13 @@ fn cpu_micros_from(stat: &str) -> u64 {
 
 fn percentiles(histogram: &Histogram<u64>) -> String {
     format!(
-        "p50 {}  p90 {}  p99 {}  p99.9 {}  max {}",
+        "p50 {}  p90 {}  p99 {}  p99.9 {}  max {}  mean {:.1}",
         histogram.value_at_quantile(0.50),
         histogram.value_at_quantile(0.90),
         histogram.value_at_quantile(0.99),
         histogram.value_at_quantile(0.999),
-        histogram.max()
+        histogram.max(),
+        histogram.mean()
     )
 }
 
@@ -401,6 +402,17 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     let mut rng = Rng(SEED);
     let mut send_lag = Histogram::<u64>::new(3).map_err(|e| e.to_string())?;
     let mut pending = Vec::with_capacity(config.orders as usize);
+    // A `stage-timing` exchange times only what follows; any other exchange answers 404, which
+    // changes nothing.
+    let stages_url = format!("{}/stages", config.operator);
+    let _ = call(
+        &client,
+        Method::POST,
+        &format!("{stages_url}/reset"),
+        None,
+        None,
+    )
+    .await;
     let cpu_before = cpu_micros();
     let start = Instant::now();
     for i in 0..config.orders {
@@ -550,6 +562,11 @@ pub async fn run(args: &[String]) -> Result<(), String> {
             logins.len() as f64 / seconds,
             percentiles(&logins)
         );
+    }
+    if let Ok((status, report)) = call(&client, Method::GET, &stages_url, None, None).await {
+        if status == StatusCode::OK {
+            print!("{}", String::from_utf8_lossy(&report));
+        }
     }
     Ok(())
 }

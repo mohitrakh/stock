@@ -1247,7 +1247,7 @@ Rules for every file:
 
 ## 25. Latency
 
-**Status: planned on 2026-10-14; not started. The owner reviews this plan before any code.** Its documents will go in `docs/milestones/25-latency/`, with the same layout and depth rules as milestone 24 (see milestone 24, "Documentation for this milestone"). The decisions marked *proposed* need the owner's confirmation before the part that uses them.
+**Status: selected and planned on 2026-10-14; the owner accepted the plan and decisions 1–4 as recommended. Part 1 complete on 2026-10-14.** Progress is recorded at the end of this section. Its documents will go in `docs/milestones/25-latency/`, with the same layout and depth rules as milestone 24 (see milestone 24, "Documentation for this milestone"). The decisions marked *proposed* need the owner's confirmation before the part that uses them.
 
 ### Why this milestone
 
@@ -1298,7 +1298,7 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
      - its HTTP response is written.
 
      Also, per group: its size, its sync time, and its confirmation time.
-   - **How it is reported.** Percentiles per stage, so that the sum of the stage medians can be compared with the measured end-to-end median.
+   - **How it is reported.** Percentiles and means per stage, so that the sum of the stage means can be compared with the measured end-to-end mean. Means add up; medians do not (milestone 25 theory, §2). *(Corrected 2026-10-14: this first said medians.)*
    - **What it should answer.** Where the unexplained part of the median goes, how much is queueing (waiting for the group in progress), and what share of the p99 is the disk.
    - *Proposed:* the timing is compiled in only with a cargo feature (`stage-timing`). The normal build is then unchanged and pays nothing, and the cost of the timing itself can be measured by comparing the two builds. See decision 1.
 2. **A pipelined journal sync.**
@@ -1334,7 +1334,7 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 
 ### Completion criteria
 
-- A stage-by-stage breakdown of an order exists for in-process and HTTP, alone and replicated, at 1,000 and 5,000 orders/s. The sum of its stage medians accounts for the measured end-to-end median, and any remainder is stated.
+- A stage-by-stage breakdown of an order exists for in-process and HTTP, alone and replicated, at 1,000 and 5,000 orders/s. The sum of its stage means accounts for the measured end-to-end mean, and any remainder is stated. *(Corrected 2026-10-14: this first said medians.)*
 - **Pipelined sync behaviour:**
   - durable-before-visible holds: tests prove that no reply, read, publication or callback of group N happens before group N, and every group before it, is durable;
   - a failed sync with a second group in flight answers neither group, halts the worker, and recovers from the journal;
@@ -1353,6 +1353,35 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 - mmap ingress;
 - FIX or SBE;
 - new hardware. A server SSD with power-loss protection would lower the floor by about two orders of magnitude; that is recorded as the largest lever, but it is outside the software.
+
+### Progress
+
+**Part 1, complete (2026-10-14): where the time goes.** Write-up: `docs/milestones/25-latency/part-1-stage-timing.md`; measurements in its `performance/01` and `02`.
+- **The timing itself.** A cargo feature, `stage-timing`, times 16 stages of an order:
+  - from the HTTP handler, through the queue, the in-group waits, prepare, encode and commit;
+  - then the group's write, sync, confirm, publish and release;
+  - to the reply.
+
+  The worker records into thread-local histograms and merges once per group. The report is printed by `--bench`, and served on the operator port (`GET /stages`, `POST /stages/reset`). `--http-bench` reads it. The normal build is unchanged: `PlaceOrder` is now built through one constructor, and the un-replicated flush calls `write_records` + `sync` instead of their wrapper. Both benchmarks now print the end-to-end mean.
+- **What the timing costs.** Nothing measurable at 5,000 orders/s, and about 3% of throughput at the maximum rate. Measuring that exposed a run-order effect: the second run of a back-to-back pair was about 9.5% faster at the maximum rate. Comparisons must alternate their order.
+- **The stage means add up to the end-to-end mean.** Not covered by any stage:
+  - 0.9–1.2 ms in-process, and 1.5–2.8 ms outside the server on HTTP: the generator's own lateness and the client side, 10–24% of what a benchmark reports;
+  - 0.34–1.09 ms of reply wake-up on HTTP.
+- **At 1,000 and 5,000 orders/s the disk dominates.** `Queue` + `Sync` + `Confirm` are 42–69% of the latency. The order's own CPU (prepare, encode, commit) is 33–91 µs, 0.2–1.3%. `Encode` alone is 0.05–0.33%.
+- **At the maximum rate one group's cycle is 22.2 ms alone and 29.0 ms replicated:**
+  - staging, 13.0 ms;
+  - sync, 6.0 ms (replicated: 8.3 ms, plus a 4.4 ms confirm);
+  - publish, 2.4 ms;
+  - write and release, 0.8 ms.
+
+  That gives about 45,800 and 34,900 orders/s, which agrees with what was measured.
+- **Projections, not measurements:**
+  - a pipelined sync could raise the maximum rate by about 37–66% alone and about 79% replicated, but would gain at most about 8% of latency at 5,000 orders/s;
+  - a binary format could gain at most about 15% of maximum throughput and nothing measurable in latency.
+- **One disturbed run.** HTTP replicated at 5,000/s, run 1, had a disk stall (syncs up to 73.5 ms) and is flagged.
+- **Verified.** Tests pass: 213 in the normal build and 216 in the feature build. A mutation check, run alone with its own cargo target volume, fails the test for each of three removed recordings. An independent review found no code defect. Its documentation findings were all fixed; they are listed in the part's write-up. The most important was the undisclosed disturbed run. A final check of the fixes found the plan's acceptance criterion still saying "medians" and a broken table, both fixed.
+
+**Decision for the owner before Part 2:** confirm Part 2 (a pipelined sync), knowing it mainly raises throughput and helps latency only a little at moderate load. Decide Part 3 (a binary format): the recommendation is to drop it, or keep it only as a learning exercise.
 
 ## Known Prototype Limitations
 

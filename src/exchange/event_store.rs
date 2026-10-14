@@ -366,9 +366,9 @@ impl EventStore {
         self.append_record(&record)
     }
 
-    /// Appends one or more complete framed records — a whole group-commit group — with ONE write
-    /// and ONE sync. The runtime publishes the group and releases its replies only after this
-    /// returns. Any error is fatal; recovery decides which complete records survived.
+    /// Appends one or more complete framed records with ONE write and ONE sync. Tests use it; the
+    /// runtime calls its two halves, `write_records` and `sync`, so it can time each one.
+    #[cfg(test)]
     pub(super) fn append_record(&mut self, records: &[u8]) -> Result<(), EventStoreError> {
         self.write_records(records)?;
         self.sync()

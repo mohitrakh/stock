@@ -458,9 +458,10 @@ Milestone 24, selected on 2026-10-12, closed on 2026-10-14 after Part 2. The own
 
 Milestone 25, planned on 2026-10-14. The owner reviews the plan in `PROJECT_DIRECTION.md` ("25. Latency") before any code. Documents go in `docs/milestones/25-latency/`.
 
-- [ ] The owner reviews the plan and confirms decisions 1–4.
-- [ ] Create `docs/milestones/25-latency/` (README, selection, theory, decisions, glossary).
-- [ ] Part 1: a stage-by-stage timing of an order (in-process and HTTP, alone and replicated), with the stage medians summing to the end-to-end median.
+- [x] The owner reviews the plan and confirms decisions 1–4 (2026-10-14).
+- [x] Create `docs/milestones/25-latency/` (README, selection, theory, decisions, glossary).
+- [x] Part 1 (2026-10-14): a stage-by-stage timing of an order (in-process and HTTP, alone and replicated). The stage means account for the end-to-end mean (means add up, medians do not; see the theory).
+- [ ] The owner confirms Part 2 and decides Part 3, given Part 1's findings.
 - [ ] Part 2: a pipelined journal sync, with durable-before-visible and the failure rule proven by tests.
 - [ ] Part 3: a binary record format, only if Part 1 shows JSON encoding matters; otherwise dropped, with the reason.
 - [ ] Part 4: final measurement against the milestone 24 part 2 binary, on the same day, interleaved, with three runs per configuration, tmpfs runs, and per-container CPU.

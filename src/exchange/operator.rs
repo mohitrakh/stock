@@ -51,16 +51,27 @@ struct Operator {
 }
 
 pub fn router(exchange: Exchange, replication: Option<Arc<Replication>>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/session", get(session))
         .route("/session/open", post(open))
         .route("/session/close", post(close))
         .route("/replication", get(replication_status))
-        .route("/replication/run-alone", post(run_alone))
-        .with_state(Operator {
-            exchange,
-            replication,
-        })
+        .route("/replication/run-alone", post(run_alone));
+    // The stage report, and its reset, which a measurement calls once its setup is done.
+    #[cfg(feature = "stage-timing")]
+    let router = router
+        .route(
+            "/stages",
+            get(|| async { crate::exchange::stage_timing::report() }),
+        )
+        .route(
+            "/stages/reset",
+            post(|| async { crate::exchange::stage_timing::reset() }),
+        );
+    router.with_state(Operator {
+        exchange,
+        replication,
+    })
 }
 
 async fn session(State(operator): State<Operator>) -> Response {

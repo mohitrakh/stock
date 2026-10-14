@@ -1,0 +1,68 @@
+
+## in-process, replicated no: --bench --orders 20000 --rate 1000 (3 runs)
+  end-to-end mean 5621
+  Queue + Worker 4462 -> generator lateness + reply wake-up 1159 (20.6%)
+  Worker 2963, its stages 2668, not covered 295 (10.0% of Worker)
+  shares of end-to-end mean: Queue 26.7%  Sync 42.1%  Confirm 0.0%  waits in group 3.0%  own CPU 1.1% (61.2 us)
+
+## in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+  end-to-end mean 6989
+  Queue + Worker 5828 -> generator lateness + reply wake-up 1161 (16.6%)
+  Worker 3886, its stages 3452, not covered 434 (11.2% of Worker)
+  shares of end-to-end mean: Queue 27.8%  Sync 33.3%  Confirm 0.0%  waits in group 13.1%  own CPU 0.5% (37.4 us)
+
+## in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+  end-to-end mean 238569
+  Queue + Worker 238485 -> generator lateness + reply wake-up 84 (0.0%)
+  Worker 22340, its stages 22171, not covered 169 (0.8% of Worker)
+  shares of end-to-end mean: Queue 90.6%  Sync 2.5%  Confirm 0.0%  waits in group 5.5%  own CPU 0.0% (11.0 us)
+
+## http, replicated no: --http-bench --orders 20000 --rate 1000 (3 runs)
+  end-to-end mean 7194
+  HttpTotal 5654 -> outside the server 1540 (21.4%)
+  HttpBeforeQueue 88, HttpAsk 5530, after the reply 36
+  Queue + Worker 5186 -> reply wake-up 344
+  Worker 3177, its stages 2802, not covered 375 (11.8% of Worker)
+  shares of end-to-end mean: Queue 27.9%  Sync 32.5%  Confirm 0.0%  waits in group 3.8%  own CPU 1.3% (90.6 us)
+
+## http, replicated no: --http-bench --orders 100000 --rate 5000 (3 runs)
+  end-to-end mean 9799
+  HttpTotal 7425 -> outside the server 2374 (24.2%)
+  HttpBeforeQueue 48, HttpAsk 7360, after the reply 17
+  Queue + Worker 6752 -> reply wake-up 609
+  Worker 4421, its stages 3474, not covered 947 (21.4% of Worker)
+  shares of end-to-end mean: Queue 23.8%  Sync 18.7%  Confirm 0.0%  waits in group 14.8%  own CPU 0.5% (47.7 us)
+
+## in-process, replicated yes: --bench --orders 20000 --rate 1000 (3 runs)
+  end-to-end mean 8322
+  Queue + Worker 7466 -> generator lateness + reply wake-up 856 (10.3%)
+  Worker 4959, its stages 3459, not covered 1500 (30.3% of Worker)
+  shares of end-to-end mean: Queue 30.1%  Sync 20.2%  Confirm 15.9%  waits in group 3.7%  own CPU 0.7% (61.9 us)
+
+## in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+  end-to-end mean 11183
+  Queue + Worker 10042 -> generator lateness + reply wake-up 1140 (10.2%)
+  Worker 6736, its stages 4982, not covered 1754 (26.0% of Worker)
+  shares of end-to-end mean: Queue 29.6%  Sync 17.1%  Confirm 12.8%  waits in group 12.5%  own CPU 0.3% (33.4 us)
+
+## in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+  end-to-end mean 303899
+  Queue + Worker 303791 -> generator lateness + reply wake-up 108 (0.0%)
+  Worker 28638, its stages 28974, not covered -337 (-1.2% of Worker)
+  shares of end-to-end mean: Queue 90.5%  Sync 2.7%  Confirm 1.5%  waits in group 4.3%  own CPU 0.0% (11.8 us)
+
+## http, replicated yes: --http-bench --orders 20000 --rate 1000 (3 runs)
+  end-to-end mean 11038
+  HttpTotal 9344 -> outside the server 1694 (15.3%)
+  HttpBeforeQueue 77, HttpAsk 9239, after the reply 28
+  Queue + Worker 8799 -> reply wake-up 440
+  Worker 5455, its stages 4042, not covered 1414 (25.9% of Worker)
+  shares of end-to-end mean: Queue 30.3%  Sync 18.3%  Confirm 12.7%  waits in group 3.9%  own CPU 0.7% (74.6 us)
+
+## http, replicated yes: --http-bench --orders 100000 --rate 5000 (3 runs)
+  end-to-end mean 20733
+  HttpTotal 17884 -> outside the server 2849 (13.7%)
+  HttpBeforeQueue 43, HttpAsk 17824, after the reply 17
+  Queue + Worker 16735 -> reply wake-up 1088
+  Worker 10924, its stages 8211, not covered 2713 (24.8% of Worker)
+  shares of end-to-end mean: Queue 28.0%  Sync 14.0%  Confirm 9.2%  waits in group 14.8%  own CPU 0.2% (42.3 us)

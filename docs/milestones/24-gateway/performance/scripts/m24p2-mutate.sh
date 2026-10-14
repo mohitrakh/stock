@@ -3,6 +3,9 @@
 # mutation: copy the tree, apply the change, run only the covering test, print its result line.
 # A mutation that still passes means the test does not guard what it claims.
 # Usage: m24p2-mutate.sh   (on the office machine's host; the tree is ~/stock-m24)
+# Mutations build in their own target volume (stock-cargo-target-mut), added after milestone 25 found
+# that a shared target dir lets the real tree (older file times, same /src path) reuse a mutated
+# build. The 2026-10-12 results were not affected: each mutated copy was newer, so it was rebuilt.
 set -u
 run() { # LABEL TEST PYTHON-REPLACEMENT-SCRIPT
   local label=$1 test=$2
@@ -10,7 +13,7 @@ run() { # LABEL TEST PYTHON-REPLACEMENT-SCRIPT
   python3 -c "$3" || { echo "  $label: mutation did not apply"; return; }
   local result
   result=$(docker run --rm -v ~/stock-m24-mut:/src -v stock-cargo-registry:/usr/local/cargo/registry \
-    -v stock-cargo-target:/target -e CARGO_TARGET_DIR=/target -w /src stock-rust \
+    -v stock-cargo-target-mut:/target -e CARGO_TARGET_DIR=/target -w /src stock-rust \
     timeout 300 cargo test --locked --bin stock "$test" 2>&1 | grep -E "^test result|^error" | head -1)
   echo "  $label -> ${result:-no result} ($test)"
 }

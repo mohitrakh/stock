@@ -1,0 +1,764 @@
+### m25p1-stages: 3 run(s) of each, exchange /scripts/stock-m25p1-timed, generator /scripts/stock-m25p1, 2026-10-14T09:11:59+05:30
+### in-process, replicated no, run 1: --bench --orders 20000 --rate 1000
+# host 2026-10-14T09:11:59+05:30: loadavg 3.41 3.44 2.81, containers running 30
+terms: building the index from the journal
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.002 s
+  latency us : p50 6055  p90 9191  p99 13191  p99.9 22527  max 38367  mean 6312.9
+  syncs      : 6677 (3.0 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 49696 kB, VmRSS: 49696 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue             20000      1618.1     1315     3461     5643    14407    28847
+WaitInGroup       20001       102.5       62      256      505     1140    14303
+Prepare           20001        29.5       19       65      122      177    26015
+Encode            20001        15.5       12       31       68      108     3009
+Commit            20001        17.6       11       30       82      216    14071
+WaitForGroup      20001        77.8       33      211      463      967    14439
+Write              6678        37.6       35       60       90      199      313
+Sync               6678      2569.9     2393     4295     6111     8847    29407
+Publish            6678        31.7       27       61      111      190      298
+Release            6678        12.6       13       20       39       76      224
+Worker            20001      3176.2     3041     4987     7195    10207    46079
+GroupSize          6678         3.0        3        5        7       10       32
+### in-process, replicated no, run 2: --bench --orders 20000 --rate 1000
+# host 2026-10-14T09:12:19+05:30: loadavg 3.02 3.34 2.79, containers running 30
+terms: building the index from the journal
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.004 s
+  latency us : p50 5599  p90 8727  p99 12735  p99.9 21007  max 25935  mean 5940.6
+  syncs      : 6560 (3.0 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 50140 kB, VmRSS: 50140 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue             20000      1598.6     1326     3429     5535     9471    17055
+WaitInGroup       20001        95.5       57      241      489     1107    13615
+Prepare           20001        28.1       18       63      121      175    32575
+Encode            20001        14.7       10       30       66      107     3561
+Commit            20001        16.7       10       29       77      211    13423
+WaitForGroup      20001        72.3       29      200      452     1073    13663
+Write              6561        36.0       34       60       87      168      591
+Sync               6561      2646.9     2347     4347     6043    10159    12455
+Publish            6561        30.9       26       60      118      233     1100
+Release            6561        11.6       12       20       36       67      262
+Worker            20001      3106.5     2801     4939     7107    12087    57695
+GroupSize          6561         3.0        3        5        7       12       18
+### in-process, replicated no, run 3: --bench --orders 20000 --rate 1000
+# host 2026-10-14T09:12:40+05:30: loadavg 3.16 3.35 2.81, containers running 30
+terms: building the index from the journal
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.003 s
+  latency us : p50 4415  p90 7431  p99 11271  p99.9 24591  max 29743  mean 4608.3
+  syncs      : 8745 (2.3 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 50696 kB, VmRSS: 50696 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue             20000      1282.2      953     3021     5075    11743    19279
+WaitInGroup       20001        84.7       41      228      450     1091    15439
+Prepare           20001        28.8       18       63      123      169    35359
+Encode            20001        15.5       11       29       66      105     7963
+Commit            20001        17.2       10       29       69      183    15927
+WaitForGroup      20001        65.2       21      179      411     1874     7747
+Write              8746        30.3       26       57       84      164      478
+Sync               8746      1881.6     1531     3711     5227     8631    13991
+Publish            8746        22.6       15       49       93      217      319
+Release            8746        10.1        8       19       32       57      713
+Worker            20001      2605.0     2375     4439     6363    14375    64959
+GroupSize          8746         2.3        2        4        6       11       20
+### in-process, replicated no, run 1: --bench --orders 100000 --rate 5000
+# host 2026-10-14T09:13:01+05:30: loadavg 2.74 3.24 2.79, containers running 30
+terms: building the index from the journal
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4997 orders/s over 20.013 s
+  latency us : p50 6303  p90 9847  p99 14127  p99.9 27455  max 41631  mean 6656.8
+  syncs      : 5972 (16.7 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 154552 kB, VmRSS: 154552 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000      1814.0     1513     3767     6079    17439    33407
+WaitInGroup      100000       434.8      295      973     2026     3719    31839
+Prepare          100000        17.2       10       40       86      137     1075
+Encode           100000         8.9        5       20       46       76     1720
+Commit           100000        10.0        6       20       47      149    31551
+WaitForGroup     100000       377.8      239      918     1901     3007    31807
+Write              5972        45.7       41       81      122      247      421
+Sync               5972      2376.8     2175     3925     5411     7543    10959
+Publish            5972       103.0       80      218      370      505      605
+Release            5972        19.9       16       37       64      266      464
+Worker           100000      3585.9     3415     5583     7803    10831    34303
+GroupSize          5972        16.7       15       25       38       55      175
+### in-process, replicated no, run 2: --bench --orders 100000 --rate 5000
+# host 2026-10-14T09:13:22+05:30: loadavg 2.48 3.15 2.76, containers running 30
+terms: building the index from the journal
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4999 orders/s over 20.005 s
+  latency us : p50 6767  p90 11415  p99 22687  p99.9 35391  max 44895  mean 7141.2
+  syncs      : 7293 (13.7 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 154432 kB, VmRSS: 154432 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000      1990.4     1496     4399     8879    18639    27375
+WaitInGroup      100000       535.0      320     1307     2943     7171    23535
+Prepare          100000        18.0       10       42       91      149     2415
+Encode           100000         9.3        5       21       50       82     2493
+Commit           100000        10.4        6       21       51      163    23119
+WaitForGroup     100000       477.9      260     1202     2749     7035    23535
+Write              7293        37.7       26       85      132      232      670
+Sync               7293      1875.8     1408     3867     6199    10927    17983
+Publish            7293        89.2       38      252      432      751     1381
+Release            7293        16.2       10       39       72      113      204
+Worker           100000      4001.3     3857     6571    13591    22239    27919
+GroupSize          7293        13.7       10       30       45       75      140
+### in-process, replicated no, run 3: --bench --orders 100000 --rate 5000
+# host 2026-10-14T09:13:43+05:30: loadavg 2.43 3.09 2.75, containers running 30
+terms: building the index from the journal
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4999 orders/s over 20.004 s
+  latency us : p50 6851  p90 10319  p99 14727  p99.9 30799  max 39103  mean 7168.8
+  syncs      : 5153 (19.4 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 156888 kB, VmRSS: 156888 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000      2020.1     1734     4103     6515    18575    30815
+WaitInGroup      100001       488.9      357     1057     2069     4127    30623
+Prepare          100001        18.3       10       41       87      144    45471
+Encode           100001         9.4        6       21       47       77     8067
+Commit           100001        10.9        6       20       48      161    42015
+WaitForGroup     100001       441.0      297     1004     1983     4251    30591
+Write              5154        51.3       49       85      122      174     1367
+Sync               5154      2723.3     2563     4215     5791     7839    23967
+Publish            5154       125.0      113      243      378      475      713
+Release            5154        23.9       21       40       66      219     4303
+Worker           100001      4071.4     3937     5911     8167    18559   124415
+GroupSize          5154        19.4       20       30       40       60      155
+### in-process, replicated no, run 1: --bench --orders 200000 --rate 0
+# host 2026-10-14T09:14:04+05:30: loadavg 2.21 3.00 2.73, containers running 30
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 44494 orders/s over 4.495 s
+  latency us : p50 242559  p90 268031  p99 286975  p99.9 291327  max 291583  mean 239807.9  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 296080 kB, VmRSS: 263384 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    217317.9   220287   243455   264447   266751   267007
+WaitInGroup      200000      7248.8     7075    11551    19375    37535    39423
+Prepare          200000         5.2        3       12       25       46     1065
+Encode           200000         2.7        2        5       11       93     1005
+Commit           200000         2.9        2        5       12       38    27791
+WaitForGroup     200000      5591.1     5295    10159    15615    36063    38943
+Write               197       349.3      335      396      527      552      552
+Sync                197      6172.3     5911     8027    11327    32863    32863
+Publish             197      2433.9     2249     2563     6795     7927     7927
+Release             197       447.2      427      551      872      979      979
+Worker           200000     22417.0    21615    26335    46943    48511    48607
+GroupSize           197      1015.2     1024     1024     1024     1024     1024
+### in-process, replicated no, run 2: --bench --orders 200000 --rate 0
+# host 2026-10-14T09:14:10+05:30: loadavg 2.28 3.00 2.73, containers running 30
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 42458 orders/s over 4.711 s
+  latency us : p50 249599  p90 295423  p99 357119  p99.9 363007  max 363263  mean 251388.2  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 296316 kB, VmRSS: 296316 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    227721.6   227071   268031   329727   336127   336383
+WaitInGroup      200000      7279.8     7007    11711    20991    30351    32463
+Prepare          200000         5.4        3       12       25       51     3067
+Encode           200000         2.9        2        5       11      107     2469
+Commit           200000         3.0        2        6       13       47    27583
+WaitForGroup     200000      6116.0     5555    10807    22975    40671    48863
+Write               197       357.9      346      430      552      559      559
+Sync                197      6725.7     6867     8759    10607    10647    10647
+Publish             197      2425.8     2245     2945     9559     9639     9639
+Release             197       450.9      423      503     1427     1566     1566
+Worker           200000     23548.4    22367    29119    51231    57791    57887
+GroupSize           197      1015.2     1024     1024     1024     1024     1024
+### in-process, replicated no, run 3: --bench --orders 200000 --rate 0
+# host 2026-10-14T09:14:17+05:30: loadavg 2.52 3.03 2.75, containers running 30
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 47420 orders/s over 4.218 s
+  latency us : p50 227071  p90 264703  p99 289791  p99.9 293887  max 294143  mean 224510.5  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 292000 kB, VmRSS: 292000 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    203396.0   204799   241279   264959   270335   270591
+WaitInGroup      200000      6981.0     6959    11351    15695    21999    23903
+Prepare          200000         5.2        3       12       24       41      706
+Encode           200000         2.7        1        5       10       80     1367
+Commit           200000         2.8        2        5       11       37    27983
+WaitForGroup     200000      5799.6     5439    10351    17663    36319    39103
+Write               197       347.3      338      390      511      525      525
+Sync                197      5044.8     4231     8047    12775    28735    28735
+Publish             197      2259.8     2225     2355     5447     6155     6155
+Release             197       447.0      427      457     1442     1453     1453
+Worker           200000     21053.8    20479    24863    45567    46975    47071
+GroupSize           197      1015.2     1024     1024     1024     1024     1024
+### http, replicated no, run 1: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T09:14:25+05:30: loadavg 2.40 3.00 2.74, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.009 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 7523  p90 11407  p99 18079  p99.9 31759  max 38015  mean 7912.8
+  send lag us: p50 853  p90 1370  p99 1780  p99.9 4871  max 10735  mean 898.2
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 377.0 us per order, 38% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue    20000        86.7       78      118      376      943     2633
+HttpAsk           20000      6188.7     5831     9479    15279    25519    30639
+HttpTotal         20000      6312.1     5951     9623    15455    25647    31087
+Queue             20000      2261.5     1933     4383     6859    12903    17487
+WaitInGroup       20000       170.5       99      424      814     3631     4763
+Prepare           20000        40.9       26       94      157      285     1193
+Encode            20000        23.4       17       47       96      170     4471
+Commit            20000        25.1       16       45      106      417    14567
+WaitForGroup      20000       139.5       66      363      748     2151    14919
+Write              5937        53.9       51       81      114      238     1628
+Sync               5937      2718.5     2501     4771     6859    11607    16671
+Publish            5937        41.4       36       75      144      328      515
+Release            5937        16.8       17       26       48      242      854
+Worker            20000      3558.4     3349     5751     8751    15431    17871
+GroupSize          5937         3.4        3        6        8       14       21
+### http, replicated no, run 2: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T09:14:48+05:30: loadavg 3.14 3.13 2.79, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.006 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 6735  p90 9983  p99 14727  p99.9 22271  max 30959  mean 6955.3
+  send lag us: p50 645  p90 1148  p99 1496  p99.9 2675  max 7687  mean 672.0
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 376.0 us per order, 38% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue    20000        87.3       78      118      359     1180     7483
+HttpAsk           20000      5485.2     5271     8271    11959    17215    22799
+HttpTotal         20000      5608.0     5391     8423    12119    17375    22879
+Queue             20000      1995.0     1736     3869     5799     8375    11343
+WaitInGroup       20000       146.8       83      378      718     1711     4053
+Prepare           20000        42.0       26       95      163      311     2107
+Encode            20000        23.2       17       47       96      152      461
+Commit            20000        23.9       16       46      110      445     4045
+WaitForGroup      20000       117.1       54      319      647     1556     4171
+Write              6618        51.9       49       79      112      329     2069
+Sync               6618      2445.1     2165     4231     5787     8075    11143
+Publish            6618        37.7       33       69      143      255      983
+Release            6618        16.2       16       25       49      168      915
+Worker            20000      3164.7     2965     5027     7095    10895    11439
+GroupSize          6618         3.0        3        5        7       11       15
+### http, replicated no, run 3: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T09:15:12+05:30: loadavg 3.13 3.13 2.80, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.006 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 6483  p90 10135  p99 15495  p99.9 39071  max 53247  mean 6713.5
+  send lag us: p50 932  p90 1451  p99 1816  p99.9 3795  max 9383  mean 974.2
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 391.0 us per order, 39% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue    20000        89.8       80      117      376      999     9287
+HttpAsk           20000      4916.2     4747     8091    12303    28463    44543
+HttpTotal         20000      5041.3     4875     8239    12439    28799    44639
+Queue             20000      1768.7     1409     3671     5947    13287    19199
+WaitInGroup       20000       133.6       75      367      710     1432     4033
+Prepare           20000        43.5       27       98      164      276     4427
+Encode            20000        24.4       19       48       99      170      832
+Commit            20000        25.3       16       46      111      316    14511
+WaitForGroup      20000       107.3       43      311      644     1348    14567
+Write              8277        47.3       46       79      106      274      827
+Sync               8277      1843.1     1344     3761     5571     8919    20671
+Publish            8277        30.6       26       58      123      264      654
+Release            8277        15.8       15       24       65      309      472
+Worker            20000      2808.2     2579     4819     7163    18831    22559
+GroupSize          8277         2.4        2        5        7       13       27
+### http, replicated no, run 1: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T09:15:37+05:30: loadavg 2.99 3.10 2.80, containers running 31
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4998 orders/s over 20.007 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 8855  p90 18191  p99 33439  p99.9 61919  max 84223  mean 10168.4
+  send lag us: p50 1099  p90 1805  p99 3359  p99.9 6207  max 11007  mean 1171.4
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 126.8 us per order, 63% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue   100000        47.4       37       69      225     1540    15727
+HttpAsk          100000      7644.9     6755    14239    25135    51231    72063
+HttpTotal        100000      7709.9     6807    14327    25231    51295    72127
+Queue            100000      2435.1     1786     5079    10015    26143    39775
+WaitInGroup      100000       772.4      403     1795     5547    12151    32991
+Prepare          100000        22.5       13       48      100      429    18783
+Encode           100000        11.7        8       24       52      178     4155
+Commit           100000        13.0        8       24       55      258    31407
+WaitForGroup     100000       673.3      323     1622     5039    10751    32799
+Write              6666        47.5       37       79      174      608     3029
+Sync               6666      1919.7     1138     4061     6183     9559    15631
+Publish            6666        84.5       45      187      578     1094     2325
+Release            6666        19.7       12       36      101      566     1721
+Worker           100000      4567.4     4077     8719    14375    26783    42111
+GroupSize          6666        15.0       10       30       57       95      235
+### http, replicated no, run 2: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T09:16:01+05:30: loadavg 4.11 3.38 2.90, containers running 31
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4996 orders/s over 20.016 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 9031  p90 17599  p99 31439  p99.9 63871  max 81151  mean 10099.1
+  send lag us: p50 988  p90 1687  p99 2995  p99.9 6271  max 18415  mean 1054.7
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 134.5 us per order, 67% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue   100000        50.0       39       73      225     1791    10063
+HttpAsk          100000      7613.9     6951    13639    23903    33567    43711
+HttpTotal        100000      7681.2     7011    13751    24031    33695    44159
+Queue            100000      2398.1     1891     4971     9247    14759    22575
+WaitInGroup      100000       829.3      443     1936     5847    10711    15287
+Prepare          100000        23.8       14       52      107      341     6695
+Encode           100000        12.6        8       26       56      160     4127
+Commit           100000        13.4        8       26       60      244    14903
+WaitForGroup     100000       724.6      361     1787     5143     9519    15247
+Write              6474        49.7       36       89      188      586     2721
+Sync               6474      1954.0     1391     4007     6003     7503    19599
+Publish            6474        91.5       45      210      563      875     1190
+Release            6474        19.2       12       39       91      328      758
+Worker           100000      4587.7     4251     8263    14303    21775    22319
+GroupSize          6474        15.4       10       30       55       82      128
+### http, replicated no, run 3: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T09:16:25+05:30: loadavg 4.26 3.47 2.94, containers running 31
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4999 orders/s over 20.005 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 7819  p90 17263  p99 30943  p99.9 40031  max 48671  mean 9129.3
+  send lag us: p50 1063  p90 1744  p99 2887  p99.9 4531  max 7411  mean 1113.9
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 123.8 us per order, 62% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue   100000        45.9       35       71      204     1497    14079
+HttpAsk          100000      6822.0     5907    13399    24847    33439    39903
+HttpTotal        100000      6883.8     5955    13495    25007    33567    39967
+Queue            100000      2160.0     1397     4675     9583    18175    28863
+WaitInGroup      100000       718.5      295     1801     5775     9631    26655
+Prepare          100000        22.0       13       48      105      368     6331
+Encode           100000        11.4        7       24       54      140     3071
+Commit           100000        12.7        7       24       57      269    25839
+WaitForGroup     100000       629.2      235     1668     5139     9175    26623
+Write              7993        42.2       31       76      175      597     1589
+Sync               7993      1617.3      923     3639     5511     7899    19919
+Publish            7993        69.0       33      168      569      837     1414
+Release            7993        16.1        9       32       85      558     1733
+Worker           100000      4106.6     3617     8279    15359    19135    29359
+GroupSize          7993        12.5        9       27       54       95      145
+### in-process, replicated yes, run 1: --bench --orders 20000 --rate 1000
+# host 2026-10-14T09:16:46+05:30: loadavg 4.40 3.55 2.98, containers running 31
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 999 orders/s over 20.011 s
+  latency us : p50 7811  p90 13911  p99 18959  p99.9 28815  max 40767  mean 7846.0
+  syncs      : 6490 (3.1 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 51568 kB, VmRSS: 51568 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue             20000      2379.3     1610     5755     9199    17215    32591
+WaitInGroup       20001       154.0       84      397      816     1801    14247
+Prepare           20001        28.2       17       61      121      191    33407
+Encode            20001        14.8       10       29       68      127     4319
+Commit            20001        16.4        9       29       72      221    13847
+WaitForGroup      20001       123.8       48      340      756     2473    14087
+Write              6491        30.5       21       63       94      174      362
+Sync               6491      1485.7      850     3463     5811     7899    15471
+Confirm            6491      1165.5      727     3005     5087     6311    21599
+Publish            6491        33.6       14       94      189      361      425
+Release            6491        12.1        7       27       47      215      544
+Worker            20001      4706.7     4867     8415    11223    19455    63039
+GroupSize          6491         3.1        2        7       10       13       33
+### in-process, replicated yes, run 2: --bench --orders 20000 --rate 1000
+# host 2026-10-14T09:17:08+05:30: loadavg 4.76 3.72 3.05, containers running 30
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.003 s
+  latency us : p50 8247  p90 14263  p99 21631  p99.9 39871  max 52863  mean 8418.0
+  syncs      : 5660 (3.5 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 51892 kB, VmRSS: 51892 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue             20000      2536.1     1777     5831     9895    19167    31631
+WaitInGroup       20001       178.7      106      427      908     4311    15223
+Prepare           20001        30.6       20       66      125      230    22335
+Encode            20001        16.3       11       32       73      132     3171
+Commit            20001        18.1       11       31       79      208    14791
+WaitForGroup      20001       147.4       64      366      893     3933    15159
+Write              5661        38.7       32       67       97      169     5227
+Sync               5661      1704.2     1030     3705     6051    10575    16511
+Confirm            5661      1310.7      836     3253     5167     7187    23695
+Publish            5661        40.8       25       99      168      357      710
+Release            5661        16.0       12       28       57      466     1870
+Worker            20001      4987.2     5031     8455    12231    21295    45023
+GroupSize          5661         3.5        2        7       11       16       33
+### in-process, replicated yes, run 3: --bench --orders 20000 --rate 1000
+# host 2026-10-14T09:17:30+05:30: loadavg 4.32 3.69 3.06, containers running 30
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.010 s
+  latency us : p50 8735  p90 13831  p99 18991  p99.9 24511  max 31519  mean 8703.1
+  syncs      : 5190 (3.9 orders per sync)
+  journal    : 725 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 51400 kB, VmRSS: 51400 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue             20000      2603.1     2125     5699     8871    12175    20735
+WaitInGroup       20001       175.3      115      412      809     2313    14239
+Prepare           20001        29.4       18       64      127      191    30879
+Encode            20001        15.0       10       30       67      111     3271
+Commit            20001        16.9       10       30       71      195    13943
+WaitForGroup      20001       133.9       73      352      733     1683     5119
+Write              5191        36.5       32       66       95      122      320
+Sync               5191      1860.2     1312     3929     6143     7607    21343
+Confirm            5191      1485.8      980     3181     5335     6467    12071
+Publish            5191        43.0       28      100      172      284      373
+Release            5191        14.7       10       28       49      208     1418
+Worker            20001      5184.1     5347     8319    11103    12919    81471
+GroupSize          5191         3.9        3        7       11       13       22
+### in-process, replicated yes, run 1: --bench --orders 100000 --rate 5000
+# host 2026-10-14T09:17:52+05:30: loadavg 3.67 3.59 3.04, containers running 30
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4996 orders/s over 20.018 s
+  latency us : p50 9679  p90 18623  p99 38687  p99.9 56831  max 66111  mean 10788.7
+  syncs      : 4665 (21.4 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 163636 kB, VmRSS: 163636 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000      3213.6     2209     7103    16703    28367    36927
+WaitInGroup      100001       711.1      411     1729     3953     7991    32479
+Prepare          100001        16.2        9       37       78      132    55199
+Encode           100001         8.1        5       18       45       82     8055
+Commit           100001         9.5        5       18       43      158    45663
+WaitForGroup     100001       661.6      342     1617     3909    11087    32383
+Write              4666        42.8       31       89      173      290     1162
+Sync               4666      1844.0     1082     3781     7783    16447    19103
+Confirm            4666      1353.6      837     3039     5127     8815    35967
+Publish            4666       133.3       69      338      712     1221     1579
+Release            4666        22.7       14       48      114      393      754
+Worker           100001      6516.0     5999    11087    26015    32575   166143
+GroupSize          4666        21.4       15       45       80      150      185
+### in-process, replicated yes, run 2: --bench --orders 100000 --rate 5000
+# host 2026-10-14T09:18:15+05:30: loadavg 3.80 3.62 3.06, containers running 30
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4999 orders/s over 20.003 s
+  latency us : p50 11471  p90 19487  p99 28239  p99.9 53535  max 66367  mean 11502.7
+  syncs      : 4425 (22.6 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 163528 kB, VmRSS: 163528 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000      3400.4     2347     7815    12495    28319    39903
+WaitInGroup      100001       792.6      446     1933     3943     9263    34079
+Prepare          100001        16.8        9       38       81      144    50751
+Encode           100001         8.6        5       18       47       87    10471
+Commit           100001         9.8        5       18       45      173    43007
+WaitForGroup     100001       722.1      370     1829     3775     9959    33951
+Write              4426        47.2       32      102      172      321     1172
+Sync               4426      1884.7      989     4247     6163     8279    20975
+Confirm            4426      1417.6      801     3371     5583     7043    20511
+Publish            4426       147.4       66      405      742     1232     3413
+Release            4426        31.5       15       57      207     1957     2907
+Worker           100001      6932.3     7227    11735    16119    37215   137087
+GroupSize          4426        22.6       15       50       70      105      205
+### in-process, replicated yes, run 3: --bench --orders 100000 --rate 5000
+# host 2026-10-14T09:18:37+05:30: loadavg 3.30 3.50 3.04, containers running 30
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4998 orders/s over 20.006 s
+  latency us : p50 11199  p90 18447  p99 26415  p99.9 35807  max 48255  mean 11256.5
+  syncs      : 4345 (23.0 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 163752 kB, VmRSS: 163752 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000      3305.4     2585     7371    11791    18719    24255
+WaitInGroup      100001       689.6      425     1680     3331     4875    17279
+Prepare          100001        15.1        9       33       75      124    51039
+Encode           100001         7.5        5       16       42       78     8439
+Commit           100001         8.7        5       16       41      109    42367
+WaitForGroup     100001       619.8      351     1544     3275     5143    17263
+Write              4346        41.2       24       88      166      248     1304
+Sync               4346      2017.0     1052     4275     5979     9775    62495
+Confirm            4346      1515.8      871     3501     5339     6295    20031
+Publish            4346       130.4       52      333      693      899     1021
+Release            4346        21.4       12       47       96      201      921
+Worker           100001      6759.8     6931    11103    15103    24703   173311
+GroupSize          4346        23.0       15       49       70       95      125
+### in-process, replicated yes, run 1: --bench --orders 200000 --rate 0
+# host 2026-10-14T09:18:59+05:30: loadavg 3.67 3.58 3.07, containers running 30
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 38119 orders/s over 5.247 s
+  latency us : p50 268287  p90 351487  p99 400383  p99.9 403199  max 403711  mean 279725.5  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 312752 kB, VmRSS: 312752 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    253357.9   241535   322303   365567   368639   368895
+WaitInGroup      200001      7017.0     6923    11367    17471    20911    41727
+Prepare          200001         5.6        3       12       24       40    96127
+Encode           200001         2.8        2        5       10       97    16215
+Commit           200001         3.3        2        5       12       49    84479
+WaitForGroup     200001      5826.2     5379    10415    18367    37823    41439
+Write               198       382.4      359      482      710     2497     2497
+Sync                198      5899.1     3853    10575    32831    54751    54751
+Confirm             198      4691.2     4687     6631     9567    58527    58527
+Publish             198      2311.1     2257     2673     3341     9727     9727
+Release             198       445.6      424      464     1292     2437     2437
+Worker           200001     26265.9    24655    34591    51103    58559   320511
+GroupSize           198      1010.1     1024     1024     1024     1024     1024
+### in-process, replicated yes, run 2: --bench --orders 200000 --rate 0
+# host 2026-10-14T09:19:07+05:30: loadavg 3.25 3.50 3.05, containers running 30
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 32242 orders/s over 6.203 s
+  latency us : p50 337407  p90 367615  p99 447231  p99.9 456447  max 456703  mean 328947.2  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 303788 kB, VmRSS: 303788 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    297677.7   306687   335871   403455   409343   409599
+WaitInGroup      200001      7336.3     7079    11663    22463    30047    31727
+Prepare          200001         5.9        3       12       26       56   114047
+Encode           200001         2.9        2        5       12      101    16687
+Commit           200001         3.4        2        5       13       45    85119
+WaitForGroup     200001      5936.5     5403    10543    21439    37119    40127
+Write               198       384.1      354      496      641     2545     2545
+Sync                198     10384.0    10951    12911    27599   116159   116159
+Confirm             198      4377.9     3975     7403    12495    13063    13063
+Publish             198      2535.5     2257     2711     9991    10831    10831
+Release             198       492.8      426      628     2273     2755     2755
+Worker           200001     31126.2    29999    38783    54367    57247   346623
+GroupSize           198      1010.1     1024     1024     1024     1024     1024
+### in-process, replicated yes, run 3: --bench --orders 200000 --rate 0
+# host 2026-10-14T09:19:16+05:30: loadavg 3.06 3.45 3.04, containers running 30
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 35194 orders/s over 5.683 s
+  latency us : p50 310783  p90 359679  p99 411647  p99.9 416767  max 416767  mean 303025.2  (queue-bound at max rate)
+  syncs      : 196 (1020.4 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 308248 kB, VmRSS: 308248 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    274424.9   283391   327935   381951   385279   385791
+WaitInGroup      200001      7061.7     6875    11287    20543    39199    41247
+Prepare          200001         5.5        3       12       24       48    93375
+Encode           200001         2.8        1        5       10       86    16255
+Commit           200001         3.3        2        5       12       45    83327
+WaitForGroup     200001      5594.8     5235    10031    17807    37567    41055
+Write               197       369.5      351      408      580     2489     2489
+Sync                197      8763.5    10111    12463    30863    47487    47487
+Confirm             197      4241.5     3919     6575    10007    68351    68351
+Publish             197      2398.5     2255     2387     9727    12551    12551
+Release             197       438.9      424      477     1115     1385     1385
+Worker           200001     28521.7    28335    34687    52735    54527   318719
+GroupSize           197      1015.2     1024     1024     1024     1024     1024
+### http, replicated yes, run 1: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T09:19:28+05:30: loadavg 3.14 3.45 3.04, containers running 32
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.010 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 11087  p90 17311  p99 25823  p99.9 47519  max 76351  mean 11437.8
+  send lag us: p50 562  p90 1070  p99 1545  p99.9 3345  max 6891  mean 593.2
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 337.5 us per order, 34% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue    20000        80.7       75      112      362      996    13927
+HttpAsk           20000      9981.2     9735    15535    23007    38975    73919
+HttpTotal         20000     10090.9     9839    15679    23263    39359    74111
+Queue             20000      3456.6     2967     6843    10343    17551    29327
+WaitInGroup       20000       266.7      161      634     1259     4479    12487
+Prepare           20000        35.9       21       82      151      453     2345
+Encode            20000        20.4       14       42       91      277     9183
+Commit            20000        22.0       13       41      100      526    12159
+WaitForGroup      20000       227.1      114      570     1277     3961     9903
+Write              3929        54.8       51       87      122      366      748
+Sync               3929      2524.7     2247     4679     6859    10743    14895
+Confirm            3929      1782.2     1595     3599     5487     9975    23391
+Publish            3929        58.0       42      122      228      456      553
+Release            3929        19.8       17       34       63      345     1130
+Worker            20000      6020.5     5951     9223    13439    18127    29455
+GroupSize          3929         5.1        5        9       12       20       29
+### http, replicated yes, run 2: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T09:19:54+05:30: loadavg 5.21 3.89 3.20, containers running 32
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 999 orders/s over 20.010 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 10399  p90 16071  p99 22799  p99.9 41407  max 49791  mean 10313.5
+  send lag us: p50 883  p90 1394  p99 1891  p99.9 3819  max 8487  mean 919.1
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 359.0 us per order, 36% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue    20000        85.9       78      115      388     1036    11031
+HttpAsk           20000      8531.0     8623    14007    19903    35551    43039
+HttpTotal         20000      8649.2     8743    14159    20159    35679    43135
+Queue             20000      2977.3     2427     6199     9647    16607    26735
+WaitInGroup       20000       252.4      153      615     1189     4175    11527
+Prepare           20000        39.0       23       88      154      392     8847
+Encode            20000        21.7       14       45       89      291     1267
+Commit            20000        23.3       14       43      116      506     9335
+WaitForGroup      20000       212.2      106      540     1041     9575    11447
+Write              5420        46.7       38       85      115      349      843
+Sync               5420      1790.8     1238     3763     6083     8519    17439
+Confirm            5420      1263.1      806     3027     4839     6787    12895
+Publish            5420        43.8       31      100      151      278      681
+Release            5420        18.4       12       33       99      427      785
+Worker            20000      5086.4     5279     8311    11567    24911    27247
+GroupSize          5420         3.7        3        7       11       16       28
+### http, replicated yes, run 3: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T09:20:20+05:30: loadavg 5.09 3.97 3.25, containers running 32
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 999 orders/s over 20.014 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 9759  p90 17103  p99 63071  p99.9 152319  max 168447  mean 11363.0
+  send lag us: p50 1493  p90 1992  p99 2337  p99.9 3493  max 5511  mean 1522.8
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 265.5 us per order, 27% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue    20000        63.2       46      106      311      941     3149
+HttpAsk           20000      9205.5     7635    14527    60735   150143   166399
+HttpTotal         20000      9292.2     7723    14663    60767   150271   166399
+Queue             20000      3597.3     2095     6355    27839   139519   158719
+WaitInGroup       20000       187.9       82      525     1369     2763     8183
+Prepare           20000        28.9       18       69      141      412     2303
+Encode            20000        15.9       11       35       77      149     1099
+Commit            20000        16.8       10       34       84      312     7595
+WaitForGroup      20000       158.5       51      444     1398     2987     8319
+Write              5940        35.7       26       78      107      195     1314
+Sync               5940      1757.2     1018     3747     6163    29663   159231
+Confirm            5940      1157.6      685     2943     4811     8855    24703
+Publish            5940        30.5       15       82      154      322      604
+Release            5940        13.4        8       28       78      278      793
+Worker            20000      5258.9     4695     8695    32511    55455   159487
+GroupSize          5940         3.4        2        7       11       33      159
+### http, replicated yes, run 1: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T09:20:45+05:30: loadavg 4.58 3.93 3.25, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : not measured (99989 answered before the 120 s deadline)
+  unanswered : 11 (no answer within the 120 s deadline)
+  latency us : p50 13759  p90 42975  p99 274431  p99.9 350207  max 1019903  mean 24503.2
+  send lag us: p50 1007  p90 1694  p99 4139  p99.9 9031  max 12255  mean 1098.6
+  statuses   : 201 x 98905
+  errors     : 1084 (first: http://127.0.0.1:4000/exchange/orders: client error (Connect))
+  client cpu : 86.0 us per order, 7% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue    98905        31.2       18       51      137     1458     8919
+HttpAsk           98905     22178.9    12015    38911   268543   321535   351231
+HttpTotal         98905     22224.6    12055    38975   268543   321791   351487
+Queue             98905      7485.1     3887    14111   105215   145919   185727
+WaitInGroup       98905      1753.3      476     3907    19599    61631    78335
+Prepare           98905        14.8        9       28       86      446     7071
+Encode            98905         7.4        4       14       43      210     3297
+Commit            98905         8.5        4       14       45      283    16399
+WaitForGroup      98905      1462.7      393     3111    16431    59455    78271
+Write              3129        47.5       37       63      266      714     3385
+Sync               3129      3011.6     2557     5727    10575    59007    73535
+Confirm            3129      1973.6     1121     4371     8991    40191    51999
+Publish            3129       125.5       79      205     1251     3291     6483
+Release            3129        33.4       17       44      317     2032     3359
+Worker            98905     13495.7     7439    24303   165375   188159   188287
+GroupSize          3129        31.6       25       60      150      380      623
+### http, replicated yes, run 2: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T09:22:49+05:30: loadavg 1.51 3.11 3.04, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4995 orders/s over 20.020 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 17055  p90 33279  p99 56479  p99.9 85311  max 111487  mean 18879.6
+  send lag us: p50 1146  p90 1912  p99 4235  p99.9 10399  max 19023  mean 1262.6
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 131.4 us per order, 66% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue   100000        51.4       38       73      213     2165    13191
+HttpAsk          100000     15710.1    14495    27823    45759    61919    71359
+HttpTotal        100000     15779.1    14559    27919    45951    62303    71423
+Queue            100000      4962.5     4151    10231    18783    30303    37983
+WaitInGroup      100000      1691.9      970     4311    10639    16071    31695
+Prepare          100000        23.8       13       49      109      706    11151
+Encode           100000        12.5        7       24       57      169     8247
+Commit           100000        13.3        8       24       57      289    25967
+WaitForGroup     100000      1467.5      808     3685     9271    16527    31647
+Write              3231        65.2       41      120      266     1188     3271
+Sync               3231      2386.2     1761     4899     6955     9983    18559
+Confirm            3231      1668.2      950     3819     5799     9207     9743
+Publish            3231       190.4       96      443     1114     1740     1952
+Release            3231        36.7       21       71      195     1189     1767
+Worker           100000      9682.1     8839    17039    29135    38431    38559
+GroupSize          3231        31.0       25       62      110      172      239
+### http, replicated yes, run 3: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T09:23:13+05:30: loadavg 2.75 3.28 3.10, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4998 orders/s over 20.009 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 16447  p90 29759  p99 58271  p99.9 111871  max 127423  mean 18815.4
+  send lag us: p50 1167  p90 1889  p99 3857  p99.9 17055  max 29039  mean 1279.8
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 125.3 us per order, 63% of one hardware thread (user + system, includes the login loops)
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+HttpBeforeQueue   100000        47.7       37       68      201     1994    14767
+HttpAsk          100000     15581.7    13919    25071    45087    61759    68991
+HttpTotal        100000     15647.1    13983    25183    45343    61823    69119
+Queue            100000      4986.8     4387     9479    18095    31263    42719
+WaitInGroup      100000      1500.5      917     3511     9543    15887    37567
+Prepare          100000        21.9       12       46       98      622     6551
+Encode           100000        11.8        7       23       52      240     5099
+Commit           100000        12.7        7       23       53      364    35679
+WaitForGroup     100000      1332.6      770     3149     8815    19359    37535
+Write              2508        77.6       62      129      272     1861     8143
+Sync               2508      3312.9     3269     5299     7951    11295    12591
+Confirm            2508      2095.0     1790     3999     5903     9767    11295
+Publish            2508       230.9      182      467     1056     1617     2153
+Release            2508        43.1       33       72      171     1316     2795
+Worker           100000      9593.6     8511    15151    28223    36127    42847
+GroupSize          2508        39.9       39       64      115      196      279
+### done

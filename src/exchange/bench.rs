@@ -260,6 +260,9 @@ pub async fn run(args: &[String]) -> Result<(), String> {
             .map(|metadata| metadata.len())
             .map_err(|e| e.to_string())
     };
+    // Only the measured orders are timed, not the setup deposits (`--depth` orders still are).
+    #[cfg(feature = "stage-timing")]
+    crate::exchange::stage_timing::reset();
     let mut rng = Rng(SEED);
     let mut latency = Histogram::<u64>::new(3).map_err(|e| e.to_string())?;
     let mut rejected = 0u64;
@@ -296,9 +299,8 @@ pub async fn run(args: &[String]) -> Result<(), String> {
                     now,
                 );
                 resting.push(
-                    send(&tx, |respond_to| ExchangeCommand::PlaceOrder {
-                        order,
-                        respond_to,
+                    send(&tx, |respond_to| {
+                        ExchangeCommand::place_order(order, respond_to)
                     })
                     .await?,
                 );
@@ -326,9 +328,8 @@ pub async fn run(args: &[String]) -> Result<(), String> {
             let price = BAND_LOW + rng.below(BAND_TICKS);
             let qty = 1 + rng.below(10) as u32;
             let order = order(format!("o{i}"), user, symbol, side, price, qty, now);
-            let reply = send(&tx, |respond_to| ExchangeCommand::PlaceOrder {
-                order,
-                respond_to,
+            let reply = send(&tx, |respond_to| {
+                ExchangeCommand::place_order(order, respond_to)
             })
             .await?;
             pending.push(tokio::spawn(async move {
@@ -375,12 +376,13 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     // At "max" the generator keeps the queue full, so latency there is mostly time spent
     // waiting in a 10,000-deep queue. Read latency from fixed-rate runs.
     println!(
-        "  latency us : p50 {}  p90 {}  p99 {}  p99.9 {}  max {}{}",
+        "  latency us : p50 {}  p90 {}  p99 {}  p99.9 {}  max {}  mean {:.1}{}",
         latency.value_at_quantile(0.50),
         latency.value_at_quantile(0.90),
         latency.value_at_quantile(0.99),
         latency.value_at_quantile(0.999),
         latency.max(),
+        latency.mean(),
         if config.rate == 0 {
             "  (queue-bound at max rate)"
         } else {
@@ -397,6 +399,8 @@ pub async fn run(args: &[String]) -> Result<(), String> {
     );
     println!("  rejected   : {rejected}");
     println!("  memory     : {}", memory());
+    #[cfg(feature = "stage-timing")]
+    print!("{}", crate::exchange::stage_timing::report());
 
     drop(tx);
     worker

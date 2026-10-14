@@ -1488,10 +1488,7 @@ mod tests {
             let (respond_to, reply) = oneshot::channel();
             send(
                 &tx,
-                ExchangeCommand::PlaceOrder {
-                    order: order(id, user, side, price, quantity),
-                    respond_to,
-                },
+                ExchangeCommand::place_order(order(id, user, side, price, quantity), respond_to),
             );
             reply.blocking_recv().unwrap().unwrap();
         }
@@ -1623,11 +1620,8 @@ mod tests {
 
         let sell = order("sell", "seller", "SELL", 100, 5);
         let (respond_to, response) = oneshot::channel();
-        tx.blocking_send(ExchangeCommand::PlaceOrder {
-            order: sell,
-            respond_to,
-        })
-        .unwrap();
+        tx.blocking_send(ExchangeCommand::place_order(sell, respond_to))
+            .unwrap();
         assert!(response.blocking_recv().unwrap().is_ok());
 
         let (respond_to, response) = oneshot::channel();
@@ -1641,11 +1635,8 @@ mod tests {
 
         let buy = order("buy", "buyer", "BUY", 100, 2);
         let (respond_to, response) = oneshot::channel();
-        tx.blocking_send(ExchangeCommand::PlaceOrder {
-            order: buy,
-            respond_to,
-        })
-        .unwrap();
+        tx.blocking_send(ExchangeCommand::place_order(buy, respond_to))
+            .unwrap();
         assert!(response.blocking_recv().unwrap().is_ok());
 
         while let Some(batch) = reader.next_batch().unwrap() {
@@ -1721,10 +1712,7 @@ mod tests {
             let (respond_to, reply) = oneshot::channel();
             send(
                 &tx,
-                ExchangeCommand::PlaceOrder {
-                    order: order(id, user, side, price, quantity),
-                    respond_to,
-                },
+                ExchangeCommand::place_order(order(id, user, side, price, quantity), respond_to),
             );
             reply.blocking_recv().unwrap().unwrap();
         }
@@ -1757,10 +1745,7 @@ mod tests {
         let (respond_to, reply) = oneshot::channel();
         send(
             &tx,
-            ExchangeCommand::PlaceOrder {
-                order: order("sell-1", "seller", "SELL", 105, 4),
-                respond_to,
-            },
+            ExchangeCommand::place_order(order("sell-1", "seller", "SELL", 105, 4), respond_to),
         );
         reply.blocking_recv().unwrap().unwrap();
         drop(tx);

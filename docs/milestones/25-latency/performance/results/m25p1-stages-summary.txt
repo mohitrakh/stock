@@ -1,0 +1,167 @@
+
+## in-process, replicated no: --bench --orders 20000 --rate 1000 (3 runs)
+end-to-end: p50 5356  p99 12399  mean 5621
+  Queue           mean    1499.6  p50     1198  p99     5418
+  WaitInGroup     mean      94.2  p50       53  p99      481
+  Prepare         mean      28.8  p50       18  p99      122
+  Encode          mean      15.2  p50       11  p99       67
+  Commit          mean      17.2  p50       10  p99       76
+  WaitForGroup    mean      71.8  p50       28  p99      442
+  Write           mean      34.6  p50       32  p99       87
+  Sync            mean    2366.1  p50     2090  p99     5794
+  Publish         mean      28.4  p50       23  p99      107
+  Release         mean      11.4  p50       11  p99       36
+  Worker          mean    2962.6  p50     2739  p99     6888
+  GroupSize       mean       2.8  p50        3  p99        7
+
+## in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+end-to-end: p50 6640  p99 17180  mean 6989
+  Queue           mean    1941.5  p50     1581  p99     7158
+  WaitInGroup     mean     486.2  p50      324  p99     2346
+  Prepare         mean      17.8  p50       10  p99       88
+  Encode          mean       9.2  p50        5  p99       48
+  Commit          mean      10.4  p50        6  p99       49
+  WaitForGroup    mean     432.2  p50      265  p99     2211
+  Write           mean      44.9  p50       39  p99      125
+  Sync            mean    2325.3  p50     2049  p99     5800
+  Publish         mean     105.7  p50       77  p99      393
+  Release         mean      20.0  p50       16  p99       67
+  Worker          mean    3886.2  p50     3736  p99     9854
+  GroupSize       mean      16.6  p50       15  p99       41
+
+## in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+end-to-end: p50 239743  p99 311295  mean 238569
+  Queue           mean  216145.2  p50   217386  p99   286378
+  WaitInGroup     mean    7169.9  p50     7014  p99    18687
+  Prepare         mean       5.3  p50        3  p99       25
+  Encode          mean       2.8  p50        2  p99       11
+  Commit          mean       2.9  p50        2  p99       12
+  WaitForGroup    mean    5835.6  p50     5430  p99    18751
+  Write           mean     351.5  p50      340  p99      530
+  Sync            mean    5980.9  p50     5670  p99    11570
+  Publish         mean    2373.2  p50     2240  p99     7267
+  Release         mean     448.4  p50      426  p99     1247
+  Worker          mean   22339.7  p50    21487  p99    47914
+  GroupSize       mean    1015.2  p50     1024  p99     1024
+
+## http, replicated no: --http-bench --orders 20000 --rate 1000 (3 runs)
+end-to-end: p50 6914  p99 16100  mean 7194
+  HttpBeforeQueue mean      87.9  p50       79  p99      370
+  HttpAsk         mean    5530.0  p50     5283  p99    13180
+  HttpTotal       mean    5653.8  p50     5406  p99    13338
+  Queue           mean    2008.4  p50     1693  p99     6202
+  WaitInGroup     mean     150.3  p50       86  p99      747
+  Prepare         mean      42.1  p50       26  p99      161
+  Encode          mean      23.7  p50       18  p99       97
+  Commit          mean      24.8  p50       16  p99      109
+  WaitForGroup    mean     121.3  p50       54  p99      680
+  Write           mean      51.0  p50       49  p99      111
+  Sync            mean    2335.6  p50     2003  p99     6072
+  Publish         mean      36.6  p50       32  p99      137
+  Release         mean      16.3  p50       16  p99       54
+  Worker          mean    3177.1  p50     2964  p99     7670
+  GroupSize       mean       2.9  p50        3  p99        7
+
+## http, replicated no: --http-bench --orders 100000 --rate 5000 (3 runs)
+end-to-end: p50 8568  p99 31940  mean 9799
+  HttpBeforeQueue mean      47.8  p50       37  p99      218
+  HttpAsk         mean    7360.3  p50     6538  p99    24628
+  HttpTotal       mean    7425.0  p50     6591  p99    24756
+  Queue           mean    2331.1  p50     1691  p99     9615
+  WaitInGroup     mean     773.4  p50      380  p99     5723
+  Prepare         mean      22.8  p50       13  p99      104
+  Encode          mean      11.9  p50        8  p99       54
+  Commit          mean      13.0  p50        8  p99       57
+  WaitForGroup    mean     675.7  p50      306  p99     5107
+  Write           mean      46.5  p50       35  p99      179
+  Sync            mean    1830.3  p50     1151  p99     5899
+  Publish         mean      81.7  p50       41  p99      570
+  Release         mean      18.3  p50       11  p99       92
+  Worker          mean    4420.6  p50     3982  p99    14679
+  GroupSize       mean      14.3  p50       10  p99       55
+
+## in-process, replicated yes: --bench --orders 20000 --rate 1000 (3 runs)
+end-to-end: p50 8264  p99 19860  mean 8322
+  Queue           mean    2506.2  p50     1837  p99     9322
+  WaitInGroup     mean     169.3  p50      102  p99      844
+  Prepare         mean      29.4  p50       18  p99      124
+  Encode          mean      15.4  p50       10  p99       69
+  Commit          mean      17.1  p50       10  p99       74
+  WaitForGroup    mean     135.0  p50       62  p99      794
+  Write           mean      35.2  p50       28  p99       95
+  Sync            mean    1683.4  p50     1064  p99     6002
+  Confirm         mean    1320.7  p50      848  p99     5196
+  Publish         mean      39.1  p50       22  p99      176
+  Release         mean      14.3  p50       10  p99       51
+  Worker          mean    4959.3  p50     5082  p99    11519
+  GroupSize       mean       3.5  p50        2  p99       11
+
+## in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+end-to-end: p50 10783  p99 31114  mean 11183
+  Queue           mean    3306.5  p50     2380  p99    13663
+  WaitInGroup     mean     731.1  p50      427  p99     3742
+  Prepare         mean      16.0  p50        9  p99       78
+  Encode          mean       8.1  p50        5  p99       45
+  Commit          mean       9.3  p50        5  p99       43
+  WaitForGroup    mean     667.8  p50      354  p99     3653
+  Write           mean      43.7  p50       29  p99      170
+  Sync            mean    1915.2  p50     1041  p99     6642
+  Confirm         mean    1429.0  p50      836  p99     5350
+  Publish         mean     137.0  p50       62  p99      716
+  Release         mean      25.2  p50       14  p99      139
+  Worker          mean    6736.0  p50     6719  p99    19079
+  GroupSize       mean      22.3  p50       15  p99       73
+
+## in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+end-to-end: p50 305492  p99 419754  mean 303899
+  Queue           mean  275153.5  p50   277204  p99   383658
+  WaitInGroup     mean    7138.3  p50     6959  p99    20159
+  Prepare         mean       5.7  p50        3  p99       25
+  Encode          mean       2.8  p50        2  p99       11
+  Commit          mean       3.3  p50        2  p99       12
+  WaitForGroup    mean    5785.8  p50     5339  p99    19204
+  Write           mean     378.7  p50      355  p99      644
+  Sync            mean    8348.9  p50     8305  p99    30431
+  Confirm         mean    4436.9  p50     4194  p99    10690
+  Publish         mean    2415.0  p50     2256  p99     7686
+  Release         mean     459.1  p50      425  p99     1560
+  Worker          mean   28637.9  p50    27663  p99    52735
+  GroupSize       mean    1011.8  p50     1024  p99     1024
+
+## http, replicated yes: --http-bench --orders 20000 --rate 1000 (3 runs)
+end-to-end: p50 10415  p99 37231  mean 11038
+  HttpBeforeQueue mean      76.6  p50       66  p99      354
+  HttpAsk         mean    9239.2  p50     8664  p99    34548
+  HttpTotal       mean    9344.1  p50     8768  p99    34730
+  Queue           mean    3343.7  p50     2496  p99    15943
+  WaitInGroup     mean     235.7  p50      132  p99     1272
+  Prepare         mean      34.6  p50       21  p99      149
+  Encode          mean      19.3  p50       13  p99       86
+  Commit          mean      20.7  p50       12  p99      100
+  WaitForGroup    mean     199.3  p50       90  p99     1239
+  Write           mean      45.7  p50       38  p99      115
+  Sync            mean    2024.2  p50     1501  p99     6368
+  Confirm         mean    1401.0  p50     1029  p99     5046
+  Publish         mean      44.1  p50       29  p99      178
+  Release         mean      17.2  p50       12  p99       80
+  Worker          mean    5455.3  p50     5308  p99    19172
+  GroupSize       mean       4.1  p50        3  p99       11
+
+## http, replicated yes: --http-bench --orders 100000 --rate 5000 (3 runs)
+end-to-end: p50 15754  p99 129727  mean 20733
+  HttpBeforeQueue mean      43.4  p50       31  p99      184
+  HttpAsk         mean   17823.6  p50    13476  p99   119796
+  HttpTotal       mean   17883.6  p50    13532  p99   119946
+  Queue           mean    5811.5  p50     4142  p99    47364
+  WaitInGroup     mean    1648.6  p50      788  p99    13260
+  Prepare         mean      20.2  p50       11  p99       98
+  Encode          mean      10.6  p50        6  p99       51
+  Commit          mean      11.5  p50        6  p99       52
+  WaitForGroup    mean    1420.9  p50      657  p99    11506
+  Write           mean      63.4  p50       47  p99      268
+  Sync            mean    2903.6  p50     2529  p99     8494
+  Confirm         mean    1912.3  p50     1287  p99     6898
+  Publish         mean     182.3  p50      119  p99     1140
+  Release         mean      37.7  p50       24  p99      228
+  Worker          mean   10923.8  p50     8263  p99    74244
+  GroupSize       mean      34.2  p50       30  p99      125

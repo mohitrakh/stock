@@ -138,6 +138,9 @@ pub async fn deposit(
 pub async fn place_order(
     State(state): State<AppState>,
     auth: AuthUser,
+    #[cfg(feature = "stage-timing")] axum::Extension(start): axum::Extension<
+        crate::exchange::stage_timing::RequestStart,
+    >,
     Json(payload): Json<OrderRequest>,
 ) -> Result<(StatusCode, Json<OrderView>), AppError> {
     // A client-supplied id is what makes a retry recognisable as a retry; a generated one is
@@ -161,12 +164,19 @@ pub async fn place_order(
     )
     .map_err(AppError::Validation)?;
 
-    let view = ask(&state, |respond_to| ExchangeCommand::PlaceOrder {
-        order,
-        respond_to,
+    #[cfg(feature = "stage-timing")]
+    let asked = {
+        use crate::exchange::stage_timing::{Stage, record};
+        record(Stage::HttpBeforeQueue, start.0);
+        std::time::Instant::now()
+    };
+    let view = ask(&state, |respond_to| {
+        ExchangeCommand::place_order(order, respond_to)
     })
-    .await?
-    .map_err(|err| {
+    .await?;
+    #[cfg(feature = "stage-timing")]
+    crate::exchange::stage_timing::record(crate::exchange::stage_timing::Stage::HttpAsk, asked);
+    let view = view.map_err(|err| {
         // A reused client order id is the retry case, not a malformed request, and a closed
         // market, a full book or a sweep through too many resting orders depends on the
         // exchange's state, not on the request alone.

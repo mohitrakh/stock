@@ -204,9 +204,14 @@ pub struct SessionView {
 /// without changing a single outcome.
 #[derive(Debug)]
 pub enum ExchangeCommand {
+    /// Build it with `ExchangeCommand::place_order`, which also stamps it in a `stage-timing`
+    /// build.
     PlaceOrder {
         order: Order,
         respond_to: oneshot::Sender<Result<OrderView, String>>,
+        /// When the command was built: the start of its `Queue` stage.
+        #[cfg(feature = "stage-timing")]
+        queued_at: std::time::Instant,
     },
     CancelOrder {
         order_id: String,
@@ -267,4 +272,18 @@ pub enum ExchangeCommand {
     GetSession {
         respond_to: oneshot::Sender<SessionView>,
     },
+}
+
+impl ExchangeCommand {
+    pub fn place_order(
+        order: Order,
+        respond_to: oneshot::Sender<Result<OrderView, String>>,
+    ) -> Self {
+        ExchangeCommand::PlaceOrder {
+            order,
+            respond_to,
+            #[cfg(feature = "stage-timing")]
+            queued_at: std::time::Instant::now(),
+        }
+    }
 }

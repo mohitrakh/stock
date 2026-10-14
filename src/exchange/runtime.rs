@@ -18,6 +18,26 @@ use crate::{
     },
 };
 
+#[cfg(feature = "stage-timing")]
+use crate::exchange::stage_timing::Stage;
+
+/// The worker's own stage histograms: one per thread, so recording an order takes no lock. They
+/// are merged into the global report once per group.
+#[cfg(feature = "stage-timing")]
+mod timing {
+    use std::cell::RefCell;
+
+    use crate::exchange::stage_timing::Stages;
+
+    thread_local! {
+        static STAGES: RefCell<Stages> = RefCell::new(Stages::new());
+    }
+
+    pub(super) fn record(record: impl FnOnce(&mut Stages)) {
+        STAGES.with(|stages| record(&mut stages.borrow_mut()));
+    }
+}
+
 /// The rejection reason journaled for an order sent while the market is closed.
 pub(crate) const MARKET_CLOSED: &str = "MarketClosed";
 
@@ -1017,7 +1037,9 @@ impl ExchangeRuntime {
                 respond_to,
                 InputEventResult::into_set_risk_limit_result,
             ),
-            ExchangeCommand::PlaceOrder { order, respond_to } => self.stage_write(
+            ExchangeCommand::PlaceOrder {
+                order, respond_to, ..
+            } => self.stage_write(
                 ExchangeInputEvent::NewOrderRequested { order },
                 staged,
                 respond_to,
@@ -1122,12 +1144,16 @@ impl ExchangeRuntime {
         event: ExchangeInputEvent,
         staged: &mut Vec<Staged>,
     ) -> Result<InputEventResult, RuntimeFailure> {
+        #[cfg(feature = "stage-timing")]
+        let started = std::time::Instant::now();
         let prepared =
             prepare_input_event(&self.core, event.clone()).map_err(|error| match error {
                 CoreError::Business(reason) => RuntimeFailure::Internal(format!("{:?}", reason)),
                 CoreError::Internal(reason) => RuntimeFailure::Internal(reason),
             })?;
 
+        #[cfg(feature = "stage-timing")]
+        let prepared_at = std::time::Instant::now();
         let mut seq_num = self.next_event_seq;
         let mut batch = Vec::with_capacity(1 + prepared.output_events.len());
 
@@ -1147,7 +1173,15 @@ impl ExchangeRuntime {
 
         // Serialize once; these exact framed bytes go to disk and then to mmap.
         let record = encode_record(&batch).map_err(RuntimeFailure::Store)?;
+        #[cfg(feature = "stage-timing")]
+        let encoded_at = std::time::Instant::now();
         let (result, executions) = prepared.commit(&mut self.core);
+        #[cfg(feature = "stage-timing")]
+        timing::record(|stages| {
+            stages.record(Stage::Prepare, prepared_at - started);
+            stages.record(Stage::Encode, encoded_at - prepared_at);
+            stages.record(Stage::Commit, encoded_at.elapsed());
+        });
         self.next_event_seq = seq_num;
         staged.push(Staged {
             record,
@@ -1170,24 +1204,38 @@ impl ExchangeRuntime {
         if let Some(store) = self.store.as_mut() {
             let records: Vec<&[u8]> = staged.iter().map(|s| s.record.as_slice()).collect();
             let records = records.concat();
+            #[cfg(feature = "stage-timing")]
+            let started = std::time::Instant::now();
+            store
+                .write_records(&records)
+                .map_err(RuntimeFailure::Store)?;
+            #[cfg(feature = "stage-timing")]
+            let written = std::time::Instant::now();
             if let Some(replication) = &self.replication {
                 // The group goes to the replica while this disk syncs, then waits for both:
                 // nothing that exists on one machine only is ever published or answered, unless
                 // the operator lets this primary run alone.
-                store
-                    .write_records(&records)
-                    .map_err(RuntimeFailure::Store)?;
                 let end = store.end().map_err(RuntimeFailure::Store)?;
                 let next_sequence = staged.last().expect("a group").last_sequence + 1;
                 replication.written(end, next_sequence);
                 store.sync().map_err(RuntimeFailure::Store)?;
+                #[cfg(feature = "stage-timing")]
+                let synced = std::time::Instant::now();
                 alone = replication.confirm(end);
+                #[cfg(feature = "stage-timing")]
+                timing::record(|stages| stages.record(Stage::Confirm, synced.elapsed()));
+                #[cfg(feature = "stage-timing")]
+                timing::record(|stages| stages.record(Stage::Sync, synced - written));
             } else {
-                store
-                    .append_record(&records)
-                    .map_err(RuntimeFailure::Store)?;
+                store.sync().map_err(RuntimeFailure::Store)?;
+                #[cfg(feature = "stage-timing")]
+                timing::record(|stages| stages.record(Stage::Sync, written.elapsed()));
             }
+            #[cfg(feature = "stage-timing")]
+            timing::record(|stages| stages.record(Stage::Write, written - started));
         }
+        #[cfg(feature = "stage-timing")]
+        let publishing = std::time::Instant::now();
         for command in staged {
             // Only now is the command part of history and visible to callbacks.
             #[cfg(test)]
@@ -1199,6 +1247,8 @@ impl ExchangeRuntime {
             }
             self.core.notify_executions(&command.executions);
         }
+        #[cfg(feature = "stage-timing")]
+        timing::record(|stages| stages.record(Stage::Publish, publishing.elapsed()));
         // Answered on this machine only: its stream's end, which says what it acknowledged, must
         // survive a power loss, so that if this primary was replaced meanwhile, the handshake
         // refuses it when it rejoins rather than cutting what it acknowledged.
@@ -1220,7 +1270,19 @@ impl ExchangeRuntime {
         let mut staged = Vec::new();
         let mut replies = Vec::new();
         let mut fault = None;
+        // The group was taken off the queue just before this call, all of it within microseconds.
+        #[cfg(feature = "stage-timing")]
+        let dequeued = std::time::Instant::now();
+        #[cfg(feature = "stage-timing")]
+        let mut staging_ends = Vec::new();
         for command in commands {
+            #[cfg(feature = "stage-timing")]
+            timing::record(|stages| {
+                if let ExchangeCommand::PlaceOrder { queued_at, .. } = &command {
+                    stages.record(Stage::Queue, dequeued.saturating_duration_since(*queued_at));
+                }
+                stages.record(Stage::WaitInGroup, dequeued.elapsed());
+            });
             match self.stage_command(command, &mut staged) {
                 Ok(reply) => replies.push(reply),
                 Err(err) => {
@@ -1231,12 +1293,31 @@ impl ExchangeRuntime {
                     break;
                 }
             }
+            #[cfg(feature = "stage-timing")]
+            staging_ends.push(std::time::Instant::now());
         }
+        #[cfg(feature = "stage-timing")]
+        timing::record(|stages| {
+            let flushing = std::time::Instant::now();
+            for end in &staging_ends {
+                stages.record(Stage::WaitForGroup, flushing - *end);
+            }
+            stages.count(Stage::GroupSize, staging_ends.len() as u64);
+        });
         let flushed = self.flush(staged);
         let failure = flushed.as_ref().err().map(halted_message);
+        #[cfg(feature = "stage-timing")]
+        let releasing = std::time::Instant::now();
         for reply in replies {
             reply(failure.as_deref());
+            #[cfg(feature = "stage-timing")]
+            timing::record(|stages| stages.record(Stage::Worker, dequeued.elapsed()));
         }
+        #[cfg(feature = "stage-timing")]
+        timing::record(|stages| {
+            stages.record(Stage::Release, releasing.elapsed());
+            stages.merge_into_global();
+        });
         flushed?;
         fault.map_or(Ok(()), Err)
     }
@@ -1678,10 +1759,10 @@ mod tests {
         let (respond_to, _response_rx) = oneshot::channel();
 
         runtime
-            .handle_command(ExchangeCommand::PlaceOrder {
-                order: order("buy-1", "buyer", "BUY", 10, 10),
+            .handle_command(ExchangeCommand::place_order(
+                order("buy-1", "buyer", "BUY", 10, 10),
                 respond_to,
-            })
+            ))
             .unwrap();
 
         assert_eq!(runtime.event_log.len(), 2);
@@ -1708,10 +1789,10 @@ mod tests {
         let (respond_to, _response_rx) = oneshot::channel();
 
         runtime
-            .handle_command(ExchangeCommand::PlaceOrder {
-                order: order("buy-1", "buyer", "BUY", 10, 10),
+            .handle_command(ExchangeCommand::place_order(
+                order("buy-1", "buyer", "BUY", 10, 10),
                 respond_to,
-            })
+            ))
             .unwrap();
 
         assert_eq!(runtime.event_log.len(), 2);
@@ -1777,10 +1858,10 @@ mod tests {
         let (respond_to, _response_rx) = oneshot::channel();
 
         runtime
-            .handle_command(ExchangeCommand::PlaceOrder {
-                order: order("buy-1", "buyer", "BUY", 10, 5),
+            .handle_command(ExchangeCommand::place_order(
+                order("buy-1", "buyer", "BUY", 10, 5),
                 respond_to,
-            })
+            ))
             .unwrap();
 
         assert_eq!(runtime.event_log.len(), 4);
@@ -1838,18 +1919,18 @@ mod tests {
 
         let (respond_to, _response_rx) = oneshot::channel();
         runtime
-            .handle_command(ExchangeCommand::PlaceOrder {
-                order: order("sell-1", "seller", "SELL", 10, 5),
+            .handle_command(ExchangeCommand::place_order(
+                order("sell-1", "seller", "SELL", 10, 5),
                 respond_to,
-            })
+            ))
             .unwrap();
 
         let (respond_to, _response_rx) = oneshot::channel();
         runtime
-            .handle_command(ExchangeCommand::PlaceOrder {
-                order: order("buy-1", "buyer", "BUY", 10, 5),
+            .handle_command(ExchangeCommand::place_order(
+                order("buy-1", "buyer", "BUY", 10, 5),
                 respond_to,
-            })
+            ))
             .unwrap();
 
         let consumed_events = runtime.event_log();
@@ -2148,10 +2229,10 @@ mod tests {
 
         let (respond_to, _response_rx) = oneshot::channel();
         runtime
-            .handle_command(ExchangeCommand::PlaceOrder {
-                order: order("buy-1", "buyer", "BUY", 10, 10),
+            .handle_command(ExchangeCommand::place_order(
+                order("buy-1", "buyer", "BUY", 10, 10),
                 respond_to,
-            })
+            ))
             .unwrap();
 
         let length_before_reads = runtime.event_log().len();
@@ -2196,10 +2277,10 @@ mod tests {
 
         let (respond_to, response_rx) = oneshot::channel();
         runtime
-            .handle_command(ExchangeCommand::PlaceOrder {
-                order: order("buy-1", "buyer", "BUY", 10, 10),
+            .handle_command(ExchangeCommand::place_order(
+                order("buy-1", "buyer", "BUY", 10, 10),
                 respond_to,
-            })
+            ))
             .unwrap();
 
         let view = response_rx.blocking_recv().unwrap().unwrap();
@@ -2636,13 +2717,11 @@ mod tests {
             quantity: 5,
             respond_to,
         });
-        let sell = queue(&mut group, |respond_to| ExchangeCommand::PlaceOrder {
-            order: order("sell-1", "seller", "SELL", 10, 5),
-            respond_to,
+        let sell = queue(&mut group, |respond_to| {
+            ExchangeCommand::place_order(order("sell-1", "seller", "SELL", 10, 5), respond_to)
         });
-        let buy = queue(&mut group, |respond_to| ExchangeCommand::PlaceOrder {
-            order: order("buy-1", "buyer", "BUY", 10, 5),
-            respond_to,
+        let buy = queue(&mut group, |respond_to| {
+            ExchangeCommand::place_order(order("buy-1", "buyer", "BUY", 10, 5), respond_to)
         });
         let balance = queue(&mut group, |respond_to| ExchangeCommand::GetBalance {
             user_id: "buyer".into(),
@@ -2667,6 +2746,64 @@ mod tests {
         let recovered = recover_runtime(rx, &path).unwrap();
         assert_eq!(recovered.core_snapshot_for_test(), live);
         drop(recovered);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// One durable group with two orders records every worker stage. The global report is shared
+    /// with every other test of a feature build, so this checks that each stage is present, not
+    /// how many samples it has.
+    #[cfg(feature = "stage-timing")]
+    #[test]
+    fn a_group_records_every_worker_stage() {
+        let path = temp_log_path("stage-timing");
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let mut runtime = recover_runtime(rx, &path).unwrap();
+        let mut group = Vec::new();
+        let _ = queue(&mut group, |respond_to| ExchangeCommand::OpenMarket {
+            trading_day: trading_day(1),
+            respond_to,
+        });
+        let _ = queue(&mut group, |respond_to| ExchangeCommand::Deposit {
+            user_id: "buyer".into(),
+            amount: 1_000,
+            respond_to,
+        });
+        let _ = queue(&mut group, |respond_to| ExchangeCommand::DepositShares {
+            user_id: "seller".into(),
+            symbol: "AAPL".into(),
+            quantity: 5,
+            respond_to,
+        });
+        let _ = queue(&mut group, |respond_to| {
+            ExchangeCommand::place_order(order("sell-1", "seller", "SELL", 10, 5), respond_to)
+        });
+        let _ = queue(&mut group, |respond_to| {
+            ExchangeCommand::place_order(order("buy-1", "buyer", "BUY", 10, 5), respond_to)
+        });
+        runtime.handle_group(group.into_iter()).unwrap();
+
+        let report = crate::exchange::stage_timing::report();
+        for stage in [
+            "Queue",
+            "WaitInGroup",
+            "Prepare",
+            "Encode",
+            "Commit",
+            "WaitForGroup",
+            "Write",
+            "Sync",
+            "Publish",
+            "Release",
+            "Worker",
+            "GroupSize",
+        ] {
+            assert!(
+                report.lines().any(|line| line.starts_with(stage)),
+                "{stage} missing from the report:\n{report}"
+            );
+        }
+        drop(runtime);
+        let _ = std::fs::remove_file(format!("{}.terms", path.display()));
         std::fs::remove_file(path).unwrap();
     }
 
@@ -2736,9 +2873,8 @@ mod tests {
             respond_to,
         });
         // Crediting a seller who holds u64::MAX is an internal fault, not a rejection.
-        let faulting = queue(&mut group, |respond_to| ExchangeCommand::PlaceOrder {
-            order: order("buy-1", "buyer", "BUY", 10, 1),
-            respond_to,
+        let faulting = queue(&mut group, |respond_to| {
+            ExchangeCommand::place_order(order("buy-1", "buyer", "BUY", 10, 1), respond_to)
         });
         let after = queue(&mut group, |respond_to| ExchangeCommand::DepositShares {
             user_id: "late".into(),
@@ -3305,10 +3441,10 @@ mod tests {
 
         let (respond_to, _response_rx) = oneshot::channel();
         runtime
-            .handle_command(ExchangeCommand::PlaceOrder {
-                order: order("buy-1", "buyer", "BUY", 10, 10),
+            .handle_command(ExchangeCommand::place_order(
+                order("buy-1", "buyer", "BUY", 10, 10),
                 respond_to,
-            })
+            ))
             .unwrap();
 
         let (respond_to, order_rx) = oneshot::channel();

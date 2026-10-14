@@ -14,5 +14,7 @@ pub mod replication;
 pub mod reporter;
 pub mod runtime;
 pub mod snapshot;
+#[cfg(feature = "stage-timing")]
+pub mod stage_timing;
 pub mod terms;
 pub mod warm_replica;

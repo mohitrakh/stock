@@ -5,9 +5,15 @@ use axum::{
 };
 
 pub fn exchange_routes() -> Router<AppState> {
+    let place_order = post(exchange_controller::place_order);
+    // The order route alone is timed: its middleware stamps each request for the handler.
+    #[cfg(feature = "stage-timing")]
+    let place_order = place_order.layer(axum::middleware::from_fn(
+        crate::exchange::stage_timing::http_layer,
+    ));
     Router::new()
         .route("/deposit", post(exchange_controller::deposit))
-        .route("/orders", post(exchange_controller::place_order))
+        .route("/orders", place_order)
         .route("/orders/cancel", post(exchange_controller::cancel_order))
         .route("/shares/deposit", post(exchange_controller::deposit_shares))
         .route("/balance", get(exchange_controller::get_balance))
