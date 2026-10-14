@@ -1,12 +1,13 @@
-# Project Direction - Milestone 23 (Two Machines) Complete; Next Not Selected
+# Project Direction - Milestone 24 Closed After Part 2; Milestone 25 (Latency) Planned, Not Started
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
 1. `stock-exchange-system-design.md` for the target architecture.
 2. `EXCHANGE_PIPELINE_TODO.md` for the current milestone state.
 3. `SYSTEM_DOCUMENTATION.md` for the code that exists now.
-4. `docs/tasks/` for the per-task write-ups: what each task changed, how, and why.
-5. The current Rust code before making architecture decisions.
+4. `docs/tasks/` for the per-task write-ups of milestones 7 to 23: what each task changed, how, and why.
+5. `docs/milestones/` for milestone 24 onwards: one folder per milestone holding its theory, implementation, measurements and decisions (see "Documentation for this milestone" under milestone 24).
+6. The current Rust code before making architecture decisions.
 
 The repository is a learning stock exchange with an exchange-grade architecture target. Prefer small, tested changes that move toward deterministic, replayable, single-owner processing.
 
@@ -952,6 +953,407 @@ The independent review found the code correct. Its findings: the documents still
 
 Not shown: a power loss, and two machines with their own disks and a real network. Every live figure is two containers on one machine.
 
+## 24. Gateway and Trust Boundary
+
+**Status: closed on 2026-10-14 after Parts 1 and 2 (both complete on 2026-10-12). Parts 3 to 6 were dropped by the owner.** This is a learning project, and custody, KYC and protection against abusive customers are not goals. Unlimited deposits, self-set risk limits, invented symbols and floods are therefore accepted, and remain in Known Prototype Limitations. Parts 1 and 2 stay: Part 1's tools and baseline are the starting point of milestone 25, and Part 2 fixed a performance fault (bcrypt on the threads that serve orders). The decision and its reasoning are in `docs/milestones/24-gateway/decisions.md`. The plan below is kept as it was written, as the record of what was considered.
+
+The owner selected it after a review of the code at commit `27ce277` on `dev-rakh`. Its documents are in their own folder, `docs/milestones/24-gateway/` (see "Documentation for this milestone" below). All seven decisions marked *proposed* below were confirmed by the owner on 2026-10-12 as recommended (`docs/milestones/24-gateway/decisions.md`). Measurements run on the office Ubuntu machine over SSH, as milestones 22 and 23 did.
+
+### Why this milestone
+
+Milestones 8 to 23 made every acknowledged command survive a crash, a torn write, and the loss of a whole machine. The customer API, however, lets any customer change that state in ways no exchange allows, or block every other customer. Checked in the code on 2026-10-12:
+
+- **Anyone can create money and shares.** Registration is open (`POST /users/register`). A registered user can credit themselves any amount of cash (`POST /exchange/deposit`, `exchange_controller::deposit`) and any number of shares in any symbol (`POST /exchange/shares/deposit`). Milestone 9 made trades conserve cash and shares, but nothing guards the deposits themselves. The journal already lists both deposits as "placeholders for real custody".
+- **Anyone can raise their own risk limit.** `POST /exchange/risk/limits` sets the caller's own daily cap. The design calls risk checks a regulatory requirement ("the exchange is a regulated facility, so we need to make sure it runs risk checks"). A check that the checked user can switch off does not meet it.
+- **One customer can block every other customer:**
+  - Deposit until the exchange's total cash, or a symbol's total shares, reaches `u64::MAX`. Milestone 23 part 1 added that guard so that no fill can overflow. After it, every later deposit by anyone is refused, and nothing withdraws.
+  - Rest 200,000 orders (`MAX_RESTING_ORDERS`). After that, every order that would rest is refused with `BookFull`, for everyone, until orders trade, are cancelled, or expire at the close.
+  - Name new symbols. Each symbol ever used keeps an empty book and its execution counter in memory and in every snapshot, so the state grows without limit.
+- **Logins and registrations can stall order entry.** `login` calls `bcrypt::verify`, and `register` calls `bcrypt::hash`, both at `DEFAULT_COST` (12). Each call runs 2^12 = 4,096 rounds of bcrypt's expensive key setup. Both run directly inside an `async fn`, so the call occupies a Tokio worker thread until it finishes. `#[tokio::main]` starts one worker thread per logical CPU it sees: 4 on the office i3-7100 (2 cores, 4 threads). Inside a container that count depends on the container's CPU limits, and Part 1 records it. Those same threads parse and route every order request. A cost-12 bcrypt typically takes a few hundred milliseconds on a desktop CPU. That is an estimate, and Part 1 measures it on the office machine. So about four simultaneous registrations, which need no account at all, could hold every worker thread for that long.
+- **Login reveals which emails have accounts.** It answers "user not found" for an unknown email and "invalid password" for a known one. It also skips bcrypt for an unknown email, so the response time leaks the same fact.
+- **Smaller gateway faults:**
+  - `GET /users/` returns a hard-coded list of two invented users. It is a leftover placeholder.
+  - The JWT check calls `std::env::var("JWT_SECRET")` on every request instead of reading the key once at startup.
+  - Authentication failures at login are answered as validation errors.
+
+The milestone 23 journal had already put "the gateway and trust boundary" first among the candidates. This review confirms that order.
+
+### Why not latency first
+
+This reasoning was given to the owner on 2026-10-12, who had expected latency to be next. It is recorded here with every number and its source so it can be checked later. `00-selection.md` in the milestone folder expands it.
+
+**What the design asks.** The design asks for round-trip latency "at the millisecond level, with a particular focus on the 99th percentile". It measures from the moment an order enters the exchange until its execution returns.
+
+**What was measured.** The figures are from `docs/performance/results/results-m23.txt`, two runs per configuration. The machine is the office Ubuntu machine: two containers sharing its 2 cores and one SATA SSD. Each run is `--bench` at a fixed 5,000 orders/s:
+
+| Configuration | p50 | p99 | p99.9 |
+|---|---|---|---|
+| One machine (alone) | 7.9 / 7.2 ms | 30.4 / 16.7 ms | 65.0 / 27.6 ms |
+| Replicated | 11.4 / 12.4 ms | 28.8 / 49.2 ms | 40.9 / 88.9 ms |
+
+So the median is a few milliseconds, and the p99 is tens of milliseconds. The gap to the design is real, but it is about one order of magnitude, not several.
+
+**Where the CPU time per order goes.** These figures are from `docs/tasks/14-critical-path-performance-v1.md`, "Where the time goes now". They came from an instrumented build in the Docker Desktop VM, at the maximum rate, on disk:
+
+| Step | Time per order |
+|---|---|
+| prepare (risk, wallet, match plan, settlement checks) | 8.8 µs |
+| build envelopes and JSON-encode the record | 6.9 µs |
+| commit to the core | 5.7 µs |
+| journal write and sync, shared across the group | 6.0 µs |
+| mmap publish and callbacks | 3.5 µs |
+| release replies | 0.6 µs |
+
+That is about 31.5 µs of the worker's time per order. These are microseconds, not CPU cycles. About 25.5 µs of it is CPU work. The 6.0 µs sync row is not CPU work: it is the worker idling while the disk syncs, shared across a group of about 1,000 orders. The instrumentation slowed that build to about 36,000 orders/s, so the proportions are more reliable than the sums.
+
+**What each recorded latency item would buy:**
+- **A binary record format** would remove most of the 6.9 µs of JSON, about a quarter of the CPU per order. That raises the maximum rate, which is CPU-bound. At 5,000 orders/s the worker is mostly idle, waiting for the disk. Saving about 7 µs from a median of about 7,500 µs changes the median by about 0.1%.
+- **A pipelined journal sync** lets the worker prepare group N+1 while group N syncs. At the maximum rate the worker sits idle for about 6 ms during each group's sync (`docs/tasks/14`). Overlapping that wait raises throughput and shortens queues under load. At light load it cannot go below one sync, plus one round trip to the replica when replicated. It also lets the in-memory core run further ahead of the disk, which changes the failure rule recorded for milestone 19.
+- **CPU pinning** removes scheduler jitter of the order of microseconds, on machines that have spare cores isolated for the pinned thread. The office machine has 2 physical cores. They are shared by the primary, the replica, the warm replica, the MDP, the reporter, PostgreSQL and the load generator. Pinning the worker there would starve the others, so it is not useful on this hardware.
+
+**Part of the median is unexplained.** In run 1 at 5,000 orders/s, the bench made 8,267 syncs in 20.009 s. That is 413 syncs per second, so one group cycle takes 1 / 413 ≈ 2.42 ms on average and holds 12.1 orders. A simple model of the wait:
+- an order first waits for the group in progress to finish, about half a cycle: ≈ 1.2 ms;
+- then its own group's cycle: ≈ 2.4 ms;
+- plus the generator's timer error, at most 1 ms and about 0.5 ms on average (`docs/performance/00-benchmark-harness.md`).
+
+That totals about 4.1 ms, against a measured median of 7.9 ms: about 3.8 ms unexplained. Run 2 had 7,896 syncs in 20.006 s: 395 per second, a cycle of 2.53 ms, a model of about 4.3 ms, and a measured median of 7.2 ms. That leaves about 2.9 ms unexplained. So about 3–4 ms of the median is not accounted for.
+
+*Corrected after Part 1 (2026-10-12):* the same in-process run on the same machine three days later gave a median of 3.6–3.8 ms and about 0.9 ms unexplained, with no change to the trading path. So the machine's state, not the code, moved the median by a factor of two. See `docs/milestones/24-gateway/00-selection.md`, "Correction after Part 1". This is a crude model, not a measurement. Cycles vary in length, and a long cycle collects more orders. Only a build that timestamps each stage can say where the rest goes.
+
+**What has never been measured:**
+- **The HTTP path.** `--bench` deliberately skips HTTP, JSON request parsing and JWT (`docs/performance/00-benchmark-harness.md`, "What it does not measure"). The design measures from the gateway, so the latency customers actually see is unknown.
+- **The office SSD's raw sync time.** The only raw figure is from the Docker Desktop VM's virtual disk: 1.8 ms at p50 and 22 ms at p99 for a 600-byte write plus `sync_all`.
+- **Real hardware.** Every replicated figure is two containers on one machine with one SSD. There is no run on two machines with their own disks.
+
+**The floor is the disk.** On every `fsync`, a consumer SATA SSD without power-loss protection must make the data durable. For a drive without protected cache, that means writing it to flash. Drives with power-loss protection (most server NVMe drives) can acknowledge the flush from cache that a capacitor protects. Their sync then commonly takes tens of microseconds instead of milliseconds. This is general knowledge about drive classes, not a measurement made here.
+
+**Conclusion.** Latency work now would shave microseconds while the milliseconds sit in the disk. The measurements it needs (the HTTP path, a timed breakdown of each stage, the raw sync of the real disk) do not exist yet. This milestone records the HTTP path and the raw sync as its Part 1 baseline, and the latency milestone can reuse them.
+
+### Goal
+
+- Only the operator can create cash, shares, products and risk limits.
+- Only listed products trade.
+- No single customer can deny service to the others through the customer API.
+- The HTTP path is measured end to end, before and after.
+
+### Behaviour
+
+1. **A product list, journaled.**
+   - New input `ProductListRequested { symbol }` produces `ProductListed { symbol }` or `ProductListingRejected { symbol, reason }`. Reasons: `AlreadyListed`, or a symbol that fails the gateway's identifier rule.
+   - The list is journaled for the same reason as sessions and risk limits. A list read from configuration would make the same journal rebuild different state on a differently configured machine.
+   - Operator port: `POST /products` with `{"symbol":"AAPL"}`, and `GET /products`. Customer port: `GET /exchange/products`.
+   - A symbol's book is created when it is listed, not on first use.
+   - The listing check sits in `prepare_input_event`, the entry point shared by live processing, replay and the warm replica. It refuses three things for an unlisted symbol, each with the reason `UnknownSymbol`:
+     - a new order: `OrderRejected` (409, as for other state-dependent refusals such as `BookFull` and `MarketClosed`);
+     - a share deposit: `SharesDepositRejected`;
+     - a risk limit: a new output, `RiskLimitRejected { user_id, symbol, reason }`, because a risk limit can be refused for the first time.
+   - *Proposed:* no delisting in this milestone, and products carry only a symbol (no tick size or lot size). See decision 1.
+2. **Deposits and risk limits by the operator only.**
+   - Remove the customer routes `POST /exchange/deposit`, `POST /exchange/shares/deposit` and `POST /exchange/risk/limits`.
+   - Add operator routes: `POST /accounts/{user_id}/cash`, `POST /accounts/{user_id}/shares` and `POST /accounts/{user_id}/risk-limits`.
+   - Customers keep the reads: `GET /exchange/balance`, `/exchange/positions` and `/exchange/risk/limits`.
+   - The input events already carry the `user_id`, so this part changes no event and no journal format. Only the operator port can issue them now. The operator port remains loopback-only and unauthenticated, the same trust model as the session commands.
+   - A customer can no longer use up the deposit totals. The operator still can, which is acceptable for a trusted operator.
+   - *Proposed:* the operator handler checks that the user exists in PostgreSQL before it enqueues the command, so that a mistyped user id cannot receive money. The check is not journaled and is not on the trading path. See decision 2.
+3. **A per-user share of the book, journaled.**
+   - Each user may have at most `MAX_RESTING_ORDERS_PER_USER` resting orders. *Proposed:* 2,000, which is 1% of the 200,000-order book. It is a compiled-in constant, like `MAX_RESTING_ORDERS`.
+   - An order that would rest beyond it is refused as `OrderRejected { reason: "UserBookShareExceeded" }` (409). The decision is made in preparation, so replay reaches the same decision.
+   - With deposits by the operator only, a new account has no collateral and can rest nothing. So filling the book with many accounts needs the operator to fund each of them.
+   - Changing the constant later changes replay decisions, like the other compiled-in limits: start a new journal when it changes.
+4. **Rate limiting per user, in the gateway, not journaled.**
+   - Each authenticated user gets a token bucket in the gateway, checked before the command queue.
+   - *Proposed:* writes (orders and cancellations) at 100 per second with a burst of 200. Reads in a separate bucket. Limits per IP address on the unauthenticated `register` and `login`.
+   - A request over its limit gets `429 Too Many Requests` with `Retry-After`. It never reaches the queue.
+   - It is not journaled, and it must not be. The decision depends on arrival times, which replay cannot reproduce. A request refused before the queue changes no state, so replay needs nothing from it.
+   - The map of buckets is bounded: idle entries are evicted.
+   - *Proposed:* a hand-written token bucket of a few dozen lines rather than a new dependency such as `governor`. See decision 5.
+5. **Login and registration hardening.**
+   - Run `bcrypt::hash` and `bcrypt::verify` on Tokio's blocking pool (`spawn_blocking`), so the worker threads that serve orders never run them. *Proposed:* also cap the bcrypt calls in flight with a semaphore, so that bcrypt cannot occupy both cores. See decision 7.
+   - Answer an unknown email and a wrong password the same way: 401 with "invalid email or password". For an unknown email, verify against a fixed dummy hash, so both answers take the same time.
+   - Remove the placeholder `GET /users/`.
+   - Read `JWT_SECRET` once at startup into the application state.
+
+### Parts
+
+Each part goes through code, tests, measurement where relevant, its documents in the milestone folder, and an update to this journal.
+
+1. **Baseline, before any change, on the milestone 23 binary.**
+   - Build an HTTP load generator. It is open loop: each order is timed from its intended send time, which avoids coordinated omission. Latencies go in an HdrHistogram. It drives the real customer port through Axum, JSON and JWT. See decision 6.
+   - Measure order round trips over HTTP at 1,000 and 5,000 orders/s, alone and replicated. Compare them with in-process `--bench` at the same rates: the difference is the gateway's cost.
+   - Measure one cost-12 bcrypt on the office machine.
+   - Measure order latency while N simultaneous registrations and logins run, for several N: the stall.
+   - Measure the office SSD's raw `write` + `sync_all` latency for a 600-byte record, as `docs/performance/00` did on the VM. This gives the later latency milestone its floor.
+2. **Login and registration hardening (behaviour 5).** Measure the stall again against the Part 1 baseline.
+3. **The product list (behaviour 1).**
+   - Snapshot version 6.
+   - The shared decoder yields `ProductListed`.
+   - The MDP serves books only for listed symbols.
+   - The reporter accepts the new events. *Proposed:* no new reporter table (decision 3).
+   - The benchmark lists its symbols before setup.
+4. **Deposits and risk limits by the operator (behaviour 2).** The benchmark is unaffected, because it sends commands in-process. The live scripts in `~/stock-scripts` move to the operator port.
+5. **The per-user book share and rate limiting (behaviours 3 and 4).** Measure the limiter's cost on the HTTP path. Show that a user over the limit does not move other users' latency.
+6. **Final measurement and abuse tests.**
+   - Run Part 1's measurements again on the final binary.
+   - Reproduce every abuse in "Why this milestone" live on the milestone 23 binary. Show the new binary refuses each one, as milestone 23 part 1 did with the sweep and the overflow.
+
+**Why this order:**
+- The baseline must be recorded before anything changes; it cannot be recovered afterwards.
+- Login hardening is the smallest change, and it is measured directly against that baseline.
+- The product list comes before operator share deposits, because a share deposit needs a listed symbol.
+- Rate limiting comes last, because it needs the final set of routes.
+
+### Components
+
+- **Core** (`core.rs`, `order_manager.rs`, `matching_engine.rs`):
+  - the set of listed products, with books created at listing;
+  - a resting-order count per user, rebuilt and validated when a snapshot loads, like the other indexes.
+- **Events** (`exchange_event.rs`): `ProductListRequested`, `ProductListed`, `ProductListingRejected` and `RiskLimitRejected`.
+- **Runtime** (`runtime.rs`, `types.rs`): `ExchangeCommand` variants for listing and reading products, and the listing check in `prepare_input_event`.
+- **Snapshot** (`snapshot.rs`): version 6, holding the product list.
+- **Shared decoder** (`committed_batch.rs`), **MDP** (`market_data.rs`), **reporter** (`reporter.rs`): accept the new events.
+- **Operator port** (`operator.rs`): the product and account routes.
+- **Customer gateway** (`routes/`, `controllers/`, `middleware/`):
+  - remove the write routes for deposits and limits;
+  - add the rate limiter and its 429 answer;
+  - read the key once;
+  - run bcrypt off the worker threads;
+  - give login one uniform answer;
+  - delete `GET /users/`.
+- **Benchmark** (`bench.rs`): list products first. A new HTTP load generator, if decision 6 puts it in the crate.
+
+### Compatibility
+
+The product list changes replay. An old journal holds orders on symbols that were never listed, and a new binary would reject them, so replay stops with an `OutputMismatch`. Start a new journal. Remove the old snapshot, the stream file, the market-data state and the probe checkpoint with it. If the reporter's schema changes, add a migration that empties the report for a rebuild. The primary, the replica and the warm replica must run the same version.
+
+### Completion criteria
+
+- No customer route can create cash, shares, products or risk limits. Those routes no longer exist.
+- The operator can do each of these through the operator port. Replay, snapshots, the warm replica and replication carry every one of them.
+- Orders, share deposits and risk limits on an unlisted symbol are refused and journaled, and replay reaches the same decision. Memory and snapshots no longer grow with symbols that customers invent.
+- No user can rest more than `MAX_RESTING_ORDERS_PER_USER` orders, and replay agrees.
+- A user over the rate limit gets 429, nothing is journaled for it, and other users' latency does not change beyond the noise (measured).
+- Simultaneous registrations and logins do not move order p99 beyond the noise (measured against the Part 1 stall).
+- An unknown email and a wrong password get the same status and the same body.
+- HTTP round-trip latency is measured at the start and the end, beside the in-process bench, on the office machine. The raw sync latency of the office SSD is recorded.
+- Every abuse listed in "Why this milestone" is reproduced live on the milestone 23 binary and refused by the new one.
+- `cargo fmt -- --check`, `cargo test --locked` and the PostgreSQL acceptance tests pass, and an independent review of each part is done.
+- The milestone folder is complete, as "Documentation for this milestone" requires.
+
+### Not in this milestone
+
+- withdrawals;
+- delisting;
+- tick size and lot size, unless decision 1 adds them;
+- operator authentication and an audit of which operator did what (the operator port stays loopback-only and unauthenticated);
+- user roles, KYC, or account approval in PostgreSQL;
+- TLS;
+- pushed updates (WebSocket);
+- latency work: a binary format, a pipelined sync, CPU pinning;
+- web-application-firewall or captcha defences beyond simple limits per IP address;
+- short selling;
+- self-trade prevention by engine-generated cancellation.
+
+### Decisions for the owner
+
+Each decision is confirmed before the part that needs it starts, and is recorded with its date in `decisions.md` in the milestone folder.
+
+1. **Product fields.** Recommended: symbol only. This milestone is about trust, and a tick size changes price validation and the benchmark's workload. Alternative: symbol, tick size and lot size now.
+2. **Unknown user ids on the operator port.** Recommended: check the `users` table before enqueueing. Alternative: accept any id that passes the identifier rule.
+3. **The reporter and listings.** Recommended: no table; the reporter accepts the events and ignores them. Alternative: a `products` table.
+4. **The limits.** `MAX_RESTING_ORDERS_PER_USER` (proposed 2,000). The rates and bursts (proposed 100 writes per second with a burst of 200, reads separate, and limits per IP address for registration and login).
+5. **Rate limiter.** Recommended: hand-written token bucket, because it needs no new dependency and is worth learning. Alternative: the `governor` crate (GCRA).
+6. **HTTP load generator.** Recommended: Rust, inside the crate. The current client is `~/stock-scripts/m23p6-load.py`, which lives outside the repository. A Python client on the same 2-core machine is unlikely to keep accurate open-loop timing at 5,000 orders/s, so it would measure itself. Alternative: extend the Python script.
+7. **Cap on bcrypt calls in flight.** Recommended: yes, with a semaphore. Alternative: rely on the blocking pool alone.
+
+### Documentation for this milestone
+
+The owner's requirement, given on 2026-10-12: learning is the main goal of this project. Everything about this milestone is written down in depth, in its own folder, so that it can be studied cold months later. Nothing is compromised for brevity. Nothing stays only in chat, in a commit message, or in a reviewer's notes. Later milestones use the same layout unless the owner says otherwise.
+
+Folder: `docs/milestones/24-gateway/`. Before the first commit, check that git tracks it (`git check-ignore -v`), because `.gitignore` uses exceptions for some documents.
+
+- **`README.md`.** Reading order, the status of each part, and a short summary of every file.
+- **`00-selection.md`.** Why this milestone and not latency. It expands the two sections above: every number with its source file, the machine and setup it was measured on, and the arithmetic of every derived figure. An example is the 413 syncs per second, the 2.42 ms cycle and the 4.1 ms model.
+- **`01-theory.md`.** All the background needed to read the code without prior context, with worked examples:
+  - trust boundaries, and where each check belongs: in the gateway, or in the deterministic core;
+  - authentication versus authorization;
+  - which decisions are journaled and which must never be, and why replay forces that split;
+  - reference data and listing in real exchanges: security definitions, tick and lot sizes;
+  - rate-limiting algorithms: fixed window, sliding window, token bucket, leaky bucket and GCRA, with their trade-offs;
+  - how real exchanges throttle: message-rate limits and order-to-trade ratios;
+  - password hashing: what bcrypt's cost factor means, the arithmetic of the work factor, and why it is slow on purpose;
+  - async runtimes: Tokio's worker model, why a CPU-bound call inside an `async fn` stalls unrelated requests, and `spawn_blocking`;
+  - user enumeration and timing side channels;
+  - open-loop load testing, coordinated omission, and HdrHistogram;
+  - `fsync`, drive write caches and power-loss protection.
+- **One file per part** (`part-1-baseline.md`, `part-2-login.md`, and so on). Each covers:
+  - what changed, file by file and function by function;
+  - why each choice was made;
+  - every option rejected, and why;
+  - every test added, and what it proves;
+  - every live run, with its exact commands;
+  - compatibility.
+- **`performance/`.** One file per measurement. Each covers:
+  - the question it answers;
+  - the method: machine, CPU, disk, OS, containers, build, exact command lines, workload, rates and number of runs;
+  - tables of results;
+  - the arithmetic of every derived number, shown step by step;
+  - the noise and error bounds, such as the generator's ±1 ms timer;
+  - what the numbers prove and what they do not.
+
+  Raw output goes in `performance/results/` as `.txt` files. `.gitignore` ignores `*.log`, so a raw result saved as `.log` would silently not be committed.
+- **`decisions.md`.** Every owner decision, with its date and the options that were shown.
+- **`glossary.md`.** Every term the other files use: GCRA, coordinated omission, power-loss protection, epoch, and so on.
+
+### Progress
+
+**Part 1, complete (2026-10-12): the baseline, before any change.** Write-up: `docs/milestones/24-gateway/part-1-baseline.md`; measurements in its `performance/01` to `05`, with raw output and the scripts that produced it.
+- **New tools, no change to the exchange's behaviour:**
+  - `stock --http-bench`: an open-loop HTTP load generator. It sends the same orders as `--bench` and adds `--logins`, `--deadline` and a `/health` control.
+  - `stock --sync-probe` and `stock --bcrypt-probe`.
+  - The exchange prints its Tokio worker count at startup.
+  - The scripts now live in the repository.
+- **The disk.** One durable 600-byte append on the office SSD takes 0.80–0.90 ms at p50, 1.31–1.39 ms on average and 5.3–5.5 ms at p99. Almost all of that is the `sync_all`. On tmpfs the same append takes 1.6 µs.
+- **bcrypt.** One call at cost 12 takes 229 ms. The whole machine maxes out at about 15 per second.
+- **HTTP's share.** HTTP adds 0.3–0.9 ms to an order's p50. At 5,000 orders/s it adds 49% to the p99 alone and 71% replicated.
+- **The login stall.** One login loop pushes the order p99 from about 14 ms to 0.1–0.2 s, and four push the p50 to 0.15–0.19 s. With sixteen, connections already open are still served slowly, but new connections, to the operator port too, get no answer for tens of seconds. In one of three runs with eight, a few orders were never answered, so the logins never stopped, and new connections went unserved for the 17 minutes until the run was stopped.
+- **Enumeration.** A login reveals whether an email has an account, by its body and by a 230 ms timing gap.
+- **A correction.** The same in-process bench ran twice as fast as on 2026-10-09, with no change to the trading path. The "3–4 ms unexplained" in "Why not latency first" did not recur, and only same-day comparisons are trustworthy on this machine.
+
+Verified on the office machine: `cargo fmt -- --check`; `cargo test --locked` with 211 unit tests plus the integration tests. An independent review found no code bug. It found ten errors in the documents, all fixed and listed in the write-up. The most important: the "17 minutes with no order journaled" was a misread timestamp. The orders had been journaled, a few were never answered, and so the login loops never stopped.
+
+**Part 2, complete (2026-10-12): login and registration hardening.** Write-up: `docs/milestones/24-gateway/part-2-login.md`; measurements in its `performance/06` and `07`.
+- **bcrypt off the worker threads.** It runs on Tokio's blocking pool, at most `max(1, CPUs / 2)` calls at a time (2 on the office machine). The permit moves into the blocking closure, so a disconnecting client cannot free it while its bcrypt still runs.
+- **One answer for every failed login.** `401 invalid email or password`, after exactly one full bcrypt computation on every path. When the email is unknown, it verifies against a dummy hash computed at the accounts' cost before the port opens.
+- **Smaller fixes.** The JWT key is read once. `GET /users` is gone.
+- **Measured the same hour against the Part 1 binary:**
+  - with 4 or 16 clients logging in back to back, orders keep a p50 of 2.8–4.0 ms and a p99 of 10–19 ms, the same as with no logins (Part 1: 0.21–0.58 s and 0.74–2.64 s);
+  - at C = 16, no connection is refused and nothing goes unanswered (Part 1: 33–1,415 failed connections, 14 unanswered, its container at 383–390% CPU);
+  - logins are capped at 8.1–8.3 per second and wait instead, with the p50 Little's law predicts (1.9 s at C = 16);
+  - known and unknown emails now get the same 401 in the same time (230.5 against 229.9 ms on average; Part 1: 230.3 against 0.59 ms).
+- **The measuring tool had a bug.** Its login loops retried failed logins without yielding, which made the generator spin at 366% CPU in one run. They now back off 10 ms. The C = 16 numbers above were re-measured with the fix, and they confirm Part 1's starvation was the exchange's own.
+- **Not fixed:**
+  - registration still answers `user already exists`;
+  - a failed login now costs a full bcrypt, so fake logins can crowd out real ones until Part 5's per-IP limits.
+
+Verified on the office machine: `cargo fmt -- --check`; `cargo test --locked` with 213 unit tests plus the integration tests. Three mutations, each removing one fix, each make the covering test fail. An independent review found no gateway bug, and its findings were all fixed:
+- an unreadable stored hash answered `400`, revealing the account. It now answers `401`, is logged, and costs one bcrypt, like every other path;
+- the first correction of Part 1's C = 16 rows wrongly blamed a spinning generator; those runs' own CPU figures rule it out.
+
+Rules for every file:
+- every claim that carries a number gives its source: measured in this milestone (which file), an earlier document (file and section), or an outside reference;
+- every derived figure shows its arithmetic;
+- an estimate is labelled as an estimate;
+- the unit is always explicit: µs of CPU time, not "CPU cycles".
+
+## 25. Latency
+
+**Status: planned on 2026-10-14; not started. The owner reviews this plan before any code.** Its documents will go in `docs/milestones/25-latency/`, with the same layout and depth rules as milestone 24 (see milestone 24, "Documentation for this milestone"). The decisions marked *proposed* need the owner's confirmation before the part that uses them.
+
+### Why this milestone
+
+- The owner's own interest.
+- The design asks for round-trip latency "at the millisecond level, with a particular focus on the 99th percentile".
+- Milestone 24 part 1 built the measurement base this milestone needs:
+  - `--http-bench` drives real HTTP traffic, with a `/health` control;
+  - `--sync-probe` measures the disk alone;
+  - the scripts run on the office machine.
+
+What is known, measured on the office machine on 2026-10-12 (`docs/milestones/24-gateway/performance/`):
+- **The disk.** One durable 600-byte append takes 0.80–0.90 ms at p50, 1.31–1.39 ms on average and 5.3–5.5 ms at p99. Almost all of it is `sync_all`; on tmpfs it takes 1.6 µs.
+- **At 5,000 orders/s, alone, in-process:** p50 3.6–3.8 ms and p99 about 19 ms. The group cycle is 1.46–1.65 ms, and the flush is about 80–90% of it.
+- **Through HTTP**, the p50 is 0.3–0.9 ms higher. The p99 is 49% higher alone and 71% higher replicated, likely from CPU contention (not measured).
+- **A simple model leaves about 0.9 ms of the median unexplained** at 5,000/s. On 2026-10-09 the same model left 3–4 ms, which did not recur.
+- **The CPU work per order** is about 25.5 µs in the Docker Desktop VM (`docs/tasks/14`). JSON encoding is about 6.9 µs of it.
+- **The machine is shared and noisy.** Its speed differed by a factor of two between two days, so every comparison must be made on the same day, interleaved, over several runs.
+
+The current group commit (`ExchangeRuntime::run`, `handle_group`, `flush` in `runtime.rs`):
+1. The worker takes every queued command, up to 1,024.
+2. It prepares and commits each one in memory.
+3. It writes all their records with one `write_all` and one `sync_all`. When replicated, it ships them to the replica while it syncs, and waits for the replica's confirmation.
+4. It publishes each batch to the mmap stream and runs the callbacks.
+5. It releases every held reply.
+6. Only then does it take the next group.
+
+During step 3 the worker does nothing: on the office SSD that is about 1.3 ms on average and 5 ms at p99, per group.
+
+### Goal
+
+Know, stage by stage, where an order's time goes, then shorten the stages that dominate. The rule is never to optimize a stage that has not been measured. Durable-before-visible must hold throughout: no reply, read, publication or callback may reveal a command before the disk holds it, or both disks when replicated.
+
+### Parts
+
+1. **Where the time goes.**
+   - **What to time.** Each order's progress through every stage:
+     - the HTTP handler receives it;
+     - it enters the command queue;
+     - the worker dequeues it;
+     - prepare ends;
+     - its record is encoded;
+     - it is committed in memory;
+     - its group's `write_all` ends;
+     - its group's `sync_all` ends;
+     - the replica confirms (when replicated);
+     - it is published to the mmap stream;
+     - its reply is sent;
+     - its HTTP response is written.
+
+     Also, per group: its size, its sync time, and its confirmation time.
+   - **How it is reported.** Percentiles per stage, so that the sum of the stage medians can be compared with the measured end-to-end median.
+   - **What it should answer.** Where the unexplained part of the median goes, how much is queueing (waiting for the group in progress), and what share of the p99 is the disk.
+   - *Proposed:* the timing is compiled in only with a cargo feature (`stage-timing`). The normal build is then unchanged and pays nothing, and the cost of the timing itself can be measured by comparing the two builds. See decision 1.
+2. **A pipelined journal sync.**
+   - **The change.** A second thread does the `sync_all` (and the replica's confirmation) of group N, while the worker stages group N+1. The replies, reads, publication and callbacks of group N are released only when group N is durable, and always in group order.
+   - **Expected effect.** Higher maximum throughput (the worker no longer idles during a sync), and shorter queues, so a lower p99, under load. The p50 at light load cannot fall below one sync, plus one round trip when replicated.
+   - **Pipeline depth.** *Proposed:* depth 2: one group syncing while one is staged; the worker waits if both slots are full. See decision 2.
+   - **The failure rule.** It is milestone 19's rule extended: after a failed sync, the in-memory core may be up to two groups ahead of the disk. The worker halts, neither group is answered, and only a restart that recovers from the journal goes on. The tests of milestone 19's group commit are reworked for two groups in flight.
+3. **A binary record format, only if Part 1 shows JSON encoding matters.**
+   - **Expected effect.** It replaces JSON in the journal record, about 6.9 µs of CPU per order, which mainly raises the maximum rate.
+   - **What it changes.**
+     - The journal format, with a new magic (`EXCHLOG3`): start a new journal.
+     - Every reader of records: recovery, the replica's checks, the mmap stream, the shared decoder, the MDP, the reporter and the probe.
+   - **The format.** *Proposed:* decided at this part, from what Part 1 measures. The options are a hand-written fixed layout, or a crate such as `postcard` or `bincode`. See decision 3.
+   - If Part 1 shows encoding is a small share of what dominates, this part is dropped and the reason recorded.
+4. **Final measurement.**
+   - **What is compared:**
+     - the milestone 24 part 2 binary against the final binary;
+     - on the same day, interleaved;
+     - in-process and HTTP;
+     - alone and replicated;
+     - at 1,000 and 5,000 orders/s, and at the maximum rate in-process.
+
+     *Proposed:* three runs per configuration instead of two (decision 4).
+   - **tmpfs runs** separate the software's share from the disk's.
+   - **CPU of each container** is sampled during the HTTP runs, to settle milestone 24's open question of CPU contention in the tail.
+
+### Decisions for the owner
+
+1. **How the stage timing is built in.** Recommended: a cargo feature, off by default. Alternative: always on, which has a measurable cost on every order.
+2. **The pipeline depth.** Recommended: 2 (one group syncing, one staging). Alternative: deeper. That needs more memory held ahead of the disk, a harder failure rule, and gains little when one sync is already shared by many commands.
+3. **The binary format** (only if Part 3 goes ahead). Hand-written, or a crate. Decided after Part 1.
+4. **Runs per configuration.** Recommended: 3. Alternative: 2, as in milestone 24, which proved too few to settle the tails.
+
+### Completion criteria
+
+- A stage-by-stage breakdown of an order exists for in-process and HTTP, alone and replicated, at 1,000 and 5,000 orders/s. The sum of its stage medians accounts for the measured end-to-end median, and any remainder is stated.
+- **Pipelined sync behaviour:**
+  - durable-before-visible holds: tests prove that no reply, read, publication or callback of group N happens before group N, and every group before it, is durable;
+  - a failed sync with a second group in flight answers neither group, halts the worker, and recovers from the journal;
+  - replication still never acknowledges a command one machine lacks.
+- **Pipelined sync results:** the maximum rate and the p99 at 5,000 orders/s are measured against the milestone 24 part 2 binary, on the same day, with three runs each. Either the improvement is beyond the spread between runs, or the reason it is not is explained.
+- **The binary format:** either built and measured, or dropped with Part 1's numbers as the reason.
+- `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests, and an independent review of each part all pass.
+- `docs/milestones/25-latency/` is complete, written in depth.
+
+### Not in this milestone
+
+- CPU pinning: the office machine has 2 cores shared with about 30 containers;
+- lock-free ring buffers or Crossbeam in place of the command queue;
+- new threads for trading components, other than the one sync thread;
+- per-symbol workers;
+- mmap ingress;
+- FIX or SBE;
+- new hardware. A server SSD with power-loss protection would lower the floor by about two orders of magnitude; that is recorded as the largest lever, but it is outside the software.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -997,16 +1399,20 @@ Not shown: a power loss, and two machines with their own disks and a real networ
 - a promotion binds the customer, operator and replication ports only after it has fenced the old primary: a port already in use then leaves no primary until the operator starts one
 - if the stream's writer (the primary, or the replica process on the second machine) dies while publishing, leaving the ready marker cleared, a running warm replica waits where it is and can still be promoted (milestone 23 part 6), but a warm replica *started* then refuses to start, and the market-data process and the reporter stop; restarting the writer repairs the stream from the journal
 - the warm replica's management API is unauthenticated and loopback-only; `202` from `/promote` means the old writer is fenced, not that the customer listener is ready
+- registration answers `user already exists` for a taken email, so it reveals which emails have accounts. Login no longer does (milestone 24 part 2). Fixing registration needs email verification, which the project does not have
+- every login and registration costs one bcrypt at cost 12 (about 229 ms of CPU on the office machine), at most `max(1, CPUs / 2)` at a time. That is about 8 per second on the office machine, and nothing limits who uses that capacity: a flood of fake logins makes real users' logins wait, though orders are unaffected. Rate limits were planned in milestone 24 part 5 and dropped by the owner
 - the crate uses Unix-only APIs (advisory file locks, positioned reads, mmap) and builds and tests on Linux only
 - the reporter applies about 1,600 commands/s: it keeps up at 1,000 orders/s but falls behind a sustained faster exchange and catches up afterwards; set-based writes or `COPY` are the next lever
 
 ## What Not To Work On Yet
 
-Milestone 23, two machines, is complete; no next milestone is selected yet, which is the owner's call. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it. After milestone 23, the recorded candidates in order are:
-1. the gateway and trust boundary: risk limits and deposits set by the operator only, a product list so that only listed symbols trade, and per-user rate limiting;
-2. set-based reporter writes or `COPY`;
-3. pushed updates (WebSocket) of a user's own fills and the L2 book;
-4. latency: a binary record format instead of JSON, a pipelined journal sync, and CPU pinning.
+Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, is planned and awaits the owner's review of its plan. Do not start any other candidate while it is open. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
+
+After milestone 25, the remaining candidates (the owner selects):
+1. **Pushed updates (WebSocket)** of a user's own fills and the L2 book. The design requires that a client "receive matched trades in real-time" and "view the real-time order book". Today clients must poll, so a functional requirement is unmet.
+2. **Set-based reporter writes or `COPY`.** The reporter applies about 1,600 commands/s against the exchange's 35,000+. It is off the trading path and catches up afterwards, so this matters only at sustained volume.
+
+Custody, KYC, operator-only deposits, rate limits and other protection against abusive customers are not goals of this learning project (owner, 2026-10-14).
 
 The same restraint applies to tax or customer statements, settlement, broad historical-market-data APIs, journal compaction, Crossbeam, lock-free ring buffers, new trading-component threads, per-symbol workers, and FIX/SBE. The committed mmap reader remains the input for all independent subscribers and for the warm follower; inbound commands remain on the existing bounded Tokio queue.
 
@@ -1020,7 +1426,9 @@ Discuss architecture before implementation. If a suggestion conflicts with the t
 
 Every completed task produces two documents, not just code:
 
-1. A new numbered write-up in `docs/tasks/` covering what the task was, how it was done, and the reasoning behind each decision — including the options that were rejected and why. Write it so it can be read cold, months later, without the conversation that produced it.
+1. A new numbered write-up covering what the task was, how it was done, and the reasoning behind each decision — including the options that were rejected and why. Write it so it can be read cold, months later, without the conversation that produced it. Up to milestone 23 these went in `docs/tasks/`. From milestone 24 on, each milestone has its own folder, `docs/milestones/NN-name/`, with the layout and rules given under milestone 24's "Documentation for this milestone": a README, the selection reasoning, the theory, one file per part, a `performance/` folder with raw results, the decisions, and a glossary.
 2. An update to this journal recording the milestone.
+
+Learning is the main goal of this project. Write in depth, never in summary. Every number gives its source and its unit, and every derived figure shows its arithmetic. Every estimate says it is an estimate. An analysis given only in conversation (for example, "a binary format saves about 7 µs per order") must also be written into the milestone folder, with its source and its reasoning.
 
 Do not claim a milestone here before `cargo fmt -- --check` and `cargo test` both pass. Prefer checking behavior against a running server over trusting unit tests alone; a passing test on unreachable code is what this project has already been caught doing once.

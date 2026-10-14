@@ -440,6 +440,28 @@ Milestone 23, selected on 2026-10-05 and complete on 2026-10-09. The specificati
 - [x] Part 6 (2026-10-09): measurement and failure tests. The warm replica now waits out an interrupted stream publication instead of stopping, so it stays promotable when the replica process is killed while publishing (`PublicationInterrupted`, `stream_interrupted` on `/status`). Live on two containers with 16 HTTP customers: the primary killed under load ten times, five of them after a network cut; all 83,186 acknowledged orders on B, B's journal a byte-identical prefix of A's, A's unconfirmed tail (up to 7.1 KB) cut on rejoining; promote request to first accepted order 26 to 74 ms, median 42 ms. Replica killed and network cut under load: nothing acknowledged until the operator acted or the replica was back. Throughput 45,000 to 56,000 orders/s alone, 34,000 to 36,000 replicated (`docs/performance/11-failover-under-load.md`). Independent review done, findings fixed except one, recorded in the write-up (a warm replica started on an interrupted stream still refuses to start).
 - [x] `PROJECT_DIRECTION.md` updated after every part; an independent review of each part; `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests.
 
-## Next Milestone
+## Closed Milestone - Gateway and Trust Boundary
 
-Not selected yet; that is the owner's call. The recorded candidates, in order, are in `PROJECT_DIRECTION.md` ("What Not To Work On Yet").
+Milestone 24, selected on 2026-10-12, closed on 2026-10-14 after Part 2. The owner dropped Parts 3 to 6: protection against abusive customers is not a goal of this learning project. The specification and the record of what was done are in `PROJECT_DIRECTION.md` ("24. Gateway and Trust Boundary") and `docs/milestones/24-gateway/` (this milestone does not use `docs/tasks/` or `docs/performance/`).
+
+- [x] Create `docs/milestones/24-gateway/` with `README.md`, `00-selection.md`, `01-theory.md`, `decisions.md` and `glossary.md`. Check git tracks it (`git check-ignore -v`).
+- [x] Part 1 (2026-10-12): baseline on the milestone 23 binary, before any change:
+  - an open-loop HTTP load generator with HdrHistogram;
+  - HTTP against in-process latency at 1,000 and 5,000 orders/s, alone and replicated;
+  - the cost of one bcrypt call, and the stall it causes during simultaneous logins and registrations;
+  - the office SSD's raw sync latency.
+- [x] Part 2 (2026-10-12): bcrypt on the blocking pool, capped at half the CPUs (decision 7); one uniform login answer with a dummy-hash verify; delete `GET /users/`; read `JWT_SECRET` once. Measure the stall again.
+- Dropped (owner, 2026-10-14): Part 3, the journaled product list; Part 4, deposits and risk limits on the operator port only; Part 5, the per-user book share and rate limits; Part 6, the final measurement and abuse tests of those changes.
+- [x] For each completed part: a part file and its `performance/` files written in depth; this checklist and `PROJECT_DIRECTION.md` updated; `cargo fmt -- --check`, `cargo test --locked`, and an independent review.
+
+## Planned Milestone - Latency
+
+Milestone 25, planned on 2026-10-14. The owner reviews the plan in `PROJECT_DIRECTION.md` ("25. Latency") before any code. Documents go in `docs/milestones/25-latency/`.
+
+- [ ] The owner reviews the plan and confirms decisions 1–4.
+- [ ] Create `docs/milestones/25-latency/` (README, selection, theory, decisions, glossary).
+- [ ] Part 1: a stage-by-stage timing of an order (in-process and HTTP, alone and replicated), with the stage medians summing to the end-to-end median.
+- [ ] Part 2: a pipelined journal sync, with durable-before-visible and the failure rule proven by tests.
+- [ ] Part 3: a binary record format, only if Part 1 shows JSON encoding matters; otherwise dropped, with the reason.
+- [ ] Part 4: final measurement against the milestone 24 part 2 binary, on the same day, interleaved, with three runs per configuration, tmpfs runs, and per-container CPU.
+- [ ] For each part: a part file and its `performance/` files written in depth; this checklist and `PROJECT_DIRECTION.md` updated; `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests and an independent review.

@@ -75,6 +75,27 @@ async fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--http-bench") {
+        if let Err(error) = exchange::http_bench::run(&args[1..]).await {
+            eprintln!("http-bench: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.first().is_some_and(|arg| arg == "--sync-probe") {
+        if let Err(error) = exchange::probes::sync_probe(&args[1..]) {
+            eprintln!("sync-probe: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.first().is_some_and(|arg| arg == "--bcrypt-probe") {
+        if let Err(error) = exchange::probes::bcrypt_probe(&args[1..]) {
+            eprintln!("bcrypt-probe: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--replica") {
         // The second machine's copy of the journal: it has no exchange core, no customer port
         // and no database. It runs until the primary refuses it.
@@ -134,7 +155,7 @@ async fn main() {
     }
     if !args.is_empty() {
         eprintln!(
-            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --replica PRIMARY_ADDR JOURNAL STREAM | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR] | --bench EMPTY_DIR [OPTIONS]]"
+            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --replica PRIMARY_ADDR JOURNAL STREAM | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR] | --bench EMPTY_DIR [OPTIONS] | --http-bench [OPTIONS] | --sync-probe EMPTY_DIR [OPTIONS] | --bcrypt-probe [OPTIONS]]"
         );
         std::process::exit(1);
     }
@@ -280,7 +301,16 @@ async fn serve_primary(
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 4000));
 
+    // The dummy password hash every login for an unknown email checks against: one bcrypt, done
+    // now so that no customer's login pays for it.
+    controllers::user_controller::prepare().await;
     let listener = TcpListener::bind(&addr).await.unwrap();
+    // Every customer request is parsed, checked and answered on these threads, so their number
+    // bounds how many slow calls (such as a bcrypt) can run before the whole gateway waits.
+    println!(
+        "Tokio worker threads: {}",
+        tokio::runtime::Handle::current().metrics().num_workers()
+    );
     println!("Server is listening on port 4000");
     axum::serve(listener, app).await.unwrap();
 }

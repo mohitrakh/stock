@@ -34,8 +34,13 @@ use crate::{
 const USAGE: &str = "usage: stock --bench EMPTY_DIR [--orders N_PER_DAY] [--days N] [--rate ORDERS_PER_SEC|0] [--symbols N] [--users N] [--depth RESTING_ORDERS_PER_SYMBOL]";
 
 /// Every measured order is priced inside this band, so roughly half of them cross.
-const BAND_LOW: u64 = 1_000;
-const BAND_TICKS: u64 = 20;
+pub(crate) const BAND_LOW: u64 = 1_000;
+pub(crate) const BAND_TICKS: u64 = 20;
+/// The generator's seed, and each user's setup deposits. `--http-bench` uses the same values, so
+/// both benchmarks send exactly the same orders and can be compared order for order.
+pub(crate) const SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+pub(crate) const CASH_PER_USER: u64 = 1_000_000_000_000_000;
+pub(crate) const SHARES_PER_SYMBOL: u64 = 1_000_000_000;
 /// `--depth` orders rest far above the band: they never trade, they only make the book deep.
 const DEPTH_PRICE: u64 = 1_000_000;
 
@@ -83,10 +88,10 @@ fn parse(args: &[String]) -> Result<Config, String> {
 }
 
 /// xorshift64: deterministic, so every run sends exactly the same orders.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn below(&mut self, bound: u64) -> u64 {
+    pub(crate) fn below(&mut self, bound: u64) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -222,7 +227,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         funded.push(
             send(&tx, |respond_to| ExchangeCommand::Deposit {
                 user_id: user.clone(),
-                amount: 1_000_000_000_000_000,
+                amount: CASH_PER_USER,
                 respond_to,
             })
             .await?,
@@ -232,7 +237,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
                 send(&tx, |respond_to| ExchangeCommand::DepositShares {
                     user_id: user.clone(),
                     symbol: symbol.clone(),
-                    quantity: 1_000_000_000,
+                    quantity: SHARES_PER_SYMBOL,
                     respond_to,
                 })
                 .await?,
@@ -255,7 +260,7 @@ pub async fn run(args: &[String]) -> Result<(), String> {
             .map(|metadata| metadata.len())
             .map_err(|e| e.to_string())
     };
-    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let mut rng = Rng(SEED);
     let mut latency = Histogram::<u64>::new(3).map_err(|e| e.to_string())?;
     let mut rejected = 0u64;
     // Totals over the measured order phases only: no open, close or depth setup.

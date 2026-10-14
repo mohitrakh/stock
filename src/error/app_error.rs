@@ -9,6 +9,8 @@ pub enum AppError {
     Unavailable(String),
     /// The request collided with state that already exists — today, a reused client order id.
     Conflict(String),
+    /// The caller could not be authenticated: a failed login.
+    Unauthorized(String),
 }
 
 impl From<sqlx::Error> for AppError {
@@ -33,6 +35,8 @@ impl IntoResponse for AppError {
             AppError::Unavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg).into_response(),
 
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg).into_response(),
+
+            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg).into_response(),
         }
     }
 }

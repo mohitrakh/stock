@@ -1,0 +1,42 @@
+### m24p1-control: 2 run(s) of each, /scripts/stock-m24p1, 2026-10-12T17:14:34+05:30
+### health control, rate 1000, run 1: --http-bench --target health --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:14:36+05:30: loadavg 3.51 11.46 16.42, containers running 31
+http-bench: 20000 GET /health requests (control), rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.001 s
+  latency us : p50 987  p90 1562  p99 2999  p99.9 5851  max 11623
+  send lag us: p50 688  p90 1086  p99 1455  p99.9 3541  max 6155
+  statuses   : 200 x 20000
+  errors     : 0
+  client cpu : 331.5 us per order, 33% of one hardware thread (user + system, includes the login loops)
+### health control, rate 1000, run 2: --http-bench --target health --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:14:58+05:30: loadavg 2.79 10.79 16.09, containers running 31
+http-bench: 20000 GET /health requests (control), rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.001 s
+  latency us : p50 1096  p90 1641  p99 2159  p99.9 7315  max 22559
+  send lag us: p50 806  p90 1193  p99 1457  p99.9 3297  max 7643
+  statuses   : 200 x 20000
+  errors     : 0
+  client cpu : 325.0 us per order, 32% of one hardware thread (user + system, includes the login loops)
+### health control, rate 5000, run 1: --http-bench --target health --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:15:20+05:30: loadavg 2.51 10.20 15.78, containers running 31
+http-bench: 100000 GET /health requests (control), rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 5000 orders/s over 20.001 s
+  latency us : p50 1637  p90 2705  p99 6375  p99.9 21983  max 37919
+  send lag us: p50 1010  p90 1771  p99 2423  p99.9 8199  max 12607
+  statuses   : 200 x 100000
+  errors     : 0
+  client cpu : 183.0 us per order, 91% of one hardware thread (user + system, includes the login loops)
+### health control, rate 5000, run 2: --http-bench --target health --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:15:42+05:30: loadavg 2.54 9.59 15.43, containers running 31
+http-bench: 100000 GET /health requests (control), rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 5000 orders/s over 20.001 s
+  latency us : p50 1565  p90 2591  p99 5967  p99.9 52607  max 76671
+  send lag us: p50 1009  p90 1739  p99 2289  p99.9 10911  max 17343
+  statuses   : 200 x 100000
+  errors     : 0
+  client cpu : 165.3 us per order, 83% of one hardware thread (user + system, includes the login loops)
+### done

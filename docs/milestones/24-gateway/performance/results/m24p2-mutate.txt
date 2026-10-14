@@ -1,0 +1,5 @@
+### m24p2-mutate: 2026-10-12T17:55:32+05:30
+  bcrypt inline on the worker (no spawn_blocking) -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.12s (bcrypt_work_runs_off_the_worker_threads)
+  no cap (permit not taken) -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.03s (bcrypt_work_runs_off_the_worker_threads)
+  dummy hash at a lower cost -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 213 filtered out; finished in 0.00s (the_dummy_hash_is_a_real_hash)
+### done

@@ -1,0 +1,67 @@
+### m24p1-probes: /scripts/stock-m24p1, 2026-10-12T16:46:00+05:30
+# host 2026-10-12T16:46:00+05:30: loadavg 1.45 2.04 1.66, containers running 30
+### sync, named volume, run 1
+# host 2026-10-12T16:46:00+05:30: loadavg 1.81 2.11 1.68, containers running 30
+sync-probe: 10000 appends of 600 bytes to /data/p/sync-probe.dat, write_all + sync_all each
+  write_all : n 10000  mean 21.3  p50 15  p90 43  p99 79  p99.9 148  max 240  (us)
+  sync_all  : n 10000  mean 1296.7  p50 780  p90 3171  p99 5219  p99.9 7923  max 15527  (us)
+  total     : n 10000  mean 1318.5  p50 801  p90 3205  p99 5267  p99.9 7959  max 15551  (us)
+  rate      : 758 durable appends/s over 13.198 s
+### sync, named volume, run 2
+# host 2026-10-12T16:46:14+05:30: loadavg 1.76 2.09 1.68, containers running 30
+sync-probe: 10000 appends of 600 bytes to /data/p/sync-probe.dat, write_all + sync_all each
+  write_all : n 10000  mean 23.9  p50 20  p90 44  p99 79  p99.9 184  max 303  (us)
+  sync_all  : n 10000  mean 1360.6  p50 880  p90 3003  p99 5463  p99.9 8703  max 25903  (us)
+  total     : n 10000  mean 1385.0  p50 904  p90 3037  p99 5503  p99.9 8711  max 25935  (us)
+  rate      : 721 durable appends/s over 13.864 s
+### sync, named volume, run 3
+# host 2026-10-12T16:46:28+05:30: loadavg 1.87 2.10 1.69, containers running 30
+sync-probe: 10000 appends of 600 bytes to /data/p/sync-probe.dat, write_all + sync_all each
+  write_all : n 10000  mean 22.1  p50 19  p90 41  p99 72  p99.9 160  max 587  (us)
+  sync_all  : n 10000  mean 1283.2  p50 877  p90 2711  p99 5327  p99.9 6699  max 24095  (us)
+  total     : n 10000  mean 1305.8  p50 904  p90 2737  p99 5359  p99.9 6803  max 24143  (us)
+  rate      : 765 durable appends/s over 13.071 s
+### sync, tmpfs
+# host 2026-10-12T16:46:42+05:30: loadavg 2.63 2.26 1.75, containers running 30
+sync-probe: 10000 appends of 600 bytes to /data/p/sync-probe.dat, write_all + sync_all each
+  write_all : n 10000  mean 0.9  p50 1  p90 2  p99 3  p99.9 7  max 53  (us)
+  sync_all  : n 10000  mean 0.1  p50 0  p90 0  p99 1  p99.9 7  max 71  (us)
+  total     : n 10000  mean 1.6  p50 1  p90 2  p99 4  p99.9 16  max 72  (us)
+  rate      : 437274 durable appends/s over 0.023 s
+### bcrypt, cost 12, 1 thread
+# host 2026-10-12T16:46:42+05:30: loadavg 2.63 2.26 1.75, containers running 30
+bcrypt-probe: cost 12 (2^12 = 4096 key-schedule rounds), 1 thread(s) x 20 hashes and 20 verifies; available_parallelism 4
+  hash      : n 20  mean 230566.4  p50 228735  p90 233855  p99 251391  p99.9 251391  max 251391  (us)
+  verify    : n 20  mean 228940.8  p50 228607  p90 229887  p99 233215  p99.9 233215  max 233215  (us)
+  rate      : 4.35 bcrypt calls/s in total over 9.191 s
+### bcrypt, cost 12, 2 threads at once
+# host 2026-10-12T16:46:52+05:30: loadavg 2.83 2.32 1.77, containers running 30
+bcrypt-probe: cost 12 (2^12 = 4096 key-schedule rounds), 2 thread(s) x 5 hashes and 5 verifies; available_parallelism 4
+  hash      : n 10  mean 239308.8  p50 231039  p90 257663  p99 260991  p99.9 260991  max 260991  (us)
+  verify    : n 10  mean 232652.8  p50 230399  p90 238463  p99 241407  p99.9 241407  max 241407  (us)
+  rate      : 8.42 bcrypt calls/s in total over 2.374 s
+### bcrypt, cost 12, 4 threads at once
+# host 2026-10-12T16:46:56+05:30: loadavg 2.76 2.31 1.77, containers running 30
+bcrypt-probe: cost 12 (2^12 = 4096 key-schedule rounds), 4 thread(s) x 5 hashes and 5 verifies; available_parallelism 4
+  hash      : n 20  mean 260272.0  p50 254463  p90 279295  p99 299775  p99.9 299775  max 299775  (us)
+  verify    : n 20  mean 253900.8  p50 247551  p90 269567  p99 302079  p99.9 302079  max 302079  (us)
+  rate      : 15.42 bcrypt calls/s in total over 2.593 s
+### bcrypt, cost 12, 8 threads at once
+# host 2026-10-12T16:46:59+05:30: loadavg 2.76 2.31 1.77, containers running 30
+bcrypt-probe: cost 12 (2^12 = 4096 key-schedule rounds), 8 thread(s) x 5 hashes and 5 verifies; available_parallelism 4
+  hash      : n 40  mean 508571.2  p50 506879  p90 643583  p99 757247  p99.9 757247  max 757247  (us)
+  verify    : n 40  mean 501480.0  p50 501503  p90 669695  p99 769535  p99.9 769535  max 769535  (us)
+  rate      : 15.10 bcrypt calls/s in total over 5.298 s
+### bcrypt, cost 10, 1 thread
+# host 2026-10-12T16:47:05+05:30: loadavg 3.18 2.41 1.81, containers running 30
+bcrypt-probe: cost 10 (2^10 = 1024 key-schedule rounds), 1 thread(s) x 10 hashes and 10 verifies; available_parallelism 4
+  hash      : n 10  mean 57558.4  p50 57247  p90 58399  p99 58783  p99.9 58783  max 58783  (us)
+  verify    : n 10  mean 58048.0  p50 58079  p90 58879  p99 59007  p99.9 59007  max 59007  (us)
+  rate      : 17.30 bcrypt calls/s in total over 1.156 s
+### bcrypt, cost 11, 1 thread
+# host 2026-10-12T16:47:07+05:30: loadavg 3.09 2.40 1.81, containers running 30
+bcrypt-probe: cost 11 (2^11 = 2048 key-schedule rounds), 1 thread(s) x 10 hashes and 10 verifies; available_parallelism 4
+  hash      : n 10  mean 115097.6  p50 115071  p90 115519  p99 116927  p99.9 116927  max 116927  (us)
+  verify    : n 10  mean 114880.0  p50 114687  p90 115391  p99 116159  p99.9 116159  max 116159  (us)
+  rate      : 8.69 bcrypt calls/s in total over 2.300 s
+### done

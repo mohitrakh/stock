@@ -1,0 +1,100 @@
+### m24p2-stall: 2 run(s) of each, 2026-10-12T17:58:15+05:30
+### stock-m24p1, logins 0, run 1: --http-bench --orders 20000 --rate 1000 --logins 0 --deadline 120
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:58:17+05:30: loadavg 1.55 2.04 3.61, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.006 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 6075  p90 9647  p99 13951  p99.9 22463  max 29631
+  send lag us: p50 1105  p90 1627  p99 1900  p99.9 3703  max 6883
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 346.5 us per order, 35% of one hardware thread (user + system, includes the login loops)
+### stock-m24p2, logins 0, run 1: --http-bench --orders 20000 --rate 1000 --logins 0 --deadline 120
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:58:42+05:30: loadavg 1.63 2.02 3.56, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.003 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 5843  p90 8935  p99 12799  p99.9 21823  max 31199
+  send lag us: p50 977  p90 1489  p99 1713  p99.9 3015  max 5643
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 352.5 us per order, 35% of one hardware thread (user + system, includes the login loops)
+### stock-m24p1, logins 0, run 2: --http-bench --orders 20000 --rate 1000 --logins 0 --deadline 120
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:59:06+05:30: loadavg 2.21 2.13 3.57, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.009 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 4363  p90 8783  p99 14535  p99.9 47487  max 65791
+  send lag us: p50 1162  p90 1692  p99 2006  p99.9 3543  max 6623
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 312.5 us per order, 31% of one hardware thread (user + system, includes the login loops)
+### stock-m24p2, logins 0, run 2: --http-bench --orders 20000 --rate 1000 --logins 0 --deadline 120
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:59:30+05:30: loadavg 2.43 2.20 3.55, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.001 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 4723  p90 8839  p99 14407  p99.9 24783  max 32895
+  send lag us: p50 1038  p90 1552  p99 1755  p99.9 3367  max 4787
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 298.5 us per order, 30% of one hardware thread (user + system, includes the login loops)
+### stock-m24p1, logins 4, run 1: --http-bench --orders 20000 --rate 1000 --logins 4 --deadline 120
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:59:53+05:30: loadavg 2.78 2.31 3.55, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 4 login loop(s), against http://127.0.0.1:4000
+  throughput : 979 orders/s over 20.433 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 214399  p90 462591  p99 741887  p99.9 982527  max 1001471
+  send lag us: p50 1474  p90 1945  p99 2441  p99.9 4095  max 6575
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 90.5 us per order, 9% of one hardware thread (user + system, includes the login loops)
+  logins     : 294 succeeded (14.4/s), 0 failed; latency us p50 261247  p90 319487  p99 495103  p99.9 528895  max 528895
+### stock-m24p2, logins 4, run 1: --http-bench --orders 20000 --rate 1000 --logins 4 --deadline 120
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T18:00:18+05:30: loadavg 3.47 2.51 3.58, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 4 login loop(s), against http://127.0.0.1:4000
+  throughput : 999 orders/s over 20.017 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 3831  p90 7915  p99 18831  p99.9 117311  max 137215
+  send lag us: p50 1402  p90 1907  p99 2297  p99.9 3829  max 4891
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 96.0 us per order, 10% of one hardware thread (user + system, includes the login loops)
+  logins     : 163 succeeded (8.1/s), 0 failed; latency us p50 479487  p90 526847  p99 574463  p99.9 580095  max 580095
+### stock-m24p1, logins 4, run 2: --http-bench --orders 20000 --rate 1000 --logins 4 --deadline 120
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T18:00:41+05:30: loadavg 3.82 2.68 3.61, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 4 login loop(s), against http://127.0.0.1:4000
+  throughput : 973 orders/s over 20.558 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 254207  p90 568831  p99 872447  p99.9 1056767  max 1193983
+  send lag us: p50 1204  p90 1671  p99 2803  p99.9 3983  max 5035
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 92.0 us per order, 9% of one hardware thread (user + system, includes the login loops)
+  logins     : 295 succeeded (14.3/s), 0 failed; latency us p50 259711  p90 324607  p99 503807  p99.9 739327  max 739327
+### stock-m24p2, logins 4, run 2: --http-bench --orders 20000 --rate 1000 --logins 4 --deadline 120
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T18:01:06+05:30: loadavg 4.01 2.80 3.63, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 4 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.004 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 4005  p90 7231  p99 14447  p99.9 26879  max 38111
+  send lag us: p50 1197  p90 1700  p99 2030  p99.9 3893  max 4911
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 94.5 us per order, 9% of one hardware thread (user + system, includes the login loops)
+  logins     : 162 succeeded (8.1/s), 0 failed; latency us p50 477439  p90 530943  p99 630271  p99.9 660991  max 660991
+### stock-m24p1, logins 16, run 1: --http-bench --orders 20000 --rate 1000 --logins 16 --deadline 120
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T18:01:29+05:30: loadavg 4.57 3.03 3.68, containers running 31
+  probe 18:02:19: /health 000 in 10.002319s; operator /session 000 in 10.002225s; journal 3460106 bytes
+  probe 18:03:10: /health 000 in 10.002893s; operator /session 000 in 10.002536s; journal 3460106 bytes
+  probe 18:04:00: /health 000 in 10.002972s; operator /session 000 in 10.002108s; journal 3460106 bytes
+### stopped by hand at 2026-10-12T18:13:30+05:30: the stock-m24p1 logins 16 run 1 did not end; the generator itself was at 366% CPU with the exchange idle (a busy loop in the login loops on failed requests, fixed afterwards)

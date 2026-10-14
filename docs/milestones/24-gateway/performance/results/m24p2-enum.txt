@@ -1,0 +1,94 @@
+### m24p2-enum: 2026-10-12T17:57:42+05:30
+### stock-m24p1
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:57:43+05:30: loadavg 1.60 2.11 3.69, containers running 31
+register: 201
+right password: 200 0.230285
+GET /users: [{"id":1,"name":"Mohit"},{"id":2,"name":"John"}] [200]
+known   400 0.233658 invalid password
+unknown 400 0.000781 user not found
+known   400 0.230652 invalid password
+unknown 400 0.000570 user not found
+known   400 0.229699 invalid password
+unknown 400 0.000632 user not found
+known   400 0.228967 invalid password
+unknown 400 0.000604 user not found
+known   400 0.228906 invalid password
+unknown 400 0.000609 user not found
+known   400 0.229660 invalid password
+unknown 400 0.000536 user not found
+known   400 0.228858 invalid password
+unknown 400 0.000552 user not found
+known   400 0.229869 invalid password
+unknown 400 0.000641 user not found
+known   400 0.229234 invalid password
+unknown 400 0.000528 user not found
+known   400 0.228892 invalid password
+unknown 400 0.000571 user not found
+known   400 0.228834 invalid password
+unknown 400 0.000529 user not found
+known   400 0.228725 invalid password
+unknown 400 0.000539 user not found
+known   400 0.228449 invalid password
+unknown 400 0.000545 user not found
+known   400 0.228764 invalid password
+unknown 400 0.000556 user not found
+known   400 0.241198 invalid password
+unknown 400 0.000716 user not found
+known   400 0.234422 invalid password
+unknown 400 0.000550 user not found
+known   400 0.230202 invalid password
+unknown 400 0.000556 user not found
+known   400 0.228699 invalid password
+unknown 400 0.000604 user not found
+known   400 0.228803 invalid password
+unknown 400 0.000631 user not found
+known   400 0.229385 invalid password
+unknown 400 0.000536 user not found
+### stock-m24p2
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-12T17:57:55+05:30: loadavg 1.83 2.14 3.68, containers running 31
+register: 201
+right password: 200 0.229455
+GET /users:  [404]
+known   401 0.229445 invalid email or password
+unknown 401 0.229793 invalid email or password
+known   401 0.229215 invalid email or password
+unknown 401 0.229383 invalid email or password
+known   401 0.230107 invalid email or password
+unknown 401 0.229071 invalid email or password
+known   401 0.229364 invalid email or password
+unknown 401 0.229730 invalid email or password
+known   401 0.229094 invalid email or password
+unknown 401 0.228622 invalid email or password
+known   401 0.228951 invalid email or password
+unknown 401 0.228741 invalid email or password
+known   401 0.228865 invalid email or password
+unknown 401 0.230188 invalid email or password
+known   401 0.229569 invalid email or password
+unknown 401 0.239410 invalid email or password
+known   401 0.239045 invalid email or password
+unknown 401 0.228862 invalid email or password
+known   401 0.235614 invalid email or password
+unknown 401 0.231156 invalid email or password
+known   401 0.229247 invalid email or password
+unknown 401 0.229071 invalid email or password
+known   401 0.228945 invalid email or password
+unknown 401 0.228907 invalid email or password
+known   401 0.228900 invalid email or password
+unknown 401 0.229640 invalid email or password
+known   401 0.229870 invalid email or password
+unknown 401 0.233051 invalid email or password
+known   401 0.232754 invalid email or password
+unknown 401 0.228849 invalid email or password
+known   401 0.229992 invalid email or password
+unknown 401 0.228978 invalid email or password
+known   401 0.229449 invalid email or password
+unknown 401 0.228995 invalid email or password
+known   401 0.232894 invalid email or password
+unknown 401 0.228822 invalid email or password
+known   401 0.229078 invalid email or password
+unknown 401 0.228898 invalid email or password
+known   401 0.229018 invalid email or password
+unknown 401 0.228723 invalid email or password
+### done
