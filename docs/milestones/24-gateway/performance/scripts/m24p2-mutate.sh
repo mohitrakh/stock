@@ -9,7 +9,9 @@
 set -u
 run() { # LABEL TEST PYTHON-REPLACEMENT-SCRIPT
   local label=$1 test=$2
-  rm -rf ~/stock-m24-mut && cp -r ~/stock-m24 ~/stock-m24-mut
+  # -L: if ~/stock-m24 is a symlink, copy the tree it points to, never the link itself (a copied
+  # link would make every mutation edit the real tree).
+  rm -rf ~/stock-m24-mut && cp -rL ~/stock-m24 ~/stock-m24-mut
   python3 -c "$3" || { echo "  $label: mutation did not apply"; return; }
   local result
   result=$(docker run --rm -v ~/stock-m24-mut:/src -v stock-cargo-registry:/usr/local/cargo/registry \
@@ -17,7 +19,7 @@ run() { # LABEL TEST PYTHON-REPLACEMENT-SCRIPT
     timeout 300 cargo test --locked --bin stock "$test" 2>&1 | grep -E "^test result|^error" | head -1)
   echo "  $label -> ${result:-no result} ($test)"
 }
-F=/home/ubuntu/stock-m24-mut/src/controllers/user_controller.rs
+F=$HOME/stock-m24-mut/src/controllers/user_controller.rs
 echo "### m24p2-mutate: $(date -Is)"
 run "bcrypt inline on the worker (no spawn_blocking)" bcrypt_work_runs_off_the_worker_threads "
 import re

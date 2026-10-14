@@ -22,18 +22,25 @@ The scripts were written for the office machine and use fixed paths:
 | Path | What | Used by |
 |---|---|---|
 | `~/stock-m25` | the repository, on branch `dev-rakh` | milestone 25 scripts (`MIGRATIONS`, the mutate script) |
-| `~/stock-m24` | the same repository (a symlink is fine) | milestone 24 scripts (`MIGRATIONS` default, the mutate script) |
+| `~/stock-m24` | a second checkout of the same commit (a git worktree, not a symlink) | milestone 24 scripts (`MIGRATIONS` default, the mutate script) |
 | `~/stock-scripts/` | every script, `check.sh`, and the built binaries | every script mounts it at `/scripts` |
 | `~/m24-out/`, `~/m25-out/` | where the outputs were written | your own redirections |
 
 ```bash
 git clone <this repository's URL> ~/stock-m25
 cd ~/stock-m25 && git checkout dev-rakh
-ln -s ~/stock-m25 ~/stock-m24
+git worktree add --detach ~/stock-m24 HEAD
 mkdir -p ~/stock-scripts ~/m24-out ~/m25-out
 cp tools/check.sh docs/milestones/*/performance/scripts/* ~/stock-scripts/
 chmod +x ~/stock-scripts/*.sh
 ```
+
+Why `~/stock-m24` is a real checkout, not a symlink: the mutation scripts copy the tree and then
+deliberately break the copy. A copied symlink would point back to the real tree, and the breakages
+would be written into it. The scripts copy with `cp -rL`, which follows a link, so a symlink would
+now be safe too, but a second checkout keeps the two clearly apart. The mutation scripts use
+`$HOME`, so any user name works. After pulling new commits into `~/stock-m25`, move the second
+checkout to them too: `git -C ~/stock-m24 checkout --detach dev-rakh`.
 
 ## 3. The image, the network and the database
 
@@ -108,6 +115,9 @@ is what those measurements compare, but it does not have the tools. So:
 - for the HTTP generator, set `GEN=/scripts/stock-m24p2`;
 - for the probes (`m24p1-probes.sh`), run them with `BIN=stock-m24p2`. The probes measure the disk
   and bcrypt, not the exchange.
+- `27ce277` does not print `Tokio worker threads: N` at startup, so with `stock-m24p1` the scripts
+  print `# exchange: , replicated: ...`, with an empty field. That is cosmetic: the scripts wait
+  for "Server is listening", which it does print.
 
 ## 6. Running the measurements
 

@@ -8,7 +8,9 @@
 set -u
 run() { # LABEL TEST PYTHON-REPLACEMENT-SCRIPT
   local label=$1 test=$2
-  rm -rf ~/stock-m25-mut && cp -r ~/stock-m25 ~/stock-m25-mut
+  # -L: copy the tree a symlink points to, never the link itself (a copied link would make every
+  # mutation edit the real tree).
+  rm -rf ~/stock-m25-mut && cp -rL ~/stock-m25 ~/stock-m25-mut
   python3 -c "$3" || { echo "  $label: mutation did not apply"; return; }
   local result
   result=$(docker run --rm -v ~/stock-m25-mut:/src -v stock-cargo-registry:/usr/local/cargo/registry \
@@ -16,7 +18,7 @@ run() { # LABEL TEST PYTHON-REPLACEMENT-SCRIPT
     timeout 600 cargo test --locked --features stage-timing --bin stock "$test" 2>&1 | grep -E "^test result|^error" | head -1)
   echo "  $label -> ${result:-no result} ($test)"
 }
-R=/home/ubuntu/stock-m25-mut/src/exchange/runtime.rs
+R=$HOME/stock-m25-mut/src/exchange/runtime.rs
 echo "### m25p1-mutate: $(date -Is)"
 echo "## control: the real tree, the test alone (own target volume, fresh build)"
 docker run --rm -v ~/stock-m25:/src -v stock-cargo-registry:/usr/local/cargo/registry \
