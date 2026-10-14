@@ -386,8 +386,7 @@ impl EventStore {
     }
 
     pub(super) fn sync(&mut self) -> Result<(), EventStoreError> {
-        self.file.sync_all()?;
-        JOURNAL_SYNCS.fetch_add(1, Ordering::Relaxed);
+        sync_journal(&self.file)?;
         #[cfg(test)]
         {
             self.syncs += 1;
@@ -403,6 +402,14 @@ impl EventStore {
     pub(super) fn file(&self) -> &File {
         &self.file
     }
+}
+
+/// One journal sync through any handle on the journal: the store's own, or the journaler thread's
+/// clone of it (milestone 25 part 2). `sync_all` makes the file durable, whichever descriptor asks.
+pub(super) fn sync_journal(file: &File) -> Result<(), EventStoreError> {
+    file.sync_all()?;
+    JOURNAL_SYNCS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 pub(super) fn encode_record(envelopes: &[EventEnvelope]) -> Result<Vec<u8>, EventStoreError> {

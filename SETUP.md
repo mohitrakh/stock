@@ -71,9 +71,18 @@ docker run --rm -v ~/stock-m25:/src -v stock-cargo-registry:/usr/local/cargo/reg
   cargo test --locked --features stage-timing
 ```
 
-Expected at milestone 25 part 1: fmt exit 0; 213 unit tests passed in the normal build and 216 in
-the feature build (1 ignored in each), plus the integration tests. The three PostgreSQL acceptance
-tests are ignored unless `REPORTER_TEST_DATABASE_URL` is set.
+Expected at milestone 25 part 2: fmt exit 0; 218 unit tests passed in the normal build and 221 in
+the feature build (1 ignored in each), plus the integration tests. (At part 1: 213 and 216.) The
+three PostgreSQL acceptance tests are ignored unless `REPORTER_TEST_DATABASE_URL` is set; to run
+them against a fresh database:
+
+```bash
+docker exec stock-test-pg psql -U postgres -c "DROP DATABASE IF EXISTS reporter_test WITH (FORCE)" -c "CREATE DATABASE reporter_test"
+docker run --rm --network stock-test-net -v ~/stock-m25:/src -v stock-cargo-registry:/usr/local/cargo/registry \
+  -v stock-cargo-target:/target -e CARGO_TARGET_DIR=/target -w /src \
+  -e REPORTER_TEST_DATABASE_URL=postgres://postgres:bench@stock-test-pg:5432/reporter_test \
+  stock-rust cargo test --locked --test reporter -- --ignored
+```
 
 ## 5. The binaries the scripts run
 
@@ -82,8 +91,10 @@ using a separate git worktree per commit:
 
 | Binary name | Commit | Build | What it is |
 |---|---|---|---|
-| `stock-m25p1` | milestone 25 part 1 (this commit or later) | normal | the milestone 25 "normal" build |
-| `stock-m25p1-timed` | the same | `--features stage-timing` | the stage-timing build |
+| `stock-m25p2` | milestone 25 part 2 (this commit or later) | normal | the pipelined sync |
+| `stock-m25p2-timed` | the same | `--features stage-timing` | its stage-timing build |
+| `stock-m25p1` | `5168bcf` (milestone 25 part 1) | normal | the sync on the worker: Part 2's "before" |
+| `stock-m25p1-timed` | the same | `--features stage-timing` | its stage-timing build |
 | `stock-m24p2` | `28e085a` | normal | milestone 24 after Part 2 |
 | `stock-m24p1` | `27ce277` | normal | the milestone 23 exchange: milestone 24's "before" |
 
@@ -98,8 +109,11 @@ build() { # TREE BINARY-NAME [CARGO-FLAGS...]
 cd ~/stock-m25
 git worktree add ~/stock-build-m24 28e085a
 git worktree add ~/stock-build-m23 27ce277
-build ~/stock-m25 stock-m25p1
-build ~/stock-m25 stock-m25p1-timed --features stage-timing
+git worktree add ~/stock-build-m25p1 5168bcf
+build ~/stock-m25 stock-m25p2
+build ~/stock-m25 stock-m25p2-timed --features stage-timing
+build ~/stock-build-m25p1 stock-m25p1
+build ~/stock-build-m25p1 stock-m25p1-timed --features stage-timing
 build ~/stock-build-m24 stock-m24p2
 build ~/stock-build-m23 stock-m24p1
 ```
@@ -137,7 +151,10 @@ count. Redirect each script into a file:
 | `m25p1-overhead.sh` | `bash ~/stock-scripts/m25p1-overhead.sh 3 > ~/m25-out/m25p1-overhead.txt 2>&1` | `stock-m25p1`, `stock-m25p1-timed` |
 | `m25p1-overhead-reversed.sh` | the same, `-reversed` | the same |
 | `m25p1-stages.sh` | `bash ~/stock-scripts/m25p1-stages.sh 3 > ~/m25-out/m25p1-stages.txt 2>&1` | `stock-m25p1-timed`, generator `stock-m25p1` |
-| `m25p1-mutate.sh` | `bash ~/stock-scripts/m25p1-mutate.sh > ~/m25-out/m25p1-mutate.txt 2>&1` | builds from `~/stock-m25` |
+| `m25p1-mutate.sh` | `bash ~/stock-scripts/m25p1-mutate.sh > ~/m25-out/m25p1-mutate.txt 2>&1` | builds from `~/stock-m25`, which must then be at Part 1's commit (`git -C ~/stock-m25 checkout --detach 5168bcf`, and back afterwards): Part 2 rewrote the lines two of its three mutations replace, so on later commits those two report "mutation did not apply" |
+| `m25p2-mutate.sh` | `bash ~/stock-scripts/m25p2-mutate.sh > ~/m25-out/m25p2-mutate.txt 2>&1` | builds from `~/stock-m25` (or `TREE=...`) |
+| `m25p2-compare.sh` | `bash ~/stock-scripts/m25p2-compare.sh 3 > ~/m25-out/m25p2-compare.txt 2>&1` | `stock-m25p1`, `stock-m25p2`, generator `stock-m25p1` |
+| `m25p2-stages.sh` | `bash ~/stock-scripts/m25p2-stages.sh 3 > ~/m25-out/m25p2-stages.txt 2>&1` | `stock-m25p1-timed`, `stock-m25p2-timed`, generator `stock-m25p1` |
 
 Then summarize the stage runs the same way the documents did:
 
@@ -145,9 +162,14 @@ Then summarize the stage runs the same way the documents did:
 cd ~/stock-m25/docs/milestones/25-latency/performance
 awk -f scripts/m25p1-summarize.awk ~/m25-out/m25p1-stages.txt > ~/m25-out/m25p1-stages-summary.txt
 awk -f scripts/m25p1-decompose.awk ~/m25-out/m25p1-stages-summary.txt
+awk -f scripts/m25p2-summarize.awk ~/m25-out/m25p2-compare.txt > ~/m25-out/m25p2-compare-summary.txt
+awk -f scripts/m25p2-summarize.awk ~/m25-out/m25p2-stages.txt > ~/m25-out/m25p2-stages-summary.txt
 ```
 
-Running every script takes roughly two hours.
+Running every script takes roughly three hours; milestone 25 part 2's comparison and stage scripts
+take about 20 minutes each on the office machine (13:25–13:45 and 13:45–14:05 on 2026-10-14). Its
+mutation check took under 2 minutes with a warm cargo cache (13:24:03 to 13:25:56); a cold cache
+takes far longer.
 
 ## 7. Before you compare numbers
 

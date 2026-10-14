@@ -1,0 +1,49 @@
+### EXCERPT of manual runs on the office machine, 2026-10-14, used to diagnose the replicated
+### slowdown in results/m25p2-compare-shipping-per-group.txt. Commands (m24-lib.sh):
+###   BIN=/scripts/stock-m25p2-timed; inproc_bench yes --orders 5000 --rate 1000
+### first with the binary that shipped each group to the replica as it was written (built 12:45),
+### then with the fixed binary that ships once per sync (built 13:23), at 1,000 and 5,000/s.
+
+## 13:1x, stock-m25p2-timed shipping per group, replicated, 1,000/s, 5,000 orders (full output)
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 5000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 870 orders/s over 5.749 s
+  latency us : p50 580095  p90 1182719  p99 1480703  p99.9 1525759  max 1530879  mean 584087.5
+  syncs      : 466 (10.7 orders per sync)
+  journal    : 690 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 30656 kB, VmRSS: 30656 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue              5000        59.1       31       87      677     3285     5875
+WaitInGroup        5001        14.6        0        1      196     2625     6135
+Prepare            5001        35.7       24       72      148      497    12479
+Encode             5001        19.6       13       33       87      219     5167
+Commit             5001        16.7       11       29       72      502     3767
+WaitForGroup       5001         7.8        0        1      163      558     5675
+Write              4640        22.5       14       45      153      287      311
+Sync                467       875.0      660     1366     5343     7051     7051
+Confirm             467     11319.1       80      814   397567   797183   797183
+WaitForSync        5001    580402.9   575999  1177599  1475583  1521663  1525759
+Publish            4640         5.7        3        9       29      137     1715
+Release            4640         1.2        0        4       10       42      287
+Worker             5001    582575.7   578559  1181695  1478655  1524735  1528831
+GroupSize          4640         1.1        1        1        2        5        9
+
+## 13:2x, stock-m25p2-timed shipping once per sync (the fix), replicated (filtered by grep)
+## p2-timed replicated 1000
+  throughput : 999 orders/s over 5.004 s
+  latency us : p50 6083  p90 10663  p99 14423  p99.9 18559  max 21423  mean 6211.3
+  syncs      : 2270 (2.2 orders per sync)
+Sync               2271      1238.0      757     2855     4699     6171     6663
+Confirm            2271       893.2      630     2253     4069     5675     9111
+WaitForSync        5001      4837.9     4667     9007    12527    17183    19519
+Worker             5001      5049.3     4899     9319    12799    17551    37535
+## p2-timed replicated 5000
+  throughput : 4991 orders/s over 5.009 s
+  latency us : p50 9999  p90 14975  p99 20079  p99.9 26159  max 31103  mean 10391.0
+  syncs      : 998 (25.1 orders per sync)
+Sync                999      2868.0     2761     4571     6395    10111    10111
+Confirm             999      2079.4     1769     3737     5695    11047    11047
+WaitForSync       25001      8245.4     7899    12135    16327    23071    28367
+Worker            25001      8991.7     8687    13183    17775    25391    40255

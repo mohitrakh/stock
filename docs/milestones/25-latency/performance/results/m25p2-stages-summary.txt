@@ -1,0 +1,426 @@
+
+## stock-m25p1-timed, in-process, replicated no: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [999, 1000]
+  p50                 4976   [4651, 5179]
+  p99                13130   [10943, 15551]
+  mean                5229   [4785, 5552]
+  per sync             2.3   [2.2, 2.4]
+  Queue           n     20000  mean    1334.6  p50      959  p99     5960
+  WaitInGroup     n     20001  mean      82.4  p50       39  p99      491
+  Prepare         n     20001  mean      28.2  p50       18  p99      122
+  Encode          n     20001  mean      15.1  p50       11  p99       69
+  Commit          n     20001  mean      16.2  p50       10  p99       74
+  WaitForGroup    n     20001  mean      61.3  p50       18  p99      446
+  Write           n      8878  mean      30.4  p50       27  p99       86
+  Sync            n      8878  mean    1863.2  p50     1375  p99     6010
+  Publish         n      8878  mean      22.5  p50       14  p99      110
+  Release         n      8878  mean       9.7  p50        8  p99       32
+  Worker          n     20001  mean    2624.6  p50     2409  p99     7959
+  GroupSize       n      8878  mean       2.3  p50        2  p99        7
+
+## stock-m25p2-timed, in-process, replicated no: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 5524   [5299, 5759]
+  p99                11930   [11735, 12223]
+  mean                5694   [5478, 6031]
+  per sync             2.4   [2.1, 2.6]
+  Queue           n     20000  mean      90.8  p50       51  p99      551
+  WaitInGroup     n     20001  mean      11.8  p50        1  p99      211
+  Prepare         n     20001  mean      47.2  p50       30  p99      170
+  Encode          n     20001  mean      25.8  p50       22  p99       98
+  Commit          n     20001  mean      24.0  p50       16  p99      100
+  WaitForGroup    n     20001  mean       7.9  p50        0  p99      161
+  Write           n     18393  mean      40.4  p50       29  p99      259
+  Sync            n      8599  mean    2224.4  p50     1987  p99     5651
+  WaitForSync     n     20001  mean    4093.7  p50     3940  p99     9514
+  Publish         n     18393  mean      14.5  p50       11  p99       68
+  Release         n     18393  mean       8.1  p50        2  p99       52
+  Worker          n     20001  mean    4326.5  p50     4169  p99     9996
+  GroupSize       n     18393  mean       1.1  p50        1  p99        2
+
+## stock-m25p1-timed, in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4999   [4998, 4999]
+  p50                 5996   [5091, 6979]
+  p99                17167   [15887, 18943]
+  mean                6511   [5887, 7478]
+  per sync            13.7   [10.2, 19.4]
+  Queue           n    100000  mean    1792.6  p50     1257  p99     7351
+  WaitInGroup     n    100001  mean     431.0  p50      239  p99     2500
+  Prepare         n    100001  mean      16.5  p50        9  p99       85
+  Encode          n    100001  mean       8.3  p50        5  p99       46
+  Commit          n    100001  mean       9.6  p50        5  p99       47
+  WaitForGroup    n    100001  mean     385.7  p50      191  p99     2430
+  Write           n      7867  mean      36.3  p50       29  p99      127
+  Sync            n      7867  mean    1957.4  p50     1463  p99     5927
+  Publish         n      7867  mean      79.1  p50       48  p99      407
+  Release         n      7867  mean      15.7  p50       11  p99       67
+  Worker          n    100001  mean    3610.8  p50     3338  p99     9676
+  GroupSize       n      7867  mean      13.7  p50       11  p99       41
+
+## stock-m25p2-timed, in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4998, 4999]
+  p50                 5387   [4619, 5979]
+  p99                16447   [13695, 19247]
+  mean                5814   [5050, 6402]
+  per sync             9.5   [7.3, 11.9]
+  Queue           n    100000  mean     183.4  p50       54  p99     1215
+  WaitInGroup     n    100000  mean     133.8  p50       71  p99      842
+  Prepare         n    100000  mean      23.7  p50       14  p99      124
+  Encode          n    100000  mean      12.0  p50        8  p99       64
+  Commit          n    100000  mean      12.8  p50        8  p99       63
+  WaitForGroup    n    100000  mean     111.4  p50       49  p99      795
+  Write           n     25181  mean      30.5  p50       21  p99      199
+  Sync            n     10970  mean    1805.9  p50     1313  p99     5871
+  WaitForSync     n    100000  mean    3988.9  p50     3608  p99    12367
+  Publish         n     25181  mean      28.7  p50       19  p99      127
+  Release         n     25181  mean       8.3  p50        5  p99       58
+  Worker          n    100000  mean    4480.9  p50     4112  p99    13596
+  GroupSize       n     25181  mean       4.0  p50        4  p99       10
+
+## stock-m25p1-timed, in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         45033   [42270, 47525]
+  p50               239444   [219519, 251391]
+  p99               325375   [288511, 365311]
+  mean              237834   [223945, 252633]
+  per sync          1015.2   [1015.2, 1015.2]
+  Queue           n    200000  mean  215489.7  p50   217343  p99   297642
+  WaitInGroup     n    200000  mean    7331.5  p50     7167  p99    18714
+  Prepare         n    200000  mean       5.6  p50        3  p99       25
+  Encode          n    200000  mean       2.9  p50        2  p99       11
+  Commit          n    200000  mean       3.2  p50        2  p99       12
+  WaitForGroup    n    200000  mean    6076.9  p50     5575  p99    19812
+  Write           n       197  mean     361.6  p50      341  p99      532
+  Sync            n       197  mean    5449.8  p50     5236  p99    12948
+  Publish         n       197  mean    2392.0  p50     2256  p99     6854
+  Release         n       197  mean     445.0  p50      428  p99     1290
+  Worker          n    200000  mean   22235.3  p50    21268  p99    39071
+  GroupSize       n       197  mean    1013.5  p50     1024  p99     1024
+
+## stock-m25p2-timed, in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         60899   [59138, 61930]
+  p50               190506   [189183, 191231]
+  p99               265002   [230015, 334335]
+  mean              190463   [187876, 194526]
+  per sync          1011.8   [1010.1, 1015.2]
+  Queue           n    200000  mean  157393.8  p50   158506  p99   226431
+  WaitInGroup     n    200000  mean    7349.6  p50     7218  p99    18460
+  Prepare         n    200000  mean       5.2  p50        3  p99       24
+  Encode          n    200000  mean       3.0  p50        1  p99       10
+  Commit          n    200000  mean       2.9  p50        2  p99       12
+  WaitForGroup    n    200000  mean    5740.9  p50     5371  p99    17887
+  Write           n       198  mean     346.3  p50      337  p99      537
+  Sync            n       199  mean    6262.2  p50     5939  p99    19087
+  WaitForSync     n    200000  mean   16744.1  p50    15882  p99    34420
+  PipelineFull    n         3  mean    1290.9  p50        3  p99     3873
+  Publish         n       198  mean    2183.3  p50     2121  p99     3427
+  Release         n       198  mean     484.8  p50      462  p99     1883
+  Worker          n    200000  mean   32989.0  p50    31444  p99    64735
+  GroupSize       n       198  mean    1011.8  p50     1024  p99     1024
+
+## stock-m25p1-timed, http, replicated no: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 6672   [6175, 7143]
+  p99                16074   [14351, 18511]
+  mean                6992   [6518, 7549]
+  unanswered             0   [0, 0]
+  HttpBeforeQueue n     20000  mean      82.9  p50       74  p99      377
+  HttpAsk         n     20000  mean    4767.8  p50     4473  p99    12527
+  HttpTotal       n     20000  mean    4883.5  p50     4594  p99    12687
+  Queue           n     20000  mean    1733.2  p50     1403  p99     5987
+  WaitInGroup     n     20000  mean     122.6  p50       57  p99      709
+  Prepare         n     20000  mean      39.3  p50       25  p99      158
+  Encode          n     20000  mean      22.3  p50       16  p99       95
+  Commit          n     20000  mean      22.7  p50       14  p99      101
+  WaitForGroup    n     20000  mean      97.7  p50       32  p99      643
+  Write           n      8370  mean      44.4  p50       39  p99      108
+  Sync            n      8370  mean    1896.0  p50     1482  p99     5790
+  Publish         n      8370  mean      28.4  p50       22  p99      120
+  Release         n      8370  mean      14.1  p50       12  p99       45
+  Worker          n     20000  mean    2711.3  p50     2442  p99     7394
+  GroupSize       n      8370  mean       2.4  p50        2  p99        7
+
+## stock-m25p2-timed, http, replicated no: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 5728   [5115, 6223]
+  p99                14874   [13607, 17135]
+  mean                6019   [5446, 6530]
+  unanswered             0   [0, 0]
+  HttpBeforeQueue n     20000  mean      82.5  p50       75  p99      345
+  HttpAsk         n     20000  mean    4263.9  p50     3976  p99    11711
+  HttpTotal       n     20000  mean    4380.6  p50     4096  p99    11908
+  Queue           n     20000  mean      96.4  p50       46  p99      881
+  WaitInGroup     n     20000  mean      11.6  p50        1  p99      223
+  Prepare         n     20000  mean      42.6  p50       29  p99      165
+  Encode          n     20000  mean      24.3  p50       19  p99      103
+  Commit          n     20000  mean      22.8  p50       15  p99       99
+  WaitForGroup    n     20000  mean       9.7  p50        0  p99      180
+  Write           n     18694  mean      35.6  p50       28  p99      207
+  Sync            n      9639  mean    1963.7  p50     1593  p99     5711
+  WaitForSync     n     20000  mean    3683.4  p50     3415  p99    10151
+  Publish         n     18694  mean      14.3  p50       11  p99       76
+  Release         n     18694  mean       9.6  p50        3  p99       78
+  Worker          n     20000  mean    3905.9  p50     3636  p99    10612
+  GroupSize       n     18694  mean       1.1  p50        1  p99        2
+
+## stock-m25p1-timed, http, replicated no: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4999   [4999, 4999]
+  p50                 6419   [4415, 7551]
+  p99                34266   [27423, 46879]
+  mean                8551   [7201, 9768]
+  unanswered             0   [0, 0]
+  HttpBeforeQueue n    100000  mean      43.2  p50       32  p99      195
+  HttpAsk         n    100000  mean    6218.9  p50     4525  p99    25140
+  HttpTotal       n    100000  mean    6278.5  p50     4572  p99    25295
+  Queue           n    100000  mean    1997.7  p50     1197  p99     9690
+  WaitInGroup     n    100000  mean     631.5  p50      250  p99     5768
+  Prepare         n    100000  mean      20.7  p50       12  p99       97
+  Encode          n    100000  mean      10.7  p50        7  p99       49
+  Commit          n    100000  mean      11.9  p50        7  p99       54
+  WaitForGroup    n    100000  mean     556.7  p50      197  p99     5358
+  Write           n      8920  mean      39.3  p50       31  p99      163
+  Sync            n      8920  mean    1515.2  p50      976  p99     5647
+  Publish         n      8920  mean      59.8  p50       30  p99      480
+  Release         n      8920  mean      15.7  p50        9  p99       86
+  Worker          n    100000  mean    3699.7  p50     2723  p99    14332
+  GroupSize       n      8920  mean      11.6  p50        7  p99       51
+
+## stock-m25p2-timed, http, replicated no: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4999   [4999, 4999]
+  p50                 6546   [6143, 6807]
+  p99                30340   [28543, 31855]
+  mean                7416   [6816, 7856]
+  unanswered             0   [0, 0]
+  HttpBeforeQueue n    100000  mean      40.4  p50       30  p99      211
+  HttpAsk         n    100000  mean    5420.4  p50     4863  p99    20618
+  HttpTotal       n    100000  mean    5476.5  p50     4911  p99    20804
+  Queue           n    100000  mean     210.4  p50       58  p99     3104
+  WaitInGroup     n    100000  mean     123.2  p50       35  p99     1763
+  Prepare         n    100000  mean      18.7  p50       11  p99       87
+  Encode          n    100000  mean       9.5  p50        6  p99       45
+  Commit          n    100000  mean      10.3  p50        6  p99       48
+  WaitForGroup    n    100000  mean     109.2  p50       22  p99     1690
+  Write           n     37625  mean      18.6  p50       12  p99      144
+  Sync            n      9230  mean    2095.5  p50     1695  p99     6070
+  WaitForSync     n    100000  mean    4406.5  p50     4108  p99    11746
+  Publish         n     37625  mean      13.0  p50        8  p99       74
+  Release         n     37625  mean       4.7  p50        2  p99       30
+  Worker          n    100000  mean    4839.4  p50     4438  p99    15535
+  GroupSize       n     37625  mean       2.7  p50        2  p99       10
+
+## stock-m25p1-timed, in-process, replicated yes: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [999, 1000]
+  p50                 8871   [8591, 9375]
+  p99                21636   [20079, 24223]
+  mean                9037   [8536, 9468]
+  per sync             3.9   [3.5, 4.4]
+  Queue           n     20000  mean    2684.1  p50     2119  p99     9708
+  WaitInGroup     n     20001  mean     176.0  p50      101  p99      945
+  Prepare         n     20001  mean      27.2  p50       16  p99      126
+  Encode          n     20001  mean      14.4  p50       10  p99       67
+  Commit          n     20001  mean      16.5  p50        9  p99       77
+  WaitForGroup    n     20001  mean     140.3  p50       63  p99      854
+  Write           n      5135  mean      37.3  p50       27  p99      105
+  Sync            n      5135  mean    1984.9  p50     1505  p99     6338
+  Confirm         n      5135  mean    1442.3  p50     1000  p99     5332
+  Publish         n      5135  mean      41.1  p50       22  p99      182
+  Release         n      5135  mean      19.0  p50        9  p99      112
+  Worker          n     20001  mean    5174.6  p50     5154  p99    12202
+  GroupSize       n      5135  mean       3.9  p50        3  p99       11
+
+## stock-m25p2-timed, in-process, replicated yes: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 9007   [7775, 10039]
+  p99                29514   [18943, 35679]
+  mean                9643   [8610, 11001]
+  per sync             3.8   [2.7, 4.6]
+  Queue           n     20000  mean      88.4  p50       45  p99      859
+  WaitInGroup     n     20001  mean      13.2  p50        1  p99      224
+  Prepare         n     20001  mean      43.5  p50       28  p99      171
+  Encode          n     20001  mean      23.6  p50       19  p99       98
+  Commit          n     20001  mean      22.1  p50       15  p99       99
+  WaitForGroup    n     20001  mean       9.5  p50        0  p99      181
+  Write           n     18202  mean      35.8  p50       23  p99      250
+  Sync            n      5526  mean    2188.5  p50     1760  p99     7239
+  Confirm         n      5526  mean    1552.8  p50     1127  p99     5995
+  WaitForSync     n     20001  mean    8052.5  p50     7427  p99    27487
+  Publish         n     18202  mean      12.7  p50       10  p99       69
+  Release         n     18202  mean       6.9  p50        2  p99       55
+  Worker          n     20001  mean    8312.9  p50     7690  p99    27940
+  GroupSize       n     18202  mean       1.1  p50        1  p99        2
+
+## stock-m25p1-timed, in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4996   [4993, 4998]
+  p50                12218   [11879, 12839]
+  p99                55636   [48575, 64031]
+  mean               14742   [14027, 15857]
+  per sync            28.8   [24.4, 34.3]
+  Queue           n    100000  mean    4644.2  p50     3181  p99    27412
+  WaitInGroup     n    100001  mean    1224.0  p50      506  p99     8694
+  Prepare         n    100001  mean      18.5  p50       10  p99      105
+  Encode          n    100001  mean       9.4  p50        5  p99       58
+  Commit          n    100001  mean      10.8  p50        5  p99       55
+  WaitForGroup    n    100001  mean    1111.8  p50      430  p99     8122
+  Write           n      3537  mean      53.1  p50       33  p99      236
+  Sync            n      3537  mean    2460.4  p50     1880  p99     8266
+  Confirm         n      3537  mean    1732.3  p50     1170  p99     6044
+  Publish         n      3537  mean     177.3  p50       81  p99     1068
+  Release         n      3537  mean      32.9  p50       16  p99      212
+  Worker          n    100001  mean    8721.0  p50     7232  p99    32452
+  GroupSize       n      3537  mean      28.8  p50       22  p99      108
+
+## stock-m25p2-timed, in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4997, 4999]
+  p50                11372   [10631, 12359]
+  p99                42207   [38303, 45567]
+  mean               12570   [12066, 13209]
+  per sync            26.7   [23.4, 30.9]
+  Queue           n    100000  mean     220.1  p50       59  p99     2684
+  WaitInGroup     n    100001  mean     171.2  p50       70  p99     1696
+  Prepare         n    100001  mean      24.9  p50       14  p99      126
+  Encode          n    100001  mean      12.7  p50        8  p99       68
+  Commit          n    100001  mean      13.6  p50        8  p99       66
+  WaitForGroup    n    100001  mean     149.3  p50       50  p99     1593
+  Write           n     25769  mean      25.6  p50       17  p99      176
+  Sync            n      3796  mean    3144.6  p50     2932  p99     9303
+  Confirm         n      3796  mean    2133.3  p50     1790  p99     6684
+  WaitForSync     n    100001  mean   10296.4  p50     9316  p99    35887
+  Publish         n     25769  mean      27.5  p50       18  p99      157
+  Release         n     25769  mean       6.9  p50        3  p99       56
+  Worker          n    100001  mean   11036.9  p50     9970  p99    38367
+  GroupSize       n     25769  mean       3.9  p50        4  p99       11
+
+## stock-m25p1-timed, in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         31402   [29911, 32669]
+  p50               333823   [318207, 361471]
+  p99               517972   [494847, 554495]
+  mean              339741   [326337, 357810]
+  per sync          1015.2   [1015.2, 1015.2]
+  Queue           n    200000  mean  307572.9  p50   302250  p99   477610
+  WaitInGroup     n    200001  mean    8136.3  p50     7804  p99    22548
+  Prepare         n    200001  mean       6.7  p50        4  p99       29
+  Encode          n    200001  mean       3.3  p50        2  p99       13
+  Commit          n    200001  mean       3.9  p50        2  p99       14
+  WaitForGroup    n    200001  mean    6968.5  p50     6232  p99    27450
+  Write           n       198  mean     418.1  p50      365  p99     1812
+  Sync            n       198  mean    8626.2  p50     7347  p99    38458
+  Confirm         n       198  mean    5078.6  p50     4960  p99    14775
+  Publish         n       198  mean    2588.8  p50     2332  p99     7299
+  Release         n       198  mean     501.2  p50      432  p99     2701
+  Worker          n    200001  mean   31993.7  p50    29764  p99    63060
+  GroupSize       n       198  mean    1010.1  p50     1024  p99     1024
+
+## stock-m25p2-timed, in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         47816   [47585, 48063]
+  p50               247039   [246399, 247551]
+  p99               292266   [285951, 301567]
+  mean              243437   [242530, 244523]
+  per sync          1015.2   [1010.1, 1020.4]
+  Queue           n    200000  mean  201175.9  p50   205268  p99   247594
+  WaitInGroup     n    200001  mean    8198.9  p50     8104  p99    20618
+  Prepare         n    200001  mean       6.4  p50        4  p99       28
+  Encode          n    200001  mean       3.4  p50        2  p99       12
+  Commit          n    200001  mean       3.8  p50        2  p99       14
+  WaitForGroup    n    200001  mean    6489.8  p50     6016  p99    18996
+  Write           n       198  mean     400.3  p50      360  p99     1903
+  Sync            n       198  mean   10806.4  p50     8232  p99    39903
+  Confirm         n       198  mean    7750.1  p50     5608  p99    32735
+  WaitForSync     n    200001  mean   23684.4  p50    22575  p99    52778
+  PipelineFull    n       129  mean    3650.9  p50     1338  p99    23303
+  Publish         n       198  mean    2618.5  p50     2602  p99     4175
+  Release         n       198  mean     488.6  p50      471  p99     1130
+  Worker          n    200001  mean   42050.3  p50    40906  p99    74367
+  GroupSize       n       198  mean    1008.4  p50     1024  p99     1024
+
+## stock-m25p1-timed, http, replicated yes: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [999, 1000]
+  p50                10196   [8663, 12791]
+  p99                23722   [18447, 32159]
+  mean               10638   [8890, 13516]
+  unanswered             0   [0, 0]
+  HttpBeforeQueue n     20000  mean      60.5  p50       49  p99      272
+  HttpAsk         n     20000  mean    9103.4  p50     8711  p99    21295
+  HttpTotal       n     20000  mean    9185.8  p50     8788  p99    21402
+  Queue           n     20000  mean    3212.2  p50     2742  p99    10674
+  WaitInGroup     n     20000  mean     199.7  p50      114  p99     1192
+  Prepare         n     20000  mean      27.0  p50       16  p99      133
+  Encode          n     20000  mean      14.5  p50        9  p99       70
+  Commit          n     20000  mean      16.3  p50        9  p99       77
+  WaitForGroup    n     20000  mean     161.0  p50       79  p99     1097
+  Write           n      4229  mean      42.2  p50       35  p99      119
+  Sync            n      4229  mean    2604.8  p50     2350  p99     6827
+  Confirm         n      4229  mean    1702.7  p50     1453  p99     5390
+  Publish         n      4229  mean      42.1  p50       29  p99      198
+  Release         n      4229  mean      17.1  p50       11  p99       85
+  Worker          n     20000  mean    5487.6  p50     5331  p99    12012
+  GroupSize       n      4229  mean       4.9  p50        5  p99       12
+
+## stock-m25p2-timed, http, replicated yes: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 8690   [8511, 8815]
+  p99                29359   [18559, 38783]
+  mean                9343   [8891, 9750]
+  unanswered             0   [0, 0]
+  HttpBeforeQueue n     20000  mean      56.6  p50       41  p99      246
+  HttpAsk         n     20000  mean    7849.8  p50     7308  p99    25895
+  HttpTotal       n     20000  mean    7926.7  p50     7378  p99    26074
+  Queue           n     20000  mean      92.8  p50       26  p99     1270
+  WaitInGroup     n     20000  mean      12.7  p50        0  p99      222
+  Prepare         n     20000  mean      29.1  p50       20  p99      136
+  Encode          n     20000  mean      16.1  p50       12  p99       76
+  Commit          n     20000  mean      15.5  p50        9  p99       73
+  WaitForGroup    n     20000  mean       9.9  p50        0  p99      181
+  Write           n     18355  mean      25.4  p50       15  p99      175
+  Sync            n      5307  mean    2357.7  p50     2025  p99     6603
+  Confirm         n      5307  mean    1401.6  p50     1027  p99     5022
+  WaitForSync     n     20000  mean    7288.2  p50     6831  p99    23316
+  Publish         n     18355  mean       8.3  p50        5  p99       45
+  Release         n     18355  mean       6.2  p50        1  p99       88
+  Worker          n     20000  mean    7479.8  p50     7000  p99    23887
+  GroupSize       n     18355  mean       1.1  p50        1  p99        2
+
+## stock-m25p1-timed, http, replicated yes: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4997, 4999]
+  p50                12031   [11615, 12607]
+  p99                56554   [44415, 69311]
+  mean               14430   [13435, 15578]
+  unanswered             0   [0, 0]
+  HttpBeforeQueue n    100000  mean      34.1  p50       22  p99      140
+  HttpAsk         n    100000  mean   11936.6  p50    10084  p99    46271
+  HttpTotal       n    100000  mean   11985.0  p50    10124  p99    46452
+  Queue           n    100000  mean    3869.0  p50     3100  p99    18319
+  WaitInGroup     n    100000  mean     977.3  p50      455  p99    10538
+  Prepare         n    100000  mean      16.1  p50        9  p99       80
+  Encode          n    100000  mean       8.0  p50        4  p99       42
+  Commit          n    100000  mean       9.3  p50        5  p99       44
+  WaitForGroup    n    100000  mean     807.0  p50      378  p99     8167
+  Write           n      3494  mean      50.1  p50       39  p99      231
+  Sync            n      3494  mean    2654.7  p50     2482  p99     7140
+  Confirm         n      3494  mean    1702.2  p50     1319  p99     5602
+  Publish         n      3494  mean     121.5  p50       91  p99      798
+  Release         n      3494  mean      27.3  p50       19  p99      138
+  Worker          n    100000  mean    7369.6  p50     6283  p99    27754
+  GroupSize       n      3494  mean      28.7  p50       28  p99      102
+
+## stock-m25p2-timed, http, replicated yes: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4998, 4998]
+  p50                10764   [10695, 10879]
+  p99                42922   [37055, 54527]
+  mean               12068   [11783, 12620]
+  unanswered             0   [0, 0]
+  HttpBeforeQueue n    100000  mean      34.0  p50       21  p99      184
+  HttpAsk         n    100000  mean    9813.6  p50     8943  p99    30228
+  HttpTotal       n    100000  mean    9861.9  p50     8983  p99    30399
+  Queue           n    100000  mean     265.4  p50       58  p99     4262
+  WaitInGroup     n    100000  mean     153.0  p50       37  p99     2557
+  Prepare         n    100000  mean      16.7  p50       10  p99       79
+  Encode          n    100000  mean       8.4  p50        5  p99       42
+  Commit          n    100000  mean       9.1  p50        5  p99       44
+  WaitForGroup    n    100000  mean     128.2  p50       24  p99     2291
+  Write           n     35150  mean      15.9  p50       10  p99      133
+  Sync            n      4062  mean    3072.6  p50     2958  p99     7382
+  Confirm         n      4062  mean    1785.1  p50     1450  p99     5682
+  WaitForSync     n    100000  mean    8444.5  p50     7986  p99    20383
+  Publish         n     35150  mean      12.1  p50        6  p99       77
+  Release         n     35150  mean       4.8  p50        1  p99       29
+  Worker          n    100000  mean    8991.0  p50     8364  p99    24223
+  GroupSize       n     35150  mean       2.9  p50        2  p99       11

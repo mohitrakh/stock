@@ -1,4 +1,4 @@
-# Project Direction - Milestone 24 Closed After Part 2; Milestone 25 (Latency) Planned, Not Started
+# Project Direction - Milestone 25 (Latency) In Progress: Parts 1 and 2 Complete
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -33,7 +33,12 @@ Axum HTTP handler
        -> commit the prepared transition in memory (the next command sees it)
        -> hold the reply
      then, once per group:
-       -> EventStore::append_record (all records, one write_all + ONE sync_all)
+       -> EventStore::write_records (all records, one write_all); tell the journaler
+       -> go on to the next group (at most 2,048 commands wait for the disk)
+     journaler thread (milestone 25 part 2), in a loop:
+       -> hand the replication link everything written (it ships while this disk syncs)
+       -> ONE sync_all, covering everything written so far; wait for the replica's confirmation
+     worker, whenever a sync ends, for every group the disk now holds, in queue order:
        -> publish each complete batch and the committed watermark through mmap
        -> notify local execution callbacks
        -> release every held reply
@@ -1247,7 +1252,7 @@ Rules for every file:
 
 ## 25. Latency
 
-**Status: selected and planned on 2026-10-14; the owner accepted the plan and decisions 1–4 as recommended. Part 1 complete on 2026-10-14.** Progress is recorded at the end of this section. Its documents will go in `docs/milestones/25-latency/`, with the same layout and depth rules as milestone 24 (see milestone 24, "Documentation for this milestone"). The decisions marked *proposed* need the owner's confirmation before the part that uses them.
+**Status: selected and planned on 2026-10-14; the owner accepted the plan and decisions 1–4 as recommended. Parts 1 and 2 complete on 2026-10-14; Part 3 awaits the owner's decision.** Progress is recorded at the end of this section. Its documents will go in `docs/milestones/25-latency/`, with the same layout and depth rules as milestone 24 (see milestone 24, "Documentation for this milestone"). The decisions marked *proposed* need the owner's confirmation before the part that uses them.
 
 ### Why this milestone
 
@@ -1381,7 +1386,25 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 - **One disturbed run.** HTTP replicated at 5,000/s, run 1, had a disk stall (syncs up to 73.5 ms) and is flagged.
 - **Verified.** Tests pass: 213 in the normal build and 216 in the feature build. A mutation check, run alone with its own cargo target volume, fails the test for each of three removed recordings. An independent review found no code defect. Its documentation findings were all fixed; they are listed in the part's write-up. The most important was the undisclosed disturbed run. A final check of the fixes found the plan's acceptance criterion still saying "medians" and a broken table, both fixed.
 
-**Decision for the owner before Part 2:** confirm Part 2 (a pipelined sync), knowing it mainly raises throughput and helps latency only a little at moderate load. Decide Part 3 (a binary format): the recommendation is to drop it, or keep it only as a learning exercise.
+**Owner, 2026-10-14:** "go ahead with next steps of our current milestone", taken as confirming Part 2. Part 3 was not answered.
+
+**Part 2, complete (2026-10-14): a pipelined journal sync.** Write-up: `docs/milestones/25-latency/part-2-pipelined-sync.md`; measurement in its `performance/03-pipelined-sync.md`.
+- **The change.** A journaler thread syncs the journal, and with replication ships to the replica and waits for its confirmation. The worker writes each group and goes on to stage the next. Each sync covers everything written before it began, so groups written during one sync share the next (one sync per group would make moderate load slower than no pipeline). At most 2,048 commands (two full groups) wait for the disk; then the worker waits too. A group is published, its callbacks run and its replies (reads included) are sent only once the disk holds it, in queue order. The worker waits on the queue and the journaler at once, through a current-thread Tokio runtime used only to wait.
+- **Failure rules.** A failed sync answers everything in flight unavailable, publishes nothing, halts, and the journaler never syncs again. A staging fault or a failed write drains the groups before it, then halts. A failed publication fails its group and all later ones; running alone, the whole pass. The sync, staging and write rules are tested; the publication rule is tested for one group, and its multi-group and running-alone cases are checked by reading the code only.
+- **A bug the measurement found.** The first version shipped every group to the replica as soon as it was written. The replica syncs once per frame, so at moderate load it did about ten times the primary's syncs and fell seconds behind: p50 2.2 s at 1,000/s replicated, and HTTP orders unanswered. All tests had passed. Fixed by shipping once per sync from the journaler, with a test that guards it.
+- **Results** (office machine, 3 interleaved runs each, alternating order):
+  - maximum rate +41.5% alone (45,975 → 65,057 orders/s) and +36.7% replicated (35,297 → 48,256);
+  - mean latency at 5,000/s down 10–28%, beyond the spread between runs in three of four configurations;
+  - at 1,000/s, no change beyond the spread.
+
+  Alone, the worker's cycle (16.12 ms per group) predicts 62,800 orders/s; the timed build measured 60,899. Replicated, the shared SSD's sync plus confirmation (18.56 ms) became the limit. Latency fell more than Part 1 projected (at most about 8%), because orders no longer wait for the rest of a large group to be staged.
+- **Part 1's open question closed.** Measured per order (the new `WaitForSync` stage), the wait for the disk accounts for `Worker` to within 1–3%, against 12–25% not covered when only per-group stages existed. That is consistent with Part 1's size-bias explanation.
+- **Verified:**
+  - `cargo fmt`; 218 tests (normal build) and 221 (feature build); the 3 PostgreSQL acceptance tests;
+  - a mutation check of 6 mutations, each failing its test;
+  - two rounds of independent review: the reviews found no way to show anything before it is durable, or out of order; three code and test fixes were made (a test made deterministic, the publication-failure answers, running alone after a failed publication), plus fixes to the summary awk and the documents.
+
+**Decision for the owner before Part 3:** Part 3, a binary record format. Part 1 measured `Encode` at 0.05–0.33% of latency and at most about 15% of maximum throughput. With the pipeline, the worker's own work is now what limits the maximum rate alone, so encoding's share there is 3.0 µs of 15.9 µs per command (16.12 ms / 1,011.8), about 19%: a free encoder could raise the maximum rate by at most about 23% (1 / (1 − 0.19)), an estimate. It costs a journal format change that every reader must follow. Recommendation unchanged: drop it, or keep it as a learning exercise. After Part 3 (or without it), Part 4, the final measurement against the milestone 24 part 2 binary.
 
 ## Known Prototype Limitations
 
@@ -1401,7 +1424,7 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 - order records and the per-user execution index hold one trading day; the open replaces both maps, releasing their memory, while the matching engine's order-location map and risk usage keep the capacity of the largest day, and a price level's node slots are freed only when the level empties, which the close guarantees once a day
 - the books hold at most 200,000 resting orders across all symbols, so that the close's one journal record always fits; beyond that an order that would rest is refused (409 `BookFull`) until orders trade, are cancelled, or expire at the close, and one user can fill the book, as there is no per-user share; there is no close spread across several records
 - one order may trade against at most 10,000 resting orders (`TooManyFills`, 409), so that its record always fits the 64 MiB limit; a client that wants more must split its order
-- one journal `sync_all` per group of queued commands; the worker waits during it (no pipelined journaler thread yet), and p99 cannot beat the disk's own sync latency. With replication it also waits for the replica's sync and one round trip; on the office machine the two syncs share one SSD
+- the journal is synced by one journaler thread, one `sync_all` at a time, covering everything written; an order still waits for the rest of the sync in progress and then its own, so p99 cannot beat the disk's own sync latency. With replication it also waits for the replica's sync and one round trip; on the office machine the two syncs share one SSD, which now limits the replicated maximum rate. The replica syncs once per frame it receives and does not coalesce frames itself; the primary must ship once per sync (milestone 25 part 2)
 - replication has one replica, and a new connection replaces the current one. Its link is neither authenticated nor encrypted, and its listener is the only one meant to be reached from another machine: use a private network. Waiting for the replica never times out: a primary without its replica waits until the operator acts (only a link silent for 10 s is dropped, so that the replica dials again). Running alone is not remembered across a restart, and a replica slower than the sustained load cannot end it until the load drops. The operator must never both let the primary run alone and promote the replica: nothing prevents it. The epochs detect it when the old primary tries to rejoin, provided it rejoins with its own stream file, but its commands acknowledged alone are then on its machine only. Started without replication after a promotion, the old primary would serve at once without even syncing its stream's end, so after a power loss its rejoin could cut those commands instead of being refused
 - the replica publishes a record one round trip after confirming it, when the next commit point arrives; its stream holds no records, so its readers read every record from the journal
 - the replica's committed end is what its stream published, synced within about two seconds of it moving. If the primary's disk loses writes it reported synced, or the primary starts on an older copy of its journal, the replica cannot tell the acknowledged records it lost, at most about two seconds' worth after a power loss, from records the primary never synced, and cuts them. Only a third machine could tell them apart
@@ -1435,7 +1458,7 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 
 ## What Not To Work On Yet
 
-Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, is planned and awaits the owner's review of its plan. Do not start any other candidate while it is open. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
+Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, is in progress: Parts 1 and 2 are complete, and Part 3 (a binary format) awaits the owner's decision. Do not start any other candidate while it is open. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
 
 After milestone 25, the remaining candidates (the owner selects):
 1. **Pushed updates (WebSocket)** of a user's own fills and the L2 book. The design requires that a client "receive matched trades in real-time" and "view the real-time order book". Today clients must poll, so a functional requirement is unmet.

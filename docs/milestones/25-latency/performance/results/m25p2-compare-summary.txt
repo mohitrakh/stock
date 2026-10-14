@@ -1,0 +1,140 @@
+
+## stock-m25p1, in-process, replicated no: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 5595   [5491, 5655]
+  p99                12026   [11487, 12447]
+  mean                5858   [5678, 6005]
+  per sync             2.6   [2.2, 2.9]
+
+## stock-m25p2, in-process, replicated no: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [999, 1000]
+  p50                 5244   [5031, 5459]
+  p99                12279   [11919, 12695]
+  mean                5465   [5332, 5578]
+  per sync             2.3   [2.2, 2.5]
+
+## stock-m25p1, in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4997, 4999]
+  p50                 7556   [7091, 7883]
+  p99                17562   [16655, 18591]
+  mean                7883   [7393, 8328]
+  per sync            17.7   [15.6, 21.0]
+
+## stock-m25p2, in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4999   [4998, 4999]
+  p50                 6568   [6047, 7223]
+  p99                18260   [12839, 27327]
+  mean                7075   [6308, 8365]
+  per sync            13.4   [11.5, 15.5]
+
+## stock-m25p1, in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         45975   [43894, 48505]
+  p50               232362   [221567, 245119]
+  p99               300884   [294655, 306943]
+  mean              232254   [219711, 243789]
+  per sync          1016.9   [1015.2, 1020.4]
+
+## stock-m25p2, in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         65057   [64399, 65870]
+  p50               180436   [178687, 181631]
+  p99               225876   [211455, 241919]
+  mean              179377   [177238, 181027]
+  per sync          1010.1   [1010.1, 1010.1]
+
+## stock-m25p1, http, replicated no: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [999, 1000]
+  p50                 6136   [5495, 6523]
+  p99                15802   [14455, 16687]
+  mean                6484   [5906, 6798]
+  unanswered             0   [0, 0]
+
+## stock-m25p2, http, replicated no: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 5975   [5463, 6815]
+  p99                15295   [12991, 18399]
+  mean                6199   [5585, 7069]
+  unanswered             0   [0, 0]
+
+## stock-m25p1, http, replicated no: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4997, 5000]
+  p50                 8194   [6751, 9015]
+  p99                55716   [27855, 93119]
+  mean               10080   [8512, 12009]
+  unanswered             0   [0, 0]
+
+## stock-m25p2, http, replicated no: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4998, 4999]
+  p50                 6522   [5675, 7323]
+  p99                27332   [19535, 40479]
+  mean                7278   [6901, 7844]
+  unanswered             0   [0, 0]
+
+## stock-m25p1, in-process, replicated yes: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput           999   [999, 1000]
+  p50                 9220   [8687, 9655]
+  p99                21988   [20447, 23007]
+  mean                9593   [9109, 9854]
+  per sync             4.5   [3.6, 5.2]
+
+## stock-m25p2, in-process, replicated yes: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 9210   [8719, 9575]
+  p99                21210   [18223, 23087]
+  mean                9516   [8919, 9991]
+  per sync             4.4   [4.1, 4.8]
+
+## stock-m25p1, in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4997   [4996, 4997]
+  p50                13511   [12767, 14327]
+  p99                32826   [31807, 34687]
+  mean               14008   [13541, 14449]
+  per sync            31.8   [27.4, 34.4]
+
+## stock-m25p2, in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4997, 4999]
+  p50                11015   [10303, 11943]
+  p99                25498   [23471, 26943]
+  mean               11408   [10872, 12363]
+  per sync            25.5   [23.3, 29.6]
+
+## stock-m25p1, in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         35297   [32004, 38993]
+  p50               301311   [278015, 317695]
+  p99               424874   [351231, 551423]
+  mean              304533   [274502, 333911]
+  per sync          1015.2   [1015.2, 1015.2]
+
+## stock-m25p2, in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         48256   [47847, 48539]
+  p50               246143   [246143, 246143]
+  p99               291839   [282111, 306175]
+  mean              241106   [239662, 242597]
+  per sync          1011.8   [1010.1, 1015.2]
+
+## stock-m25p1, http, replicated yes: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                10519   [10151, 10783]
+  p99                23172   [21935, 24815]
+  mean               10936   [10486, 11393]
+  unanswered             0   [0, 0]
+
+## stock-m25p2, http, replicated yes: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [999, 1000]
+  p50                 9900   [9567, 10263]
+  p99                21631   [19759, 23487]
+  mean               10262   [9966, 10583]
+  unanswered             0   [0, 0]
+
+## stock-m25p1, http, replicated yes: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4994   [4992, 4997]
+  p50                14487   [14119, 14967]
+  p99                58900   [46527, 65439]
+  mean               16976   [16269, 18307]
+  unanswered             0   [0, 0]
+
+## stock-m25p2, http, replicated yes: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4997, 4999]
+  p50                10892   [9639, 12311]
+  p99                60714   [30207, 114111]
+  mean               12477   [10403, 15349]
+  unanswered             0   [0, 0]

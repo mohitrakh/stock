@@ -221,6 +221,16 @@ change speeds up by a factor k, the latency becomes (1 − f) + f / k of what it
 where staging is not on the critical path. Since every order must still wait for its own sync, the
 real gain at light load is close to zero.
 
+**What a sync covers decides whether a pipeline helps or hurts** (added with Part 2). `fsync`
+makes durable everything written to the file before the call, not one "group". A pipeline that
+syncs one group at a time, in order, wastes that: at moderate load a group of one order takes a
+whole sync, and every order behind it waits a full sync longer than with no pipeline at all. A
+pipeline whose flusher syncs **as far as the log has been written** keeps every order's wait at
+"the rest of the sync in progress, plus one sync", as without a pipeline, and takes the staging and
+the release out of the gap between syncs. Database logs work this way: the writers append, and a
+log flusher syncs as far as the log has grown. `part-2-pipelined-sync.md` works through both at
+5,000 orders/s.
+
 ## 7. What durability forbids a pipeline to do
 
 The rule since milestone 8 is **durable before visible**: nothing about a command may be seen until

@@ -1,0 +1,14 @@
+### m25p2-mutate: 2026-10-14T13:24:03+05:30, tree /home/ubuntu/stock-m25p2
+## control: the real tree, each test alone (own target volume, fresh build)
+  the_next_group_is_written_during_a_sync: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.22s
+  a_failed_sync_with_a_group_in_flight: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.01s
+  a_fault_behind_a_group_in_flight: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.03s
+  at_most_two_groups_wait_for_the_disk: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.27s
+  the_replica_gets_records_once_per_sync: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.02s
+  a group is released before its sync -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.11s (the_next_group_is_written_during_a_sync)
+  the worker waits for each sync (no pipeline) -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 218 filtered out; finished in 10.01s (the_next_group_is_written_during_a_sync)
+  a failed sync counts as durable -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.01s (a_failed_sync_with_a_group_in_flight)
+  a fault halts without draining the group in flight -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.02s (a_fault_behind_a_group_in_flight)
+  each group shipped to the replica as it is written -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.02s (the_replica_gets_records_once_per_sync)
+  no limit on commands waiting for the disk -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 218 filtered out; finished in 10.01s (at_most_two_groups_wait_for_the_disk)
+### done

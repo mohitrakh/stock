@@ -1,9 +1,10 @@
 //! Stage-by-stage timing of orders, compiled only with `--features stage-timing`.
 //!
 //! Every order's round trip is cut into stages, from the HTTP handler to the reply. Each stage
-//! has its own histogram, so a report shows where the time goes, and the sum of the stage medians
-//! can be set against the measured end-to-end median. See
-//! `docs/milestones/25-latency/part-1-stage-timing.md`.
+//! has its own histogram, so a report shows where the time goes, and the sum of the stage means
+//! can be set against the measured end-to-end mean (means add up along a path; medians do not).
+//! See `docs/milestones/25-latency/part-1-stage-timing.md`; part 2 added `WaitForSync` and
+//! `PipelineFull` for the pipelined sync.
 //!
 //! The exchange worker records into its own `Stages` (no lock per order) and merges them into the
 //! global ones once per group. The gateway records straight into the global ones, under a mutex.
@@ -45,10 +46,18 @@ pub enum Stage {
     WaitForGroup,
     /// The group's `write_all` (per group).
     Write,
-    /// The group's `sync_all` (per group).
+    /// One `sync_all` (per sync). Since part 2 it runs on the journaler thread, and one sync
+    /// covers every group written before it began.
     Sync,
-    /// Waiting for the replica's confirmation after the sync (per group; replicated only).
+    /// Waiting for the replica's confirmation after the sync (per sync; replicated only).
     Confirm,
+    /// Its group was written → the worker began to release it: its wait for the disk, per command
+    /// (part 2; reads too, as `Worker`). Unlike `Sync`, which is per sync, it weighs a large group
+    /// by its many commands.
+    WaitForSync,
+    /// The worker stopped taking commands because two groups' worth already waited for the
+    /// disk, until a sync ended (per wait; part 2).
+    PipelineFull,
     /// Publishing the group's batches to the mmap stream and running callbacks (per group).
     Publish,
     /// Releasing the group's replies (per group).
@@ -59,7 +68,7 @@ pub enum Stage {
     GroupSize,
 }
 
-const ALL: [Stage; 16] = [
+const ALL: [Stage; 18] = [
     Stage::HttpBeforeQueue,
     Stage::HttpAsk,
     Stage::HttpTotal,
@@ -72,6 +81,8 @@ const ALL: [Stage; 16] = [
     Stage::Write,
     Stage::Sync,
     Stage::Confirm,
+    Stage::WaitForSync,
+    Stage::PipelineFull,
     Stage::Publish,
     Stage::Release,
     Stage::Worker,

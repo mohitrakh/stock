@@ -28,8 +28,8 @@ decisions, and a glossary. It is written to be studied cold.
 | Part | What | Status |
 |---|---|---|
 | 1 | Where the time goes: stage-by-stage timing (`--features stage-timing`) | complete, 2026-10-14 |
-| 2 | A pipelined journal sync | not started |
-| 3 | A binary record format, only if Part 1 shows it matters | not started |
+| 2 | A pipelined journal sync | complete, 2026-10-14: maximum rate +41.5% alone, +36.7% replicated; mean latency at 5,000/s −10% to −28% |
+| 3 | A binary record format, only if Part 1 shows it matters | not started; the owner's decision is pending |
 | 4 | Final measurement against the milestone 24 part 2 binary | not started |
 
 ## Files
@@ -41,6 +41,10 @@ decisions, and a glossary. It is written to be studied cold.
 | `decisions.md` | The owner's decisions, and the design choices made inside them. |
 | `glossary.md` | Definitions. |
 | `part-1-stage-timing.md` | The `stage-timing` feature, every code change, every test with its result, the mutation check, the review. |
+| `part-2-pipelined-sync.md` | The journaler thread: the design and why (one sync covers everything written; depth counted in commands), the failure rules, every code change, the tests, the mutation check, the review. |
+| `performance/scripts/m25p2-*.sh`, `m25p2-summarize.awk` | Part 2's mutation check, the before/after comparison (normal builds), the stage runs (timed builds), and the summary. |
+| `performance/03-pipelined-sync.md` | Part 2 before and after: the maximum rate, latency at 1,000 and 5,000/s, the worker's cycle, why latency fell more than projected, and Part 1's open question about the gap inside `Worker`, now closed to 1–3%. |
+| `performance/results/m25p2-*.txt` | Raw and summarized output: `compare` and `stages` (the final measurement), `compare-shipping-per-group` (the first, broken version), `shipping-diagnosis`, `mutate`, `final-tests`, and an excerpt of the first smoke run. |
 | `performance/01-instrumentation-overhead.md` | What the timing costs: nothing measurable at 5,000/s, about 3% at the maximum rate; a run-order effect of about 9.5%. |
 | `performance/02-where-the-time-goes.md` | The stage breakdown in ten configurations, the means check, the tail, the maximum-rate cycle, and projections for Parts 2 and 3. |
 

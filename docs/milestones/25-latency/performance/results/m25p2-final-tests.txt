@@ -1,0 +1,28 @@
+### m25p2 final checks, 2026-10-14 (office machine), tree ~/stock-m25p2 with every fix, inside stock-rust:
+### check.sh (fmt + cargo test --locked, first 14 lines), cargo test --locked --features stage-timing,
+### REPORTER_TEST_DATABASE_URL=postgres://postgres:bench@stock-test-pg:5432/reporter_m25p2 cargo test --locked --test reporter -- --ignored
+NOTICE:  database "reporter_m25p2" does not exist, skipping
+=== cargo fmt -- --check
+fmt exit: 0
+=== cargo test --locked
+test exit: 0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 218 filtered out; finished in 0.24s
+test result: ok. 218 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 23.32s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+=== feature
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 221 filtered out; finished in 0.65s
+test result: ok. 221 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 28.03s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+=== reporter acceptance
+test a_close_that_leaves_an_order_resting_stops_the_reporter ... ok
+test a_failed_group_rolls_back_only_itself ... ok
+test reporter_rolls_back_then_restarts_without_duplicate_history ... ok
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.82s

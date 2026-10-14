@@ -56,3 +56,56 @@ These are implementation choices, recorded so the owner can overrule them:
   `append_record`, which is exactly `write_records` followed by `sync`. It now calls the two halves
   itself, so the feature build can time each. The behaviour of both builds is unchanged, and
   `append_record` remains for tests only.
+
+## 2026-10-14 — Part 2 confirmed; Part 3 still open
+
+After Part 1, two questions were put to the owner:
+1. Go ahead with Part 2, a pipelined sync, knowing that Part 1 projects it mainly raises the maximum
+   rate (about +37–66% alone, +79% replicated) and gains at most about 8% of latency at 5,000
+   orders/s?
+2. Drop Part 3, the binary format (recommended), or keep it as a learning exercise?
+
+The owner answered "go ahead with next steps of our current milestone". That is taken as a yes to
+question 1. Question 2 was not answered. Part 3 is not started, and is put to the owner again with
+Part 2's results.
+
+## 2026-10-14 — Design choices inside decision 2 (made while building Part 2)
+
+Implementation choices, recorded so the owner can overrule them. The reasoning, with a worked
+example, is in `part-2-pipelined-sync.md`, "The design, and why".
+
+- **One sync covers everything written, not one sync per group.** The journaler syncs the journal
+  up to where the worker has written. Groups written during a sync share the next one.
+
+  Rejected: *one sync per group, in order*. At moderate load a group of one order would use a whole
+  sync, and every order behind it would wait a full sync longer than with no pipeline at all.
+- **The depth counted in commands: at most 2,048 (two full groups) waiting for the disk.** This is
+  decision 2's "one syncing, one staged" in the unit that matters for memory and for the failure
+  rule.
+
+  Rejected: *two worker groups*. Small groups would use up the slots, as above.
+- **The worker waits on the queue and the journaler at once**, with a current-thread Tokio runtime
+  used only to wait, and a `tokio::sync::Notify`.
+
+  Rejected:
+  - *an `ExchangeCommand` variant the journaler sends into the queue*: an internal signal in the
+    gateway's type;
+  - *polling*: it adds latency or burns CPU.
+- **The journaler stops at its first failed sync and never syncs again.** After a failed `fsync`
+  the kernel may have dropped the dirty pages and marked them clean, so a later `fsync` could
+  succeed without the data. Everything in flight is answered unavailable.
+- **On a staging fault or a write failure, the worker drains before it halts.** The groups before
+  the fault are valid and may still become durable; they are released if they do. On a failed sync
+  or a failed publication, nothing more is released.
+- **Two new stages in the timed build:**
+  - `WaitForSync`, per command, from its group's write to its release;
+  - `PipelineFull`, per wait, when the worker stops at 2,048 commands.
+
+  `Sync` and `Confirm` become per sync and are recorded on the journaler thread.
+- **Records go to the replica once per sync, from the journaler, not once per group from the
+  worker** (changed after the first measurement, which found the per-group version broken at
+  moderate load, replicated: the replica syncs every frame and fell seconds behind;
+  `part-2-pipelined-sync.md`, "A bug the measurement found").
+
+  Rejected for now: *coalescing frames on the replica*. It would also work, but it changes the
+  replica, which this milestone does not otherwise touch.

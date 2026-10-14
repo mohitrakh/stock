@@ -1,0 +1,518 @@
+### m25p2-compare: 3 run(s) of each, generator /scripts/stock-m25p1, 2026-10-14T12:46:52+05:30
+### stock-m25p1, in-process, replicated no, run 1: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:46:52+05:30: loadavg 4.77 3.74 2.56, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.003 s
+  latency us : p50 4823  p90 8263  p99 13359  p99.9 28719  max 38591  mean 5218.1
+  syncs      : 8510 (2.4 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated no, run 1: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:47:13+05:30: loadavg 6.12 4.12 2.70, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.006 s
+  latency us : p50 4739  p90 8027  p99 12327  p99.9 21343  max 30975  mean 5030.2
+  syncs      : 10243 (2.0 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated no, run 2: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:47:34+05:30: loadavg 5.97 4.25 2.79, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.005 s
+  latency us : p50 5155  p90 8527  p99 13479  p99.9 19295  max 22671  mean 5436.9
+  syncs      : 9513 (2.1 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated no, run 2: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:47:55+05:30: loadavg 6.67 4.51 2.90, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.008 s
+  latency us : p50 5199  p90 9223  p99 15407  p99.9 27087  max 37375  mean 5637.6
+  syncs      : 9452 (2.1 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated no, run 3: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:48:16+05:30: loadavg 5.72 4.43 2.91, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 999 orders/s over 20.012 s
+  latency us : p50 5751  p90 10047  p99 17887  p99.9 25631  max 36831  mean 6354.1
+  syncs      : 6539 (3.1 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated no, run 3: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:48:37+05:30: loadavg 5.83 4.53 2.98, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.005 s
+  latency us : p50 6479  p90 10143  p99 14503  p99.9 18847  max 21647  mean 6882.6
+  syncs      : 7031 (2.8 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated no, run 1: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:48:58+05:30: loadavg 5.48 4.53 3.01, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4997 orders/s over 20.011 s
+  latency us : p50 8647  p90 17295  p99 33759  p99.9 48319  max 62303  mean 10053.8
+  syncs      : 5127 (19.5 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated no, run 1: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:49:19+05:30: loadavg 5.72 4.67 3.10, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4998 orders/s over 20.009 s
+  latency us : p50 6423  p90 11047  p99 20415  p99.9 38143  max 47295  mean 6931.4
+  syncs      : 8759 (11.4 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated no, run 2: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:49:40+05:30: loadavg 5.03 4.58 3.10, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4998 orders/s over 20.008 s
+  latency us : p50 6591  p90 10583  p99 22175  p99.9 43327  max 55935  mean 7200.7
+  syncs      : 7079 (14.1 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated no, run 2: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:50:01+05:30: loadavg 4.61 4.51 3.11, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4997 orders/s over 20.013 s
+  latency us : p50 9079  p90 17247  p99 33599  p99.9 56895  max 68863  mean 10176.5
+  syncs      : 5631 (17.8 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated no, run 3: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:50:22+05:30: loadavg 4.07 4.39 3.10, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4999 orders/s over 20.005 s
+  latency us : p50 5979  p90 10559  p99 17247  p99.9 39103  max 49599  mean 6387.8
+  syncs      : 8903 (11.2 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated no, run 3: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:50:43+05:30: loadavg 3.40 4.22 3.07, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4998 orders/s over 20.008 s
+  latency us : p50 5211  p90 8775  p99 12599  p99.9 42175  max 58527  mean 5450.4
+  syncs      : 11359 (8.8 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated no, run 1: --bench --orders 200000 --rate 0
+# host 2026-10-14T12:51:04+05:30: loadavg 3.00 4.06 3.05, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 44376 orders/s over 4.507 s
+  latency us : p50 240767  p90 296959  p99 354303  p99.9 357375  max 357887  mean 240630.7  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated no, run 1: --bench --orders 200000 --rate 0
+# host 2026-10-14T12:51:10+05:30: loadavg 2.92 4.02 3.04, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 56984 orders/s over 3.510 s
+  latency us : p50 190591  p90 286463  p99 401919  p99.9 421375  max 421375  mean 205225.5  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated no, run 2: --bench --orders 200000 --rate 0
+# host 2026-10-14T12:51:15+05:30: loadavg 2.85 3.99 3.03, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 65388 orders/s over 3.059 s
+  latency us : p50 180863  p90 202495  p99 224383  p99.9 228095  max 228351  mean 178420.6  (queue-bound at max rate)
+  syncs      : 198 (1010.1 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated no, run 2: --bench --orders 200000 --rate 0
+# host 2026-10-14T12:51:20+05:30: loadavg 3.02 4.00 3.04, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 46705 orders/s over 4.282 s
+  latency us : p50 234239  p90 274431  p99 303359  p99.9 311551  max 311807  mean 228976.5  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated no, run 3: --bench --orders 200000 --rate 0
+# host 2026-10-14T12:51:25+05:30: loadavg 2.86 3.95 3.03, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 45672 orders/s over 4.379 s
+  latency us : p50 234879  p90 252927  p99 265215  p99.9 272383  max 272895  mean 232232.7  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated no, run 3: --bench --orders 200000 --rate 0
+# host 2026-10-14T12:51:31+05:30: loadavg 2.79 3.92 3.03, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 62209 orders/s over 3.215 s
+  latency us : p50 186751  p90 211455  p99 261631  p99.9 266239  max 266751  mean 187621.8  (queue-bound at max rate)
+  syncs      : 198 (1010.1 orders per sync)
+  rejected   : 0
+### stock-m25p1, http, replicated no, run 1: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:51:39+05:30: loadavg 3.02 3.94 3.04, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.006 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 5635  p90 9495  p99 15415  p99.9 22495  max 30479  mean 5969.9
+  send lag us: p50 1113  p90 1611  p99 2032  p99.9 3375  max 5083  mean 1145.7
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 282.0 us per order, 28% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated no, run 1: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:52:04+05:30: loadavg 3.46 3.96 3.07, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.006 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 5823  p90 10295  p99 18799  p99.9 28383  max 35071  mean 6284.9
+  send lag us: p50 658  p90 1180  p99 1539  p99.9 3103  max 5655  mean 697.9
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 339.5 us per order, 34% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated no, run 2: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:52:29+05:30: loadavg 3.50 3.96 3.10, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.001 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 6207  p90 9479  p99 13343  p99.9 26191  max 39967  mean 6398.0
+  send lag us: p50 662  p90 1163  p99 1421  p99.9 3287  max 6395  mean 695.9
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 361.0 us per order, 36% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated no, run 2: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:52:52+05:30: loadavg 3.52 3.93 3.11, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.005 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 6347  p90 9487  p99 14215  p99.9 20911  max 31023  mean 6558.7
+  send lag us: p50 1257  p90 1779  p99 2111  p99.9 3903  max 6019  mean 1299.0
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 373.0 us per order, 37% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated no, run 3: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:53:15+05:30: loadavg 4.00 4.00 3.15, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.006 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 6015  p90 9399  p99 17295  p99.9 36287  max 47295  mean 6409.7
+  send lag us: p50 875  p90 1385  p99 2239  p99.9 5543  max 11871  mean 923.3
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 343.0 us per order, 34% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated no, run 3: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:53:38+05:30: loadavg 4.06 4.02 3.17, containers running 31
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.003 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 4935  p90 8159  p99 12887  p99.9 35295  max 44383  mean 5193.7
+  send lag us: p50 525  p90 1030  p99 1369  p99.9 4155  max 10503  mean 566.1
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 326.0 us per order, 33% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated no, run 1: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:54:01+05:30: loadavg 3.96 4.00 3.19, containers running 31
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4998 orders/s over 20.010 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 5719  p90 14879  p99 27935  p99.9 73919  max 95551  mean 7626.0
+  send lag us: p50 1067  p90 1719  p99 2875  p99.9 9727  max 22991  mean 1129.9
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 125.7 us per order, 63% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated no, run 1: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:54:24+05:30: loadavg 4.53 4.11 3.25, containers running 31
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 5000 orders/s over 20.002 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 6419  p90 10591  p99 20015  p99.9 40479  max 56511  mean 6753.3
+  send lag us: p50 1042  p90 1657  p99 2217  p99.9 4747  max 12015  mean 1071.7
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 118.2 us per order, 59% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated no, run 2: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:54:47+05:30: loadavg 4.88 4.23 3.31, containers running 31
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4998 orders/s over 20.008 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 6227  p90 10607  p99 19439  p99.9 57279  max 74175  mean 6773.6
+  send lag us: p50 1047  p90 1658  p99 2171  p99.9 3505  max 8027  mean 1072.0
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 122.0 us per order, 61% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated no, run 2: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:55:11+05:30: loadavg 4.96 4.32 3.36, containers running 31
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4997 orders/s over 20.014 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 7491  p90 17391  p99 32447  p99.9 59455  max 91263  mean 9183.0
+  send lag us: p50 989  p90 1691  p99 3333  p99.9 7483  max 11007  mean 1068.5
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 131.8 us per order, 66% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated no, run 3: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:55:35+05:30: loadavg 4.30 4.22 3.35, containers running 31
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4995 orders/s over 20.020 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 5919  p90 12647  p99 31279  p99.9 48735  max 63775  mean 7275.5
+  send lag us: p50 961  p90 1588  p99 2285  p99.9 4311  max 13119  mean 996.2
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 111.1 us per order, 55% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated no, run 3: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-14T12:55:58+05:30: loadavg 4.47 4.25 3.38, containers running 31
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4998 orders/s over 20.007 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 7479  p90 12943  p99 29455  p99.9 59967  max 75199  mean 8230.0
+  send lag us: p50 1128  p90 1786  p99 3591  p99.9 11127  max 15495  mean 1208.5
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 130.5 us per order, 65% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, in-process, replicated yes, run 1: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:56:19+05:30: loadavg 4.75 4.34 3.44, containers running 31
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.006 s
+  latency us : p50 9079  p90 13639  p99 22431  p99.9 31407  max 37887  mean 9412.2
+  syncs      : 4439 (4.5 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated yes, run 1: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:56:42+05:30: loadavg 4.41 4.29 3.44, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 957 orders/s over 20.908 s
+  latency us : p50 2635775  p90 4390911  p99 4919295  p99.9 5095423  max 5111807  mean 2556561.2
+  syncs      : 37 (540.5 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated yes, run 2: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:57:05+05:30: loadavg 3.74 4.14 3.41, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 967 orders/s over 20.691 s
+  latency us : p50 2096127  p90 4300799  p99 5005311  p99.9 5185535  max 5206015  mean 2232393.6
+  syncs      : 499 (40.1 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated yes, run 2: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:57:28+05:30: loadavg 3.24 4.00 3.38, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.007 s
+  latency us : p50 8179  p90 13439  p99 19279  p99.9 25647  max 29871  mean 8482.0
+  syncs      : 4963 (4.0 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated yes, run 3: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:57:50+05:30: loadavg 3.15 3.90 3.37, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 1000 orders/s over 20.006 s
+  latency us : p50 9383  p90 15111  p99 56095  p99.9 102079  max 117183  mean 10677.6
+  syncs      : 4020 (5.0 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated yes, run 3: --bench --orders 20000 --rate 1000
+# host 2026-10-14T12:58:12+05:30: loadavg 4.12 4.10 3.44, containers running 30
+bench: 20000 orders a day for 1 day(s), rate 1000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 974 orders/s over 20.531 s
+  latency us : p50 1964031  p90 3649535  p99 4341759  p99.9 4521983  max 4542463  mean 1929731.0
+  syncs      : 177 (113.0 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated yes, run 1: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:58:35+05:30: loadavg 4.75 4.22 3.50, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4996 orders/s over 20.016 s
+  latency us : p50 9951  p90 18031  p99 55231  p99.9 185471  max 205439  mean 11542.2
+  syncs      : 5163 (19.4 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated yes, run 1: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:58:58+05:30: loadavg 4.31 4.16 3.50, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4961 orders/s over 20.158 s
+  latency us : p50 591359  p90 1236991  p99 1629183  p99.9 1713151  max 1727487  mean 654976.2
+  syncs      : 149 (671.1 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated yes, run 2: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:59:20+05:30: loadavg 3.62 4.00 3.46, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4900 orders/s over 20.410 s
+  latency us : p50 593407  p90 1306623  p99 1622015  p99.9 1758207  max 1777663  mean 679351.9
+  syncs      : 137 (729.9 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated yes, run 2: --bench --orders 100000 --rate 5000
+# host 2026-10-14T12:59:43+05:30: loadavg 3.59 3.97 3.46, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4996 orders/s over 20.017 s
+  latency us : p50 12103  p90 21535  p99 41919  p99.9 82047  max 91647  mean 12982.0
+  syncs      : 4147 (24.1 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated yes, run 3: --bench --orders 100000 --rate 5000
+# host 2026-10-14T13:00:06+05:30: loadavg 3.38 3.89 3.45, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4996 orders/s over 20.015 s
+  latency us : p50 12071  p90 21391  p99 33727  p99.9 52095  max 71487  mean 12576.1
+  syncs      : 4180 (23.9 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated yes, run 3: --bench --orders 100000 --rate 5000
+# host 2026-10-14T13:00:29+05:30: loadavg 3.13 3.80 3.43, containers running 30
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4952 orders/s over 20.195 s
+  latency us : p50 653311  p90 1349631  p99 1740799  p99.9 1917951  max 1937407  mean 701986.2
+  syncs      : 152 (657.9 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated yes, run 1: --bench --orders 200000 --rate 0
+# host 2026-10-14T13:00:51+05:30: loadavg 2.82 3.67 3.39, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 38238 orders/s over 5.230 s
+  latency us : p50 285183  p90 332031  p99 391679  p99.9 400383  max 400639  mean 279313.7  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated yes, run 1: --bench --orders 200000 --rate 0
+# host 2026-10-14T13:00:59+05:30: loadavg 2.62 3.60 3.37, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 48987 orders/s over 4.083 s
+  latency us : p50 245503  p90 258047  p99 281087  p99.9 285951  max 286207  mean 237576.3  (queue-bound at max rate)
+  syncs      : 198 (1010.1 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated yes, run 2: --bench --orders 200000 --rate 0
+# host 2026-10-14T13:01:06+05:30: loadavg 2.65 3.59 3.37, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 46953 orders/s over 4.260 s
+  latency us : p50 247807  p90 277759  p99 294399  p99.9 304127  max 304639  mean 246551.5  (queue-bound at max rate)
+  syncs      : 196 (1020.4 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated yes, run 2: --bench --orders 200000 --rate 0
+# host 2026-10-14T13:01:14+05:30: loadavg 2.99 3.63 3.39, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 36008 orders/s over 5.554 s
+  latency us : p50 300543  p90 338431  p99 350975  p99.9 358655  max 358911  mean 296560.1  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  rejected   : 0
+### stock-m25p1, in-process, replicated yes, run 3: --bench --orders 200000 --rate 0
+# host 2026-10-14T13:01:23+05:30: loadavg 2.99 3.62 3.38, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 29961 orders/s over 6.675 s
+  latency us : p50 367871  p90 435455  p99 467199  p99.9 474367  max 474623  mean 357520.7  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  rejected   : 0
+### stock-m25p2, in-process, replicated yes, run 3: --bench --orders 200000 --rate 0
+# host 2026-10-14T13:01:33+05:30: loadavg 3.00 3.60 3.38, containers running 30
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 49199 orders/s over 4.065 s
+  latency us : p50 244479  p90 258303  p99 268031  p99.9 270847  max 271615  mean 236694.0  (queue-bound at max rate)
+  syncs      : 198 (1010.1 orders per sync)
+  rejected   : 0
+### stock-m25p1, http, replicated yes, run 1: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:01:43+05:30: loadavg 2.84 3.55 3.36, containers running 32
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.007 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 11623  p90 17311  p99 23855  p99.9 42911  max 52479  mean 12153.8
+  send lag us: p50 1394  p90 1878  p99 2501  p99.9 4031  max 7203  mean 1421.3
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 344.5 us per order, 34% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated yes, run 1: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:02:10+05:30: loadavg 3.46 3.65 3.41, containers running 32
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : not measured (19988 answered before the 120 s deadline)
+  unanswered : 12 (no answer within the 120 s deadline)
+  latency us : p50 1862  p90 2228223  p99 2476031  p99.9 2562047  max 13025279  mean 921974.1
+  send lag us: p50 1106  p90 1558  p99 3371  p99.9 9935  max 15663  mean 1155.7
+  statuses   : 201 x 9712
+  errors     : 10276 (first: http://127.0.0.1:4000/exchange/orders: client error (Connect))
+  client cpu : 306.0 us per order, 5% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated yes, run 2: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:04:17+05:30: loadavg 1.18 2.79 3.12, containers running 32
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : not measured (19988 answered before the 120 s deadline)
+  unanswered : 12 (no answer within the 120 s deadline)
+  latency us : p50 2045  p90 2498559  p99 2811903  p99.9 2932735  max 20791295  mean 867157.8
+  send lag us: p50 743  p90 1205  p99 2795  p99.9 8023  max 17903  mean 786.6
+  statuses   : 201 x 9985
+  errors     : 10003 (first: http://127.0.0.1:4000/exchange/orders: client error (Connect))
+  client cpu : 320.5 us per order, 5% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated yes, run 2: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:06:25+05:30: loadavg 0.78 2.22 2.88, containers running 32
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 999 orders/s over 20.010 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 10567  p90 16047  p99 24015  p99.9 36191  max 48767  mean 10639.3
+  send lag us: p50 1117  p90 1613  p99 2243  p99.9 4419  max 9927  mean 1149.0
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 347.5 us per order, 35% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated yes, run 3: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:06:50+05:30: loadavg 1.69 2.32 2.90, containers running 32
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 1000 orders/s over 20.005 s (20000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 9719  p90 15367  p99 22847  p99.9 33407  max 45599  mean 9725.0
+  send lag us: p50 810  p90 1304  p99 1950  p99.9 3349  max 6327  mean 840.8
+  statuses   : 201 x 20000
+  errors     : 0
+  client cpu : 318.0 us per order, 32% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated yes, run 3: --http-bench --orders 20000 --rate 1000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:07:15+05:30: loadavg 2.19 2.39 2.90, containers running 32
+http-bench: 20000 orders, rate 1000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : not measured (19988 answered before the 120 s deadline)
+  unanswered : 12 (no answer within the 120 s deadline)
+  latency us : p50 2175  p90 2369535  p99 3121151  p99.9 3246079  max 3260415  mean 923776.5
+  send lag us: p50 1442  p90 1903  p99 3635  p99.9 9095  max 18687  mean 1492.3
+  statuses   : 201 x 9480
+  errors     : 10508 (first: http://127.0.0.1:4000/exchange/orders: client error (Connect))
+  client cpu : 325.0 us per order, 5% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated yes, run 1: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:09:22+05:30: loadavg 1.21 2.02 2.71, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4997 orders/s over 20.012 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 11279  p90 23759  p99 49471  p99.9 92223  max 112063  mean 13070.0
+  send lag us: p50 1075  p90 1764  p99 3887  p99.9 10591  max 17151  mean 1167.8
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 117.7 us per order, 59% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated yes, run 1: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:09:46+05:30: loadavg 2.16 2.18 2.74, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : not measured (99988 answered before the 120 s deadline)
+  unanswered : 12 (no answer within the 120 s deadline)
+  latency us : p50 1951  p90 577535  p99 860671  p99.9 1013247  max 17268735  mean 189096.3
+  send lag us: p50 1264  p90 2523  p99 11239  p99.9 17919  max 24543  mean 1705.4
+  statuses   : 201 x 41915
+  errors     : 58073 (first: http://127.0.0.1:4000/exchange/orders: client error (Connect))
+  client cpu : 133.7 us per order, 11% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated yes, run 2: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:11:54+05:30: loadavg 1.39 2.09 2.65, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : not measured (99988 answered before the 120 s deadline)
+  unanswered : 12 (no answer within the 120 s deadline)
+  latency us : p50 1757  p90 617983  p99 856575  p99.9 1010687  max 18350079  mean 188058.5
+  send lag us: p50 1125  p90 2030  p99 9287  p99.9 15335  max 21151  mean 1469.5
+  statuses   : 201 x 40406
+  errors     : 59582 (first: http://127.0.0.1:4000/exchange/orders: client error (Connect))
+  client cpu : 126.2 us per order, 11% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated yes, run 2: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:14:00+05:30: loadavg 2.11 2.14 2.60, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4996 orders/s over 20.018 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 13887  p90 30863  p99 51999  p99.9 69823  max 80959  mean 16524.3
+  send lag us: p50 1145  p90 1888  p99 3899  p99.9 7439  max 12311  mean 1239.4
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 123.8 us per order, 62% of one hardware thread (user + system, includes the login loops)
+### stock-m25p1, http, replicated yes, run 3: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:14:23+05:30: loadavg 3.22 2.39 2.68, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : 4997 orders/s over 20.012 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 12623  p90 35647  p99 71231  p99.9 89023  max 99327  mean 16478.4
+  send lag us: p50 1112  p90 1837  p99 3903  p99.9 7283  max 10583  mean 1202.0
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 115.8 us per order, 58% of one hardware thread (user + system, includes the login loops)
+### stock-m25p2, http, replicated yes, run 3: --http-bench --orders 100000 --rate 5000
+# exchange: Tokio worker threads: 4, replicated: yes
+# host 2026-10-14T13:14:48+05:30: loadavg 3.60 2.55 2.72, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  throughput : not measured (99988 answered before the 120 s deadline)
+  unanswered : 12 (no answer within the 120 s deadline)
+  latency us : p50 1700  p90 666111  p99 867839  p99.9 923647  max 17743871  mean 189226.8
+  send lag us: p50 1123  p90 1989  p99 9911  p99.9 19183  max 28335  mean 1498.5
+  statuses   : 201 x 37953
+  errors     : 62035 (first: http://127.0.0.1:4000/exchange/orders: client error (Connect))
+  client cpu : 124.7 us per order, 10% of one hardware thread (user + system, includes the login loops)
+### done

@@ -1,0 +1,23 @@
+### EXCERPT, not a raw file: copied from the terminal of a manual run, filtered by grep to the
+### throughput, latency and syncs lines; the "## ..." headers were printed by the inline command.
+### m25p2 smoke run, 2026-10-14 12:46 (office machine), one run of each, not interleaved-alternated
+### (stock-m25p2 always ran second, which Part 1 found about 9.5% faster at the maximum rate):
+### inproc_bench {no,yes} --orders 200000 --rate 0, BIN stock-m25p1 then stock-m25p2 (m24-lib.sh)
+## stock-m25p1
+# host 2026-10-14T12:46:15+05:30: loadavg 5.18 3.67 2.49, containers running 30
+  throughput : 48958 orders/s over 4.085 s
+  latency us : p50 223999  p90 252415  p99 262399  p99.9 264959  max 265215  mean 218158.4  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+## stock-m25p2
+# host 2026-10-14T12:46:20+05:30: loadavg 5.41 3.75 2.52, containers running 30
+  throughput : 56039 orders/s over 3.569 s
+  latency us : p50 201727  p90 257279  p99 300031  p99.9 301567  max 303871  mean 206128.0  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+## stock-m25p1 replicated
+  throughput : 34222 orders/s over 5.844 s
+  latency us : p50 310527  p90 355071  p99 392959  p99.9 403455  max 403967  mean 310511.7  (queue-bound at max rate)
+  syncs      : 196 (1020.4 orders per sync)
+## stock-m25p2 replicated
+  throughput : 45779 orders/s over 4.369 s
+  latency us : p50 249599  p90 308223  p99 370431  p99.9 376319  max 376575  mean 254516.9  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)

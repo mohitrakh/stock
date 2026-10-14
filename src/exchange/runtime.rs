@@ -1,4 +1,11 @@
-use std::{net::SocketAddr, path::Path, sync::Arc};
+use std::{
+    collections::VecDeque,
+    net::SocketAddr,
+    path::Path,
+    sync::{Arc, Condvar, Mutex, MutexGuard},
+};
+
+use tokio::sync::mpsc::error::TryRecvError;
 
 use crate::{
     exchange::{
@@ -6,7 +13,7 @@ use crate::{
             CoreError, ExchangeCore, PreparedAddOrder, PreparedCancelOrder, PreparedExpiry,
             SessionError,
         },
-        event_store::{EventStore, EventStoreError, MAX_RECORD_LEN, encode_record},
+        event_store::{EventStore, EventStoreError, MAX_RECORD_LEN, encode_record, sync_journal},
         event_stream::{DEFAULT_CAPACITY, StreamWriter, already_published},
         replication::Replication,
         snapshot::{self, SnapshotBoundary},
@@ -65,7 +72,17 @@ pub struct ExchangeRuntime {
     terms: Option<Terms>,
     /// The epoch a promotion starts: `run` journals it before anything else.
     pending_term: Option<u64>,
+    /// Tests hold the journaler's syncs here: before each sync it sends the end the sync covers,
+    /// then takes one value, and syncs on `true`, fails the sync on `false`.
+    #[cfg(test)]
+    sync_gate: Option<SyncGate>,
 }
+
+#[cfg(test)]
+type SyncGate = (
+    std::sync::mpsc::Sender<u64>,
+    std::sync::mpsc::Receiver<bool>,
+);
 
 /// How much the journal grows between core snapshots, as a multiple of the last snapshot's size.
 /// Since milestone 20 the warm replica writes them, not this runtime: a snapshot serializes the
@@ -75,9 +92,14 @@ pub struct ExchangeRuntime {
 /// with the square of its length (see `docs/performance/09-promotion-from-the-warm-replica.md`).
 pub const DEFAULT_SNAPSHOT_GROWTH: u64 = 4;
 
-/// Most commands that may share one journal sync. Below this cap a group is simply whatever was
+/// Most commands the worker takes as one group. Below this cap a group is simply whatever was
 /// already queued; the cap bounds how long the first command waits for the last to be prepared.
 const MAX_GROUP: usize = 1_024;
+
+/// Most commands that may wait for the disk at once: two full groups, one being synced while the
+/// next is staged (pipeline depth 2, milestone 25 part 2). With this many not yet durable the
+/// worker takes no more, so the in-memory core is never further ahead of the journal.
+const MAX_UNDURABLE: usize = 2 * MAX_GROUP;
 
 /// Startup refuses untrustworthy history or an unusable committed-event stream.
 #[derive(Debug)]
@@ -712,6 +734,8 @@ impl ExchangeRuntime {
             held: None,
             terms: None,
             pending_term: None,
+            #[cfg(test)]
+            sync_gate: None,
         }
     }
 
@@ -755,6 +779,8 @@ impl ExchangeRuntime {
             held: None,
             terms: None,
             pending_term: None,
+            #[cfg(test)]
+            sync_gate: None,
         })
     }
 
@@ -778,6 +804,8 @@ impl ExchangeRuntime {
             held: None,
             terms: None,
             pending_term: None,
+            #[cfg(test)]
+            sync_gate: None,
         }
     }
 
@@ -925,31 +953,183 @@ impl ExchangeRuntime {
     }
 
     pub fn run(mut self) {
-        if let Err(err) = self.release_held().and_then(|()| self.start_pending_term()) {
+        let result = self
+            .release_held()
+            .and_then(|()| self.start_pending_term())
+            .and_then(|()| self.pipeline());
+        if let Err(err) = result {
+            // Fail closed. A store or preparation error stops the worker before anything not yet
+            // durable is visible. A publication error happens AFTER the sync: recovery publishes
+            // what was synced on restart.
             eprintln!("exchange worker halted: {err}. No further commands accepted.");
-            return;
         }
-        let mut group = Vec::with_capacity(MAX_GROUP);
-        while let Some(first) = self.rx.blocking_recv() {
-            // Natural batching: whatever queued up while the previous group was syncing becomes
-            // the next group. A quiet exchange gets groups of one; a busy one shares each sync.
-            group.push(first);
-            while group.len() < MAX_GROUP {
+    }
+
+    /// Group commit, pipelined (milestone 25 part 2). The worker takes whatever is queued as a
+    /// group, stages it, writes it, and hands its sync to the journaler thread. While the disk
+    /// syncs, the worker goes on to the next group. One sync covers every group written before it
+    /// began. A group is released (published, its callbacks run, its replies sent, reads
+    /// included) only once the disk holds it, and groups are released in queue order, so nothing
+    /// is visible before it is durable. At most `MAX_UNDURABLE` commands wait for the disk; then
+    /// the worker waits too.
+    ///
+    /// The in-memory core runs ahead of the disk by the commands in flight. If a sync fails, none
+    /// of them is ever shown: each is answered with the halt message (a read is dropped), the
+    /// worker halts, and a restart rebuilds from the journal. A command that cannot be staged, or
+    /// a group the disk refuses to write, also halts the worker, after the groups before it are
+    /// released if they become durable.
+    fn pipeline(&mut self) -> Result<(), RuntimeFailure> {
+        let journaler = match self.store.as_ref() {
+            Some(store) => Some(Journaler::start(
+                store,
+                self.replication.clone(),
+                self.next_event_seq,
+            )?),
+            None => None,
+        };
+        #[cfg(test)]
+        if let (Some(journaler), Some(gate)) = (&journaler, self.sync_gate.take()) {
+            *journaler.shared.gate.lock().unwrap() = Some(gate);
+        }
+        // Waits on the queue and the journaler at once. A current-thread runtime does no work of
+        // its own: it only parks this thread until one of them wakes it.
+        let waiter = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map_err(|error| RuntimeFailure::Internal(format!("the worker's waiter: {error}")))?;
+        let start = journaler
+            .as_ref()
+            .map_or(0, |journaler| journaler.lock().written);
+        let mut in_flight = InFlight {
+            groups: VecDeque::new(),
+            commands: 0,
+            written: start,
+            released: start,
+        };
+        let mut commands = Vec::with_capacity(MAX_GROUP);
+        loop {
+            self.release_durable(&mut in_flight, journaler.as_ref())?;
+            if in_flight.commands >= MAX_UNDURABLE {
+                // Two groups' worth wait for the disk: the core goes no further ahead of it.
+                #[cfg(feature = "stage-timing")]
+                let waiting = std::time::Instant::now();
+                waiter.block_on(the_journaler(&journaler).synced());
+                #[cfg(feature = "stage-timing")]
+                timing::record(|stages| stages.record(Stage::PipelineFull, waiting.elapsed()));
+                continue;
+            }
+            let next = if in_flight.groups.is_empty() {
+                self.rx.blocking_recv()
+            } else {
                 match self.rx.try_recv() {
-                    Ok(command) => group.push(command),
+                    Ok(command) => Some(command),
+                    Err(TryRecvError::Disconnected) => None,
+                    Err(TryRecvError::Empty) => {
+                        // Nothing queued: whichever comes first, a command to stage or a sync to
+                        // release.
+                        let (rx, journaler) = (&mut self.rx, the_journaler(&journaler));
+                        let woken = waiter.block_on(async {
+                            tokio::select! {
+                                command = rx.recv() => Some(command),
+                                () = journaler.synced() => None,
+                            }
+                        });
+                        match woken {
+                            Some(command) => command,
+                            None => continue,
+                        }
+                    }
+                }
+            };
+            let Some(first) = next else {
+                // Every sender is gone: finish what is in flight.
+                return self.drain(&mut in_flight, journaler.as_ref(), &waiter);
+            };
+            // Natural batching: whatever queued up meanwhile joins this group. A quiet exchange
+            // gets groups of one; a busy one shares each write, and the syncs share the writes.
+            commands.push(first);
+            let room = MAX_GROUP.min(MAX_UNDURABLE - in_flight.commands);
+            while commands.len() < room {
+                match self.rx.try_recv() {
+                    Ok(command) => commands.push(command),
                     Err(_) => break,
                 }
             }
-            if let Err(err) = self.handle_group(group.drain(..)) {
-                // Fail closed. A store or preparation error stops the worker before anything in
-                // the group is visible. A publication error happens AFTER the sync: recovery
-                // publishes that group on restart.
-                eprintln!(
-                    "exchange worker halted: {}. No further commands accepted.",
-                    err
-                );
-                break;
+            let (mut group, fault) = self.stage_group(commands.drain(..));
+            match self.write(&mut group, in_flight.written) {
+                Ok(true) => {
+                    in_flight.written = group.end;
+                    the_journaler(&journaler).written(group.end, self.next_event_seq);
+                }
+                Ok(false) => {}
+                Err(failure) => {
+                    // The groups before it may still become durable: let them, then halt.
+                    let drained = self.drain(&mut in_flight, journaler.as_ref(), &waiter);
+                    fail_all([group], &failure);
+                    return drained.and(Err(failure));
+                }
             }
+            in_flight.commands += group.replies.len();
+            in_flight.groups.push_back(group);
+            if let Some(fault) = fault {
+                self.drain(&mut in_flight, journaler.as_ref(), &waiter)?;
+                return Err(fault);
+            }
+        }
+    }
+
+    /// Releases, oldest first, every group in flight that the disk now holds. After a failed
+    /// sync nothing in flight may ever be shown, and after a failed publication nothing later
+    /// may be published past the gap: every command still in flight is answered with the halt
+    /// message.
+    fn release_durable(
+        &mut self,
+        in_flight: &mut InFlight,
+        journaler: Option<&Journaler>,
+    ) -> Result<(), RuntimeFailure> {
+        // Without a journal there is nothing to wait for.
+        let (durable, alone_until) = match journaler.map_or(Ok((u64::MAX, 0)), Journaler::durable) {
+            Ok(position) => position,
+            Err(failure) => {
+                fail_all(in_flight.groups.drain(..), &failure);
+                return Err(failure);
+            }
+        };
+        let ready = in_flight
+            .groups
+            .iter()
+            .take_while(|group| group.end <= durable)
+            .count();
+        if ready == 0 {
+            return Ok(());
+        }
+        let groups: Vec<Group> = in_flight.groups.drain(..ready).collect();
+        in_flight.commands -= groups
+            .iter()
+            .map(|group| group.replies.len())
+            .sum::<usize>();
+        // Running alone let a sync among these through before the replica held it.
+        let alone = alone_until > in_flight.released;
+        in_flight.released = groups.last().expect("at least one is ready").end;
+        let released = self.release(groups, alone);
+        if let Err(failure) = &released {
+            fail_all(in_flight.groups.drain(..), failure);
+        }
+        released
+    }
+
+    /// Waits until every group in flight is durable, releasing each as it becomes so.
+    fn drain(
+        &mut self,
+        in_flight: &mut InFlight,
+        journaler: Option<&Journaler>,
+        waiter: &tokio::runtime::Runtime,
+    ) -> Result<(), RuntimeFailure> {
+        loop {
+            self.release_durable(in_flight, journaler)?;
+            let Some(journaler) = journaler.filter(|_| !in_flight.groups.is_empty()) else {
+                return Ok(());
+            };
+            waiter.block_on(journaler.synced());
         }
     }
 
@@ -1194,101 +1374,61 @@ impl ExchangeRuntime {
         Ok(result)
     }
 
-    /// Makes a group durable with ONE journal write and ONE sync, then publishes each command's
-    /// batch in order and runs its callbacks. Nothing here is reachable before the sync returns.
+    /// Makes staged commands durable on this thread, with ONE journal write and ONE sync, then
+    /// publishes each command's batch in order and runs its callbacks. Nothing here is reachable
+    /// before the sync returns. Startup's term record uses it, before the pipeline starts.
     fn flush(&mut self, staged: Vec<Staged>) -> Result<(), RuntimeFailure> {
-        if staged.is_empty() {
-            return Ok(()); // a group of reads changed nothing
-        }
-        let mut alone = false;
-        if let Some(store) = self.store.as_mut() {
-            let records: Vec<&[u8]> = staged.iter().map(|s| s.record.as_slice()).collect();
-            let records = records.concat();
-            #[cfg(feature = "stage-timing")]
-            let started = std::time::Instant::now();
-            store
-                .write_records(&records)
-                .map_err(RuntimeFailure::Store)?;
-            #[cfg(feature = "stage-timing")]
-            let written = std::time::Instant::now();
-            if let Some(replication) = &self.replication {
-                // The group goes to the replica while this disk syncs, then waits for both:
-                // nothing that exists on one machine only is ever published or answered, unless
-                // the operator lets this primary run alone.
-                let end = store.end().map_err(RuntimeFailure::Store)?;
-                let next_sequence = staged.last().expect("a group").last_sequence + 1;
-                replication.written(end, next_sequence);
-                store.sync().map_err(RuntimeFailure::Store)?;
-                #[cfg(feature = "stage-timing")]
-                let synced = std::time::Instant::now();
-                alone = replication.confirm(end);
-                #[cfg(feature = "stage-timing")]
-                timing::record(|stages| stages.record(Stage::Confirm, synced.elapsed()));
-                #[cfg(feature = "stage-timing")]
-                timing::record(|stages| stages.record(Stage::Sync, synced - written));
-            } else {
-                store.sync().map_err(RuntimeFailure::Store)?;
-                #[cfg(feature = "stage-timing")]
-                timing::record(|stages| stages.record(Stage::Sync, written.elapsed()));
-            }
-            #[cfg(feature = "stage-timing")]
-            timing::record(|stages| stages.record(Stage::Write, written - started));
-        }
-        #[cfg(feature = "stage-timing")]
-        let publishing = std::time::Instant::now();
-        for command in staged {
-            // Only now is the command part of history and visible to callbacks.
-            #[cfg(test)]
-            self.event_log.extend(command.batch);
-            if let Some(stream) = self.stream.as_mut() {
-                stream
-                    .append(&command.record, command.last_sequence)
-                    .map_err(RuntimeFailure::Stream)?;
-            }
-            self.core.notify_executions(&command.executions);
-        }
-        #[cfg(feature = "stage-timing")]
-        timing::record(|stages| stages.record(Stage::Publish, publishing.elapsed()));
-        // Answered on this machine only: its stream's end, which says what it acknowledged, must
-        // survive a power loss, so that if this primary was replaced meanwhile, the handshake
-        // refuses it when it rejoins rather than cutting what it acknowledged.
-        if alone && let Some(stream) = self.stream.as_ref() {
-            stream.sync_header().map_err(RuntimeFailure::Stream)?;
-        }
-        Ok(())
+        let mut group = Group::new();
+        group.staged = staged;
+        self.commit_here(group)
     }
 
-    /// Group commit. Every command already waiting is staged in queue order, then one sync makes
-    /// the whole group durable, and only then are replies released — reads included. Until the
-    /// sync returns, the in-memory core is ahead of the disk, but nothing outside this worker can
-    /// observe it: no reply, no mmap batch, no callback, no snapshot. If the sync fails the worker
-    /// halts, and the restart rebuilds from the journal, discarding the unsynced state.
-    fn handle_group(
+    /// One group, start to finish on this thread: written, synced, then released. If the disk
+    /// fails, every command in it is answered with the halt message instead.
+    fn commit_here(&mut self, mut group: Group) -> Result<(), RuntimeFailure> {
+        let durable = match self.write(&mut group, 0) {
+            Ok(true) => self.sync_here(group.end),
+            Ok(false) => Ok(false), // a group of reads changed nothing
+            Err(failure) => Err(failure),
+        };
+        match durable {
+            Ok(alone) => self.release(vec![group], alone),
+            Err(failure) => {
+                fail_all([group], &failure);
+                Err(failure)
+            }
+        }
+    }
+
+    /// Stages a group's commands in queue order. A write is prepared, encoded and committed in
+    /// memory, so the next command sees it; a read is answered from the core at its place. Every
+    /// reply is held in the group until the group is durable. A command that cannot be staged is
+    /// answered with the halt message at once and ends the group: the commands before it go on to
+    /// the disk, and those after it are dropped unanswered, which the gateway reports as
+    /// unavailable. Returns the group, and that fault if there was one.
+    fn stage_group(
         &mut self,
         commands: impl Iterator<Item = ExchangeCommand>,
-    ) -> Result<(), RuntimeFailure> {
-        let mut staged = Vec::new();
-        let mut replies = Vec::new();
-        let mut fault = None;
+    ) -> (Group, Option<RuntimeFailure>) {
         // The group was taken off the queue just before this call, all of it within microseconds.
-        #[cfg(feature = "stage-timing")]
-        let dequeued = std::time::Instant::now();
+        let mut group = Group::new();
+        let mut fault = None;
         #[cfg(feature = "stage-timing")]
         let mut staging_ends = Vec::new();
         for command in commands {
             #[cfg(feature = "stage-timing")]
             timing::record(|stages| {
                 if let ExchangeCommand::PlaceOrder { queued_at, .. } = &command {
-                    stages.record(Stage::Queue, dequeued.saturating_duration_since(*queued_at));
+                    stages.record(
+                        Stage::Queue,
+                        group.dequeued.saturating_duration_since(*queued_at),
+                    );
                 }
-                stages.record(Stage::WaitInGroup, dequeued.elapsed());
+                stages.record(Stage::WaitInGroup, group.dequeued.elapsed());
             });
-            match self.stage_command(command, &mut staged) {
-                Ok(reply) => replies.push(reply),
+            match self.stage_command(command, &mut group.staged) {
+                Ok(reply) => group.replies.push(reply),
                 Err(err) => {
-                    // That command is already answered. The valid commands before it still go
-                    // through the sync below; those queued after it are dropped unanswered, which
-                    // the gateway reports as unavailable.
                     fault = Some(err);
                     break;
                 }
@@ -1304,21 +1444,142 @@ impl ExchangeRuntime {
             }
             stages.count(Stage::GroupSize, staging_ends.len() as u64);
         });
-        let flushed = self.flush(staged);
-        let failure = flushed.as_ref().err().map(halted_message);
+        (group, fault)
+    }
+
+    /// Writes a group's records with ONE `write_all` and sets where the group ends: once the disk
+    /// holds the journal up to there, the group may be shown. A group of reads writes nothing and
+    /// ends at `end`, the journal's end so far. True when it wrote records. The replica gets the
+    /// records when a sync covering them begins (`make_durable`), not here.
+    fn write(&mut self, group: &mut Group, end: u64) -> Result<bool, RuntimeFailure> {
+        group.end = end;
+        let Some(store) = self.store.as_mut().filter(|_| !group.staged.is_empty()) else {
+            return Ok(false);
+        };
+        let records: Vec<&[u8]> = group.staged.iter().map(|s| s.record.as_slice()).collect();
+        let records = records.concat();
         #[cfg(feature = "stage-timing")]
-        let releasing = std::time::Instant::now();
-        for reply in replies {
-            reply(failure.as_deref());
+        let started = std::time::Instant::now();
+        store
+            .write_records(&records)
+            .map_err(RuntimeFailure::Store)?;
+        #[cfg(feature = "stage-timing")]
+        {
+            group.written = std::time::Instant::now();
+            timing::record(|stages| stages.record(Stage::Write, group.written - started));
+        }
+        group.end = store.end().map_err(RuntimeFailure::Store)?;
+        Ok(true)
+    }
+
+    /// Makes the journal durable through `end`, the end of the last staged command, on this
+    /// thread. True when running alone let it through before the replica held it.
+    fn sync_here(&mut self, end: u64) -> Result<bool, RuntimeFailure> {
+        let Some(store) = self.store.as_mut() else {
+            return Ok(false);
+        };
+        make_durable(
+            || store.sync(),
+            self.replication.as_deref(),
+            end,
+            self.next_event_seq,
+        )
+    }
+
+    /// Releases durable groups, oldest first: publishes each command's batch on the stream, runs
+    /// its callbacks, and only then answers the commands. `alone`: running alone let some of them
+    /// through before the replica held them. If publication fails, the group it failed in and
+    /// every later one are answered with the halt message; the groups published before it are
+    /// answered normally, unless `alone`, which needs the stream's header synced first: then, as
+    /// when the header sync itself fails, every group is.
+    fn release(&mut self, groups: Vec<Group>, alone: bool) -> Result<(), RuntimeFailure> {
+        #[cfg(feature = "stage-timing")]
+        let release_began = std::time::Instant::now();
+        let mut published = Ok(());
+        let mut answers = Vec::with_capacity(groups.len());
+        for group in groups {
+            if published.is_ok() {
+                published = self.publish(group.staged);
+            }
+            let shown = published.is_ok();
             #[cfg(feature = "stage-timing")]
-            timing::record(|stages| stages.record(Stage::Worker, dequeued.elapsed()));
+            answers.push((shown, group.replies, group.dequeued, group.written));
+            #[cfg(not(feature = "stage-timing"))]
+            answers.push((shown, group.replies));
+        }
+        // Answered on this machine only: its stream's end, which says what it acknowledged, must
+        // survive a power loss, so that if this primary was replaced meanwhile, the handshake
+        // refuses it when it rejoins rather than cutting what it acknowledged.
+        let header = if alone
+            && published.is_ok()
+            && let Some(stream) = self.stream.as_ref()
+        {
+            stream.sync_header().map_err(RuntimeFailure::Stream)
+        } else {
+            Ok(())
+        };
+        // Running alone, a command may be acknowledged only once the header is synced, which it
+        // is not after a failed publication or a failed header sync: then the whole pass fails.
+        let acknowledgeable = !alone || (published.is_ok() && header.is_ok());
+        if published.is_ok() {
+            published = header;
+        }
+        let failure = published.as_ref().err().map(halted_message);
+        let answer = |shown: bool| {
+            (!shown || !acknowledgeable)
+                .then(|| failure.as_deref())
+                .flatten()
+        };
+        #[cfg(feature = "stage-timing")]
+        for (shown, replies, dequeued, written) in answers {
+            let releasing = std::time::Instant::now();
+            for reply in replies {
+                timing::record(|stages| stages.record(Stage::WaitForSync, release_began - written));
+                reply(answer(shown));
+                timing::record(|stages| stages.record(Stage::Worker, dequeued.elapsed()));
+            }
+            timing::record(|stages| stages.record(Stage::Release, releasing.elapsed()));
+        }
+        #[cfg(not(feature = "stage-timing"))]
+        for (shown, replies) in answers {
+            for reply in replies {
+                reply(answer(shown));
+            }
         }
         #[cfg(feature = "stage-timing")]
-        timing::record(|stages| {
-            stages.record(Stage::Release, releasing.elapsed());
-            stages.merge_into_global();
-        });
-        flushed?;
+        timing::record(|stages| stages.merge_into_global());
+        published
+    }
+
+    /// Publishes one durable group's batches in order and runs their callbacks.
+    fn publish(&mut self, staged: Vec<Staged>) -> Result<(), RuntimeFailure> {
+        #[cfg(feature = "stage-timing")]
+        let publishing = std::time::Instant::now();
+        for command in staged {
+            // Only now is the command part of history and visible to callbacks.
+            #[cfg(test)]
+            self.event_log.extend(command.batch);
+            if let Some(stream) = self.stream.as_mut() {
+                stream
+                    .append(&command.record, command.last_sequence)
+                    .map_err(RuntimeFailure::Stream)?;
+            }
+            self.core.notify_executions(&command.executions);
+        }
+        #[cfg(feature = "stage-timing")]
+        timing::record(|stages| stages.record(Stage::Publish, publishing.elapsed()));
+        Ok(())
+    }
+
+    /// One group, synchronously: staged, written, synced, released. Tests drive the runtime's
+    /// parts through this; the worker runs the same parts pipelined (`pipeline`).
+    #[cfg(test)]
+    fn handle_group(
+        &mut self,
+        commands: impl Iterator<Item = ExchangeCommand>,
+    ) -> Result<(), RuntimeFailure> {
+        let (group, fault) = self.stage_group(commands);
+        self.commit_here(group)?;
         fault.map_or(Ok(()), Err)
     }
 
@@ -1377,6 +1638,263 @@ fn hold_read<T: 'static>(respond_to: tokio::sync::oneshot::Sender<T>, value: T) 
 
 fn halted_message(err: &RuntimeFailure) -> String {
     format!("exchange unavailable: {}", err)
+}
+
+/// Answers every command of `groups` with the halt message: none of it may ever be shown.
+fn fail_all(groups: impl IntoIterator<Item = Group>, failure: &RuntimeFailure) {
+    let message = halted_message(failure);
+    for group in groups {
+        for reply in group.replies {
+            reply(Some(&message));
+        }
+    }
+}
+
+/// One group taken off the queue: staged in memory, then written, then waiting for the disk.
+struct Group {
+    staged: Vec<Staged>,
+    replies: Vec<HeldReply>,
+    /// The journal's end once this group was written: when the disk holds the journal up to
+    /// here, the group may be shown.
+    end: u64,
+    #[cfg(feature = "stage-timing")]
+    dequeued: std::time::Instant,
+    #[cfg(feature = "stage-timing")]
+    written: std::time::Instant,
+}
+
+impl Group {
+    fn new() -> Self {
+        Self {
+            staged: Vec::new(),
+            replies: Vec::new(),
+            end: 0,
+            #[cfg(feature = "stage-timing")]
+            dequeued: std::time::Instant::now(),
+            #[cfg(feature = "stage-timing")]
+            written: std::time::Instant::now(),
+        }
+    }
+}
+
+/// The worker's side of the pipeline.
+struct InFlight {
+    /// Groups written but not yet released, oldest first.
+    groups: VecDeque<Group>,
+    /// The commands in `groups`, reads included.
+    commands: usize,
+    /// The journal's end as the worker has written it.
+    written: u64,
+    /// The end of the last group released.
+    released: u64,
+}
+
+/// Makes the journal durable through `end`, after which comes `next_sequence`. With replication it
+/// first hands the records to the link, which ships them while this disk syncs, then waits until
+/// the replica holds them too: nothing that exists on one machine only is ever published or
+/// answered, unless the operator lets this primary run alone. True when running alone let it
+/// through before the replica held it. The worker calls this for a group of its own
+/// (`sync_here`), and the journaler thread for everything written.
+///
+/// The records go to the replica here, once per sync, not as each group is written: the replica
+/// syncs every frame it receives, so a frame per small group would cost it a sync per group, many
+/// more than the primary's, and it would fall behind (milestone 25 part 2, measured).
+fn make_durable(
+    sync: impl FnOnce() -> Result<(), EventStoreError>,
+    replication: Option<&Replication>,
+    end: u64,
+    next_sequence: u64,
+) -> Result<bool, RuntimeFailure> {
+    if let Some(replication) = replication {
+        replication.written(end, next_sequence);
+    }
+    #[cfg(feature = "stage-timing")]
+    let started = std::time::Instant::now();
+    sync().map_err(RuntimeFailure::Store)?;
+    #[cfg(feature = "stage-timing")]
+    let synced = std::time::Instant::now();
+    #[cfg(feature = "stage-timing")]
+    timing::record(|stages| stages.record(Stage::Sync, synced - started));
+    let Some(replication) = replication else {
+        return Ok(false);
+    };
+    let alone = replication.confirm(end);
+    #[cfg(feature = "stage-timing")]
+    timing::record(|stages| stages.record(Stage::Confirm, synced.elapsed()));
+    Ok(alone)
+}
+
+/// The journal's sync, on its own thread (milestone 25 part 2), so that the worker stages the
+/// next group while the disk syncs the last. Each sync covers everything written before it began:
+/// groups written while one sync runs share the next. It stops at its first failure and never
+/// syncs again, because after a failed sync the disk's state is unknown. Dropping it stops it.
+struct Journaler {
+    shared: Arc<JournalShared>,
+}
+
+struct JournalShared {
+    state: Mutex<Durability>,
+    /// Signalled when the worker writes: the journaler waits here for something to sync.
+    written: Condvar,
+    /// Notified after every sync and failure: the worker waits here, alone or with the queue.
+    synced: tokio::sync::Notify,
+    #[cfg(test)]
+    gate: Mutex<Option<SyncGate>>,
+}
+
+struct Durability {
+    /// The journal's end as the worker wrote it.
+    written: u64,
+    /// The journal sequence after `written`, which the replication link needs.
+    next_sequence: u64,
+    /// The end the disk holds, and with replication the replica's disk too.
+    durable: u64,
+    /// The end of the last sync that running alone let through before the replica held it.
+    alone_until: u64,
+    /// The failure that stopped the journaler, until the worker takes it.
+    failed: Option<RuntimeFailure>,
+    stopped: bool,
+}
+
+impl Journaler {
+    /// Starts the journaler on its own handle to `store`'s journal, all of which is durable now,
+    /// followed by `next_sequence`.
+    fn start(
+        store: &EventStore,
+        replication: Option<Arc<Replication>>,
+        next_sequence: u64,
+    ) -> Result<Self, RuntimeFailure> {
+        let file = store
+            .file()
+            .try_clone()
+            .map_err(|error| RuntimeFailure::Store(error.into()))?;
+        let end = store.end().map_err(RuntimeFailure::Store)?;
+        let shared = Arc::new(JournalShared {
+            state: Mutex::new(Durability {
+                written: end,
+                next_sequence,
+                durable: end,
+                alone_until: 0,
+                failed: None,
+                stopped: false,
+            }),
+            written: Condvar::new(),
+            synced: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            gate: Mutex::new(None),
+        });
+        let syncing = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("journaler".into())
+            .spawn(move || syncing.run(file, replication))
+            .map_err(|error| RuntimeFailure::Internal(format!("journaler thread: {error}")))?;
+        Ok(Self { shared })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Durability> {
+        self.shared.state.lock().unwrap()
+    }
+
+    /// The worker wrote records up to `end`, followed by `next_sequence`.
+    fn written(&self, end: u64, next_sequence: u64) {
+        let mut state = self.lock();
+        state.written = end;
+        state.next_sequence = next_sequence;
+        drop(state);
+        self.shared.written.notify_one();
+    }
+
+    /// How far the journal is durable, and the end of the last sync running alone let through;
+    /// or the failure that stopped the journaler.
+    fn durable(&self) -> Result<(u64, u64), RuntimeFailure> {
+        let mut state = self.lock();
+        match state.failed.take() {
+            Some(failure) => Err(failure),
+            None => Ok((state.durable, state.alone_until)),
+        }
+    }
+
+    /// Completes after the next sync or failure, or at once if one came since the last wait.
+    fn synced(&self) -> tokio::sync::futures::Notified<'_> {
+        self.shared.synced.notified()
+    }
+}
+
+impl Drop for Journaler {
+    fn drop(&mut self) {
+        self.lock().stopped = true;
+        self.shared.written.notify_one();
+    }
+}
+
+impl JournalShared {
+    fn run(&self, file: std::fs::File, replication: Option<Arc<Replication>>) {
+        loop {
+            let (end, next_sequence) = {
+                let mut state = self.state.lock().unwrap();
+                while state.written <= state.durable && !state.stopped {
+                    state = self.written.wait(state).unwrap();
+                }
+                if state.stopped {
+                    return;
+                }
+                (state.written, state.next_sequence)
+            };
+            let result = make_durable(
+                || {
+                    #[cfg(test)]
+                    if !self.gate_opens(end) {
+                        return Err(std::io::Error::other("the test failed this sync").into());
+                    }
+                    sync_journal(&file)
+                },
+                replication.as_deref(),
+                end,
+                next_sequence,
+            );
+            #[cfg(feature = "stage-timing")]
+            timing::record(|stages| stages.merge_into_global());
+            let failed = result.is_err();
+            {
+                let mut state = self.state.lock().unwrap();
+                match result {
+                    Ok(alone) => {
+                        state.durable = end;
+                        if alone {
+                            state.alone_until = end;
+                        }
+                    }
+                    Err(failure) => state.failed = Some(failure),
+                }
+            }
+            self.synced.notify_one();
+            if failed {
+                return;
+            }
+        }
+    }
+
+    /// A test's gate: says which end this sync covers, then waits for the test's answer. True
+    /// lets the sync run, false fails it. Without a gate, or once the test closes it, every sync
+    /// runs.
+    #[cfg(test)]
+    fn gate_opens(&self, end: u64) -> bool {
+        self.gate
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|(arrived, gate)| {
+                let _ = arrived.send(end);
+                gate.recv().unwrap_or(true)
+            })
+    }
+}
+
+/// The journaler, where only a journal can have left commands waiting for the disk.
+fn the_journaler(journaler: &Option<Journaler>) -> &Journaler {
+    journaler
+        .as_ref()
+        .expect("only a journal leaves commands waiting for the disk")
 }
 
 /// Opens the event log at `path`, replays whatever history it holds, and returns a runtime ready to
@@ -2792,6 +3310,7 @@ mod tests {
             "WaitForGroup",
             "Write",
             "Sync",
+            "WaitForSync",
             "Publish",
             "Release",
             "Worker",
@@ -2904,6 +3423,327 @@ mod tests {
         assert!(recovered.core.position_views("late").is_empty());
         assert!(recovered.core.order_view("buy-1", "buyer").is_none());
         drop(recovered);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The complete records in the journal at `path`, walked by their length prefixes. The
+    /// pipeline tests read it while the worker runs, to see what it has written.
+    fn records_in(path: &Path) -> usize {
+        let bytes = std::fs::read(path).unwrap();
+        let (mut offset, mut records) = (crate::exchange::event_store::JOURNAL_HEADER_LEN, 0);
+        while let Ok(len) =
+            crate::exchange::event_stream::record_length(&bytes[offset.min(bytes.len())..])
+        {
+            if offset + len > bytes.len() {
+                break;
+            }
+            offset += len;
+            records += 1;
+        }
+        records
+    }
+
+    fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !condition() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn deposit_via(
+        tx: &tokio::sync::mpsc::Sender<ExchangeCommand>,
+        user: &str,
+        amount: u64,
+    ) -> oneshot::Receiver<Result<(), String>> {
+        let (respond_to, reply) = oneshot::channel();
+        tx.blocking_send(ExchangeCommand::Deposit {
+            user_id: user.into(),
+            amount,
+            respond_to,
+        })
+        .unwrap();
+        reply
+    }
+
+    fn balance_via(
+        tx: &tokio::sync::mpsc::Sender<ExchangeCommand>,
+        user: &str,
+    ) -> oneshot::Receiver<crate::types::types::BalanceView> {
+        let (respond_to, reply) = oneshot::channel();
+        tx.blocking_send(ExchangeCommand::GetBalance {
+            user_id: user.into(),
+            respond_to,
+        })
+        .unwrap();
+        reply
+    }
+
+    /// Holds the runtime's syncs at a test gate. Returns the gate (send `true` to let one sync run,
+    /// `false` to fail it; drop it to let every sync run) and where the journaler reports the end
+    /// each held sync covers.
+    fn hold_syncs(
+        runtime: &mut ExchangeRuntime,
+    ) -> (
+        std::sync::mpsc::Sender<bool>,
+        std::sync::mpsc::Receiver<u64>,
+    ) {
+        let (gate, held) = std::sync::mpsc::channel();
+        let (arrive, arrived) = std::sync::mpsc::channel();
+        runtime.sync_gate = Some((arrive, held));
+        (gate, arrived)
+    }
+
+    /// Milestone 25 part 2. While the journaler's sync of one group is held, the worker takes and
+    /// writes the next commands. Nothing of a group shows before its own sync: no reply, no read,
+    /// no publication. And a read staged behind a write waits for that write's sync.
+    #[test]
+    fn the_next_group_is_written_during_a_sync_and_nothing_shows_before_its_own_sync() {
+        use crate::exchange::event_stream::tests::Fixture;
+        let fixture = Fixture::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let (gate, arrived) = hold_syncs(&mut runtime);
+        let mut reader = fixture.reader();
+        let worker = std::thread::spawn(move || runtime.run());
+
+        let mut first = deposit_via(&tx, "buyer", 10);
+        // The journaler holds the first deposit's sync at the gate, and that sync covers the
+        // journal as it is now: through the first deposit only.
+        let first_end = arrived.recv().unwrap();
+        assert_eq!(first_end, std::fs::metadata(&fixture.log).unwrap().len());
+        let start = records_in(&fixture.log) - 1;
+        let mut second = deposit_via(&tx, "buyer", 20);
+        wait_until(
+            "the second deposit is written during the first's sync",
+            || records_in(&fixture.log) == start + 2,
+        );
+        let mut balance = balance_via(&tx, "buyer");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(first.try_recv().is_err(), "answered before its sync");
+        assert!(second.try_recv().is_err());
+        assert!(balance.try_recv().is_err());
+        assert!(reader.next_batch().unwrap().is_none(), "published unsynced");
+
+        // The first sync covers the first deposit only: it alone is answered and published.
+        gate.send(true).unwrap();
+        assert_eq!(first.blocking_recv().unwrap(), Ok(()));
+        assert!(reader.next_batch().unwrap().is_some());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(second.try_recv().is_err(), "answered before its own sync");
+        assert!(
+            balance.try_recv().is_err(),
+            "a read shown before the write it saw"
+        );
+        assert!(reader.next_batch().unwrap().is_none());
+
+        assert!(
+            arrived.recv().unwrap() > first_end,
+            "the next sync covers the second"
+        );
+        gate.send(true).unwrap();
+        assert_eq!(second.blocking_recv().unwrap(), Ok(()));
+        assert_eq!(balance.blocking_recv().unwrap().balance, 30);
+        assert!(reader.next_batch().unwrap().is_some());
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// Milestone 25 part 2. The replica syncs every frame it gets, so the link must get records
+    /// once per sync, not once per group: a group written while a sync is held reaches the link
+    /// only when the next sync begins. Shipping each group at once made the replica sync about ten
+    /// times as often as the primary, at 1,000 orders/s, and fall seconds behind.
+    #[test]
+    fn the_replica_gets_records_once_per_sync_not_once_per_group() {
+        let path = temp_log_path("pipeline-shipping");
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut runtime = recover_runtime(rx, &path).unwrap();
+        let replication = runtime.replicate("127.0.0.1:0".parse().unwrap()).unwrap();
+        let (gate, arrived) = hold_syncs(&mut runtime);
+        let worker = std::thread::spawn(move || runtime.run());
+
+        let first = deposit_via(&tx, "buyer", 10);
+        let first_end = arrived.recv().unwrap();
+        assert_eq!(replication.status().journal_end, first_end);
+        let start = records_in(&path) - 1;
+        let second = deposit_via(&tx, "buyer", 20);
+        wait_until(
+            "the second deposit is written during the first's sync",
+            || records_in(&path) == start + 2,
+        );
+        assert_eq!(
+            replication.status().journal_end,
+            first_end,
+            "a group reached the link before a sync covering it began"
+        );
+
+        // No replica is connected: let this primary run alone, so the held syncs can finish.
+        replication.run_alone();
+        gate.send(true).unwrap();
+        assert!(arrived.recv().unwrap() > first_end);
+        assert!(replication.status().journal_end > first_end);
+        drop(gate);
+        assert_eq!(first.blocking_recv().unwrap(), Ok(()));
+        assert_eq!(second.blocking_recv().unwrap(), Ok(()));
+        drop(tx);
+        worker.join().unwrap();
+        replication.shutdown();
+        let _ = std::fs::remove_file(format!("{}.terms", path.display()));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Milestone 25 part 2, the failure rule: a failed sync with a second group in flight
+    /// answers neither, publishes neither, and halts the worker. The restart recovers from the
+    /// journal.
+    #[test]
+    fn a_failed_sync_with_a_group_in_flight_answers_neither_and_halts() {
+        use crate::exchange::event_stream::tests::Fixture;
+        let fixture = Fixture::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let (gate, arrived) = hold_syncs(&mut runtime);
+        let mut reader = fixture.reader();
+        let worker = std::thread::spawn(move || runtime.run());
+
+        let first = deposit_via(&tx, "buyer", 10);
+        // The first sync, held, covers the first deposit only; the second is in flight behind it.
+        assert_eq!(
+            arrived.recv().unwrap(),
+            std::fs::metadata(&fixture.log).unwrap().len()
+        );
+        let start = records_in(&fixture.log) - 1;
+        let second = deposit_via(&tx, "buyer", 20);
+        wait_until(
+            "the second deposit is written during the first's sync",
+            || records_in(&fixture.log) == start + 2,
+        );
+        gate.send(false).unwrap();
+
+        for reply in [first, second] {
+            assert!(
+                reply
+                    .blocking_recv()
+                    .unwrap()
+                    .unwrap_err()
+                    .starts_with("exchange unavailable:")
+            );
+        }
+        worker.join().unwrap();
+        assert!(reader.next_batch().unwrap().is_none());
+        // The worker is gone, and so is its queue.
+        assert!(
+            tx.blocking_send(ExchangeCommand::GetSession {
+                respond_to: oneshot::channel().0,
+            })
+            .is_err()
+        );
+        // After a failed sync the disk's state is unknown. This test's failure lost nothing, so
+        // the restart recovers both deposits. Neither was acknowledged, so either outcome would
+        // be correct; what matters is that the journal alone decides.
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let recovered = recover_runtime(rx, &fixture.log).unwrap();
+        assert_eq!(recovered.core.balance_view("buyer").balance, 30);
+    }
+
+    /// Milestone 25 part 2. A command that cannot be staged is answered at once, but the worker
+    /// halts only after the group in flight before it is durable and released.
+    #[test]
+    fn a_fault_behind_a_group_in_flight_releases_that_group_then_halts() {
+        let path = temp_log_path("pipeline-fault");
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let mut runtime = recover_runtime(rx, &path).unwrap();
+        for input in [
+            open_market(),
+            ExchangeInputEvent::FundsDepositRequested {
+                user_id: "buyer".into(),
+                amount: 10,
+            },
+            share_deposit("seller", 1),
+            ExchangeInputEvent::NewOrderRequested {
+                order: order("sell-1", "seller", "SELL", 10, 1),
+            },
+        ] {
+            runtime.record_and_process_input_event(input).unwrap();
+        }
+        // As in the test above: crediting a seller who holds u64::MAX is an internal fault.
+        runtime.core.force_balance_for_test("seller", u64::MAX);
+        let (gate, _arrived) = hold_syncs(&mut runtime);
+        let start = records_in(&path);
+        let worker = std::thread::spawn(move || runtime.run());
+
+        let (respond_to, mut before) = oneshot::channel();
+        tx.blocking_send(ExchangeCommand::DepositShares {
+            user_id: "other".into(),
+            symbol: "AAPL".into(),
+            quantity: 7,
+            respond_to,
+        })
+        .unwrap();
+        wait_until("the first group is written", || {
+            records_in(&path) == start + 1
+        });
+        let (respond_to, faulting) = oneshot::channel();
+        tx.blocking_send(ExchangeCommand::place_order(
+            order("buy-1", "buyer", "BUY", 10, 1),
+            respond_to,
+        ))
+        .unwrap();
+        assert!(
+            faulting
+                .blocking_recv()
+                .unwrap()
+                .unwrap_err()
+                .starts_with("exchange unavailable:")
+        );
+        assert!(before.try_recv().is_err(), "answered before its sync");
+
+        gate.send(true).unwrap();
+        assert_eq!(before.blocking_recv().unwrap(), Ok(()));
+        worker.join().unwrap();
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let recovered = recover_runtime(rx, &path).unwrap();
+        assert_eq!(recovered.core.position_views("other")[0].quantity, 7);
+        assert!(recovered.core.order_view("buy-1", "buyer").is_none());
+        drop(recovered);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Milestone 25 part 2, the pipeline depth: with the disk held, the worker writes two full
+    /// groups, `MAX_UNDURABLE` commands, and takes no more until a sync ends.
+    #[test]
+    fn at_most_two_groups_wait_for_the_disk() {
+        let path = temp_log_path("pipeline-depth");
+        let (tx, rx) = tokio::sync::mpsc::channel(MAX_UNDURABLE + 8);
+        let mut runtime = recover_runtime(rx, &path).unwrap();
+        let (gate, _arrived) = hold_syncs(&mut runtime);
+        let start = records_in(&path);
+        // All queued before the worker starts, so it can take as many as it may.
+        let replies: Vec<_> = (0..MAX_UNDURABLE + 5)
+            .map(|_| deposit_via(&tx, "buyer", 1))
+            .collect();
+        let worker = std::thread::spawn(move || runtime.run());
+
+        wait_until("two full groups are written", || {
+            records_in(&path) == start + MAX_UNDURABLE
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            records_in(&path),
+            start + MAX_UNDURABLE,
+            "took a third group"
+        );
+
+        // Without its sender the gate lets every sync through.
+        drop(gate);
+        for reply in replies {
+            assert_eq!(reply.blocking_recv().unwrap(), Ok(()));
+        }
+        assert_eq!(
+            balance_via(&tx, "buyer").blocking_recv().unwrap().balance,
+            (MAX_UNDURABLE + 5) as u64
+        );
+        drop(tx);
+        worker.join().unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
