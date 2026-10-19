@@ -1,4 +1,4 @@
-# Project Direction - Milestone 25 (Latency) Closed; Next Milestone Not Selected
+# Project Direction - Milestone 26 (Pushed Updates) Planned, Awaiting Owner Review
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -1415,6 +1415,173 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 
 **Milestone 25 closed on 2026-10-19.** Follow-ups recorded, not planned: a probe timing `sync_all` with and without a concurrent appender; runs on two machines; an option to delay the journaler's next sync to protect the median at moderate load.
 
+## 26. Pushed Updates
+
+**Status: planned on 2026-10-19; awaiting the owner's review of the plan and decisions 1–6. No code until then.** Progress will be recorded at the end of this section. Documents go in `docs/milestones/26-pushed-updates/`, with the same layout and depth rules as milestones 24 and 25 (the repository's `CLAUDE.md`).
+
+### Why this milestone
+
+- **A functional requirement is unmet.** The design says a client can "receive matched trades in real-time" and "view the real-time order book" (`stock-exchange-system-design.md`, functional requirements). Today a client must poll `GET /marketdata/orderbook/{symbol}` (the MDP, port 4001) and `GET /exchange/executions` (port 4000).
+- **The design places it off the trading path.** The market data publisher "rebuilds the order book and candlestick charts, then publishes to subscribers", and the market data and reporting flows are not on the critical path. The MDP already follows the committed mmap stream and holds every L2 book. It lacks only a way to push.
+- **It is new learning ground:**
+  - fan-out to many clients;
+  - a snapshot followed by sequenced deltas;
+  - gap detection and resynchronization;
+  - backpressure and slow consumers;
+  - authentication on long-lived connections.
+
+  Milestones 24 and 25 were about one order's path. This one is about one event reaching many readers.
+- **The cost is outside the exchange.** Both feeds read the committed stream, as the MDP and the reporter do, so the worker, the journal and replication are unchanged. Durable before visible holds by construction: the stream publishes only what the journal synced, and with replication only what the replica confirmed.
+
+What is known now:
+- **The MDP keeps up, as far as measured.** It applied about 56,000 commands/s on catch-up and stayed within a second of the exchange live at up to about 34,500 orders/s (`docs/performance/05-market-data-keeps-up.md`). Since milestone 25 the exchange's maximum rate is about 50,000–65,000 orders/s on the office machine. Whether the MDP keeps up at that rate, with deltas to compute, is not measured: Part 3 measures it.
+- **Public data is already separated from private.** The MDP's projection holds no user ids, by rule. Milestone 14 says "user ids ... must never be exposed by the market-data endpoint", and a test checks that its state file contains none.
+- **Fills carry no user ids.** `ExecutionCreated` names only the buy and sell order ids. The incoming order's user is in the same batch (`NewOrderRequested`); the resting order's user is not. So a private feed must keep its own `order_id -> user_id` map, built from accepted orders, as the core and the reporter do.
+- **No WebSocket code exists.** Axum's `ws` feature is off; turning it on would add `tokio-tungstenite`.
+- **Authentication reads only the `Authorization` header** (`AuthUser`). Browsers cannot set that header on a WebSocket handshake.
+
+### Goal
+
+Push every change a client is entitled to see, as soon as it is durable, without polling and without touching the trading path:
+- **public:** the L2 book of each subscribed symbol, as a snapshot followed by deltas with sequence numbers, so a client always knows whether its copy is complete;
+- **private:** each user's own fills and order status changes (accepted, partially filled, filled, canceled, expired, rejected), to that user only.
+
+A client that falls behind is told so and resynchronizes; it never silently holds a wrong book. The exchange's throughput and latency must be unchanged with the feeds running: the mean must differ by less than 10%, or the difference must be explained.
+
+### Parts
+
+1. **The public L2 feed, in the MDP.**
+   - **The change.** A WebSocket endpoint on the MDP's port: `GET /marketdata/ws`.
+     - The client subscribes with `{"type":"subscribe","channel":"book","symbol":"AAPL"}`.
+     - It gets a `snapshot`: every level, with two sequences:
+       - `seq`, the stream point the snapshot reflects;
+       - `last`, the sequence of that symbol's latest delta (0 if none).
+     - It then gets a `delta` for every committed batch that changes that book. A delta carries:
+       - the changed levels with their new quantities (0 removes a level);
+       - `seq`, the batch's last envelope sequence;
+       - `prev`, the sequence of the symbol's previous delta.
+     - **The gap rule, in this order.** First, a delta whose `seq` is at or before the snapshot's `seq` is already in the snapshot, and is dropped. Then a delta is in order when its `prev` equals the last channel sequence the client knows: the snapshot's `last` at first, then each applied delta's `seq`. Any other `prev` is a gap, and the client resubscribes.
+     - **`last` outlives the book.** The MDP removes a book when it empties, at the latest at every close. So each symbol's last delta sequence is kept per symbol, outside the book map. Otherwise the delta after a book emptied would carry `prev` 0, and every subscribed client would see a false gap.
+     - **Symbols.** The MDP has no symbol registry, and it removes a book when the book empties, so after every close every book is gone. A subscription to any valid symbol identifier is therefore accepted, and an empty or not-yet-traded book gives an empty snapshot. Only an invalid identifier is refused.
+     - Also in scope: unsubscribe, several symbols on one connection, and ping/pong.
+   - **How.**
+     - The follower thread already applies each batch under the view's write lock. It will record which levels the batch touched. It sends one delta per changed book to that symbol's fan-out channel **while it still holds the write lock**. A send only places the message in a queue; it never waits for a client.
+     - A subscriber takes its snapshot and joins the channel under the same lock, so no delta can fall between the two.
+     - When the follower halts, the view is withdrawn (`WithdrawOnExit`). Every feed connection is then closed with code 1011, not left open and silent.
+   - **Slow consumers.** Each connection has a bounded queue. A client that falls behind is disconnected with a reason (decision 3): when its queue overflows, or when one write to its socket does not finish within a deadline. A client that stops reading fills its TCP buffers. Its task then waits in the write, never reads the queue again, and would never notice the overflow, so the write deadline is required. The client resubscribes and gets a fresh snapshot.
+   - **Proof.**
+     - An oracle test, in-process: a recorded history replayed through the projection and the feed. A client applying snapshot plus deltas must equal the projection's own view and the core's `l2_snapshot` at every sequence. The REST view cannot be the oracle per sequence: it carries no sequence, is limited to 50 levels, and answers 404 for an empty book.
+     - Live, at quiescence: the client's book equals the REST view, within 50 levels, with 404 meaning empty.
+     - Tests for:
+       - gaps, by a test that withholds one delta;
+       - resubscription;
+       - the queue overflow and the write deadline;
+       - malformed requests and invalid symbol identifiers;
+       - an empty book before its first order and after the close;
+       - the follower halting, which closes every connection;
+       - a book that one user's orders leave locked or crossed (bid ≥ ask), which the feed must publish as it is.
+2. **The private feed, in its own process.**
+   - **The change.** A new process, `stock --user-feed JOURNAL STREAM STATE_FILE [LISTEN_ADDR]` (default `127.0.0.1:4006`), follows the committed stream like the MDP.
+     - It keeps every open order's owner: `order_id -> user_id, symbol, side, remaining`.
+     - It saves that map with its checkpoint in its own state file (mode 0600).
+     - It pushes to each connected user, each message with the stream sequence:
+       - `fill`: execution id, order id, symbol, side, price, quantity, and the order's new remaining quantity. The execution id is the one the REST `GET /exchange/executions` returns for the same trade: the first execution of the pair. Execution ids count per symbol book, so `(symbol, execution_id)` is the unique key;
+       - `order`: status changes.
+     - **Who receives what.** Order ids are chosen by the client and shared across all users within a day, so the owner map must be consulted only for orders it accepted:
+       - an accepted order, its fills, its cancellation, and its expiry at the close go to its owner, from the map. For a fill, the incoming order's owner is in the same batch, and the resting order's owner comes from the map;
+       - a rejected new order goes to the user named in that input, and never touches the map. The map may already hold another user's live order with the same id;
+       - a refused cancellation goes to its requester, named in the input. The requester may not be the order's owner, and the owner is not told;
+       - a fill always involves two different users. The engine skips the aggressor's own resting orders, so no trade has the same user on both sides.
+     - The map empties at the close, when every resting order expires, so order ids reused on the next day are new entries.
+   - **Authentication.** The first message must be `{"type":"auth","token":"<JWT>"}`, within a deadline. The token is verified with the same secret and rules as the HTTP gateway (decision 4). The connection closes when the token expires.
+   - **Catching up after a disconnect.** The feed does not replay history. On connect it says which sequence it is at. Anything earlier is read once through the existing REST endpoints (`GET /exchange/executions`, `GET /exchange/orders/{id}`). Decision 5.
+   - **Proof:**
+     - both parties of a fill are told, each with their own order id and side;
+     - a user never receives another user's events: an isolation test with several users trading against each other;
+     - an order id that collides with another user's live order: the rejection goes only to the submitter;
+     - a cancellation of another user's order: the refusal goes only to the requester;
+     - cancellations, expiries at the close, and rejections;
+     - restart from the saved state;
+     - authentication failures, token expiry, and the deadline.
+3. **Measurement.**
+   - **A feed client generator, `--feed-bench`.** It runs many WebSocket clients (1, 100, 1,000), subscribed to books and private feeds, while `--http-bench` drives orders. For each message it records the time from the order's intended send to the message's arrival, by wall clock on one host, in an HdrHistogram.
+   - **What is measured:**
+     - push latency at 1,000 and 5,000 orders/s, alone and replicated;
+     - how push latency grows with the number of clients;
+     - each feed process's CPU, with milestone 25's cgroup sampler;
+     - whether the MDP still keeps up at the exchange's maximum rate, now that it also computes deltas;
+     - the exchange's throughput and latency with the feeds running against without, interleaved, in six runs each, with the order balanced. Milestone 25 found that three runs in a 2-to-1 order can mislead. This is the completion criterion.
+   - **Slow consumers under load:** a client that stops reading is disconnected, and the other clients are not delayed.
+4. **Final review and close.**
+   - The documents are complete.
+   - Every test and measurement is recorded with its command and result.
+   - The independent reviews are done.
+
+### Decisions for the owner
+
+1. **The transport.**
+   - Recommended: WebSocket, through axum's `ws` feature, which adds `tokio-tungstenite` and its small dependencies. One connection carries several subscriptions, in both directions, with ping/pong.
+   - Alternative: Server-Sent Events. They are built into axum today, with no new dependency. They are one-way only, with one stream per connection, and come with automatic reconnection and a `Last-Event-ID` header to resume.
+2. **Where each feed runs.**
+   - Recommended: the public feed in the MDP, which already has the books and no user data; the private feed in a new process, so that user ids never enter the public process.
+   - Alternative: the private feed in the primary (port 4000), where authentication already lives. Not recommended: a slow-consumer or memory problem would then share the trading process.
+3. **Slow consumers.**
+   - Recommended: a bounded queue per connection, and a deadline on each socket write. When the queue is full, or a write misses its deadline, disconnect with a reason. The client then resynchronizes: a fresh snapshot, or REST for private history.
+   - Alternatives:
+     - drop old messages: this breaks the deltas silently;
+     - conflate: send a fresh snapshot instead of the queued deltas. There is no disconnect, but it needs more code, and it does not apply to private events.
+4. **Authentication on the private feed.**
+   - Recommended: the JWT in the first message, with a deadline, and the connection closing when the token expires.
+   - Alternatives:
+     - the token in the URL query: simple, but it ends up in logs and history;
+     - the token in the `Sec-WebSocket-Protocol` header: it works in browsers, but it is unusual;
+     - a cookie, which browsers send on the handshake, with a check of the `Origin` header: the gateway issues bearer tokens only, not cookies, so this would need a login change.
+5. **Resume after a disconnect.**
+   - Recommended: no replay. The feed reports its sequence, and the client fills the gap once through REST.
+   - The limits of the REST catch-up, which the client must accept:
+     - REST holds one trading day. A disconnect across a close and the next open loses the previous day's fills and expiries, and no API serves them;
+     - REST replies carry no stream sequence, and the primary's REST is usually ahead of the feed, so the client must deduplicate, on `(symbol, execution_id)` for fills;
+     - `GET /exchange/orders/{id}` needs the order id in advance.
+   - Alternative: a replay buffer of the last N events per user, so that a quick reconnect resumes with no REST call. It needs more state, and it is a second source of truth for history.
+6. **Book depth.**
+   - Recommended: full-depth L2 snapshot and deltas. The client keeps the whole book and shows the depth it wants.
+   - Alternative: only the top N levels, as a fresh top-N snapshot on every change. It is simpler for the client and needs no special case when a level leaves the top N, but costs more bytes per change.
+
+### Completion criteria
+
+- **Public feed:**
+  - a client applying snapshot plus deltas equals the projection's view and the core's `l2_snapshot` at every sequence of a replayed history, and the REST view (within 50 levels) live at quiescence;
+  - gaps are detectable from the sequences;
+  - a slow client is disconnected with a reason and can resubscribe;
+  - no user id ever appears in a public message (tested).
+- **Private feed:**
+  - both parties of every fill are told, each with their own order and side;
+  - every order status change reaches its owner;
+  - no user receives another user's event (tested with several users, a colliding order id, and a cancellation of another user's order);
+  - authentication, the deadline and token expiry are enforced;
+  - a restart resumes from the saved state.
+- **Durable before visible:** no message is sent for anything the committed stream has not published. Both feeds read only the committed stream. A test holds a sync, as in milestone 25, and sees no message before it is released.
+- **Measured, on the same day, interleaved, six runs each with the order balanced:**
+  - push latency against the number of clients;
+  - the feeds' CPU, and whether the MDP keeps up at the maximum rate;
+  - the exchange's throughput, and its mean and p99 at 5,000 orders/s, with the feeds running against without. The mean must differ by less than 10%, or the difference must be explained. "Within the spread" alone is too weak: milestone 25 saw the maximum rate vary by up to 50% between runs.
+- `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests, and an independent review of each part all pass.
+- `docs/milestones/26-pushed-updates/` is complete, written in depth.
+
+### Not in this milestone
+
+- multicast over reliable UDP (the design's way to deliver market data to everyone at once, fairly) and FIX over SBE (the design's protocol for the external domain);
+- L3 (order-by-order) data, paid depth tiers, candles over WebSocket;
+- serving the feeds beyond loopback, TLS, and rate or connection limits against abuse (not goals of this project, owner 2026-10-14);
+- a replay service for historical data, and a public trade tape;
+- several feed servers;
+- random subscriber ordering for fairness (the design: "assign a random order when a subscriber connects"), recorded as a possible later step;
+- a browser user interface.
+
+### Progress
+
+Planned on 2026-10-19. Nothing built yet.
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -1467,11 +1634,10 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 
 ## What Not To Work On Yet
 
-Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, closed on 2026-10-19 (Parts 1, 2 and 4; Part 3 dropped). The owner selects the next milestone. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
+Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, closed on 2026-10-19 (Parts 1, 2 and 4; Part 3 dropped). Milestone 26, pushed updates, is planned and awaits the owner's review of its plan; do not start any other candidate while it is open. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
 
-The remaining candidates (the owner selects):
-1. **Pushed updates (WebSocket)** of a user's own fills and the L2 book. The design requires that a client "receive matched trades in real-time" and "view the real-time order book". Today clients must poll, so a functional requirement is unmet.
-2. **Set-based reporter writes or `COPY`.** The reporter applies about 1,600 commands/s against the exchange's 35,000+. It is off the trading path and catches up afterwards, so this matters only at sustained volume.
+After milestone 26, the remaining candidate (the owner selects):
+1. **Set-based reporter writes or `COPY`.** The reporter applies about 1,600 commands/s against the exchange's 35,000+. It is off the trading path and catches up afterwards, so this matters only at sustained volume.
 
 Custody, KYC, operator-only deposits, rate limits and other protection against abusive customers are not goals of this learning project (owner, 2026-10-14).
 
