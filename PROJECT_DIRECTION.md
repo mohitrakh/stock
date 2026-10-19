@@ -1,4 +1,4 @@
-# Project Direction - Milestone 25 (Latency) In Progress: Parts 1-2 Complete, Part 3 Dropped, Part 4 Running
+# Project Direction - Milestone 25 (Latency) Closed; Next Milestone Not Selected
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -1252,7 +1252,7 @@ Rules for every file:
 
 ## 25. Latency
 
-**Status: selected and planned on 2026-10-14; the owner accepted the plan and decisions 1–4 as recommended. Parts 1 and 2 complete on 2026-10-14; Part 3 dropped by the owner on 2026-10-19; Part 4 in progress.** Progress is recorded at the end of this section. Its documents will go in `docs/milestones/25-latency/`, with the same layout and depth rules as milestone 24 (see milestone 24, "Documentation for this milestone"). The decisions marked *proposed* need the owner's confirmation before the part that uses them.
+**Status: selected and planned on 2026-10-14; the owner accepted the plan and decisions 1–4 as recommended. Parts 1 and 2 complete on 2026-10-14; Part 3 dropped by the owner on 2026-10-19; Part 4 complete and the milestone closed on 2026-10-19.** Progress is recorded at the end of this section. Its documents will go in `docs/milestones/25-latency/`, with the same layout and depth rules as milestone 24 (see milestone 24, "Documentation for this milestone"). The decisions marked *proposed* need the owner's confirmation before the part that uses them.
 
 ### Why this milestone
 
@@ -1406,7 +1406,14 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 
 **Part 3, dropped (owner, 2026-10-19):** "drop part 3, push and start part 4". A binary record format would gain nothing measurable in latency (`Encode` is 0.05–0.33% of it) and at most about 23% of the maximum rate alone (an estimate; `Encode` is about 19% of the worker's 15.9 µs per command), for a journal format change every reader must follow. Reasons in `docs/milestones/25-latency/decisions.md`.
 
-**Part 4, started 2026-10-19: the final measurement.** The milestone 24 part 2 binary against the final binary, as planned above.
+**Part 4, complete (2026-10-19): the final measurement.** `docs/milestones/25-latency/performance/04-final-measurement.md`. The milestone 24 part 2 binary against the final binary (`67fb6bc`), 84 interleaved runs on the office machine, plus two follow-ups (stage-timing builds; a balanced 6-run order check):
+- **Maximum rate:** replicated +77.2% (28,127 → 49,842 orders/s, beyond the spread); alone +17.0% (43,916 → 51,367), within the spread (milestone 24 alone ranged 36,756–48,597). The cycle model gives +28.3% for that day's stages (sync 4.47 ms, shorter than on 2026-10-14, so less to hide); the timed builds measured +25.8%.
+- **p99 at 5,000/s:** lower in all four configurations, by 6–49%; HTTP replicated 55.7 → 28.7 ms, beyond the spread.
+- **Median at moderate load:** within the spread, both directions, except in-process replicated at 1,000/s (−16%, beyond it). At 5,000/s in-process replicated, three runs said +50%, but the pipeline ran second in two of three pairs; 6 balanced runs gave +14.6%, within the spread. The journaler keeps the sync path busy about 98% of the time (against about 78%), and its median doubled in the runs where its syncs were longer (3.2–3.4 ms against 2.1 ms). Why those syncs were longer is unproven (the shared SSD is the likely cause, an inference).
+- **tmpfs (no disk):** alone the pipeline costs 124 µs at p50 and gains nothing; replicated it still raises the maximum rate by 21%, by inference by hiding the replica's round trip. On the SSD, replicated, milestone 25 reaches 81% of its tmpfs rate against milestone 24's 56%.
+- **CPU:** in every HTTP configuration the host was busy, on average, 1.8–2.3 of its 4 hardware threads (2 cores) on average, the exchange at most about one thread. The HTTP tail is not average CPU saturation (sub-second bursts and core sharing not ruled out); milestone 24's open question is answered as far as one-second samples can.
+
+**Milestone 25 closed on 2026-10-19.** Follow-ups recorded, not planned: a probe timing `sync_all` with and without a concurrent appender; runs on two machines; an option to delay the journaler's next sync to protect the median at moderate load.
 
 ## Known Prototype Limitations
 
@@ -1426,7 +1433,7 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 - order records and the per-user execution index hold one trading day; the open replaces both maps, releasing their memory, while the matching engine's order-location map and risk usage keep the capacity of the largest day, and a price level's node slots are freed only when the level empties, which the close guarantees once a day
 - the books hold at most 200,000 resting orders across all symbols, so that the close's one journal record always fits; beyond that an order that would rest is refused (409 `BookFull`) until orders trade, are cancelled, or expire at the close, and one user can fill the book, as there is no per-user share; there is no close spread across several records
 - one order may trade against at most 10,000 resting orders (`TooManyFills`, 409), so that its record always fits the 64 MiB limit; a client that wants more must split its order
-- the journal is synced by one journaler thread, one `sync_all` at a time, covering everything written; an order still waits for the rest of the sync in progress and then its own, so p99 cannot beat the disk's own sync latency. With replication it also waits for the replica's sync and one round trip; on the office machine the two syncs share one SSD, which now limits the replicated maximum rate. The replica syncs once per frame it receives and does not coalesce frames itself; the primary must ship once per sync (milestone 25 part 2)
+- the journal is synced by one journaler thread, one `sync_all` at a time, covering everything written; an order still waits for the rest of the sync in progress and then its own, so p99 cannot beat the disk's own sync latency. With replication it also waits for the replica's sync and one round trip; on the office machine the two syncs share one SSD, which now limits the replicated maximum rate. The replica syncs once per frame it receives and does not coalesce frames itself; the primary must ship once per sync (milestone 25 part 2). The journaler starts the next sync as soon as anything is written, so in-process replicated at 5,000 orders/s the sync path was about 98% busy (timed builds, milestone 25 part 4). When syncs lengthen, every order then probably waits for about one and a half of them (an inference), and the median can rise while the tail falls; over 6 balanced runs the median effect was within the spread
 - replication has one replica, and a new connection replaces the current one. Its link is neither authenticated nor encrypted, and its listener is the only one meant to be reached from another machine: use a private network. Waiting for the replica never times out: a primary without its replica waits until the operator acts (only a link silent for 10 s is dropped, so that the replica dials again). Running alone is not remembered across a restart, and a replica slower than the sustained load cannot end it until the load drops. The operator must never both let the primary run alone and promote the replica: nothing prevents it. The epochs detect it when the old primary tries to rejoin, provided it rejoins with its own stream file, but its commands acknowledged alone are then on its machine only. Started without replication after a promotion, the old primary would serve at once without even syncing its stream's end, so after a power loss its rejoin could cut those commands instead of being refused
 - the replica publishes a record one round trip after confirming it, when the next commit point arrives; its stream holds no records, so its readers read every record from the journal
 - the replica's committed end is what its stream published, synced within about two seconds of it moving. If the primary's disk loses writes it reported synced, or the primary starts on an older copy of its journal, the replica cannot tell the acknowledged records it lost, at most about two seconds' worth after a power loss, from records the primary never synced, and cuts them. Only a third machine could tell them apart
@@ -1460,9 +1467,9 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 
 ## What Not To Work On Yet
 
-Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, is in progress: Parts 1 and 2 are complete, Part 3 (a binary format) was dropped, and Part 4 (the final measurement) is in progress. Do not start any other candidate while it is open. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
+Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, closed on 2026-10-19 (Parts 1, 2 and 4; Part 3 dropped). The owner selects the next milestone. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
 
-After milestone 25, the remaining candidates (the owner selects):
+The remaining candidates (the owner selects):
 1. **Pushed updates (WebSocket)** of a user's own fills and the L2 book. The design requires that a client "receive matched trades in real-time" and "view the real-time order book". Today clients must poll, so a functional requirement is unmet.
 2. **Set-based reporter writes or `COPY`.** The reporter applies about 1,600 commands/s against the exchange's 35,000+. It is off the trading path and catches up afterwards, so this matters only at sustained volume.
 

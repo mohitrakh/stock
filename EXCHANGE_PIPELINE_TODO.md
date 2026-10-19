@@ -454,9 +454,9 @@ Milestone 24, selected on 2026-10-12, closed on 2026-10-14 after Part 2. The own
 - Dropped (owner, 2026-10-14): Part 3, the journaled product list; Part 4, deposits and risk limits on the operator port only; Part 5, the per-user book share and rate limits; Part 6, the final measurement and abuse tests of those changes.
 - [x] For each completed part: a part file and its `performance/` files written in depth; this checklist and `PROJECT_DIRECTION.md` updated; `cargo fmt -- --check`, `cargo test --locked`, and an independent review.
 
-## Current Milestone - Latency
+## Closed Milestone - Latency
 
-Milestone 25, planned on 2026-10-14, in progress. The plan is in `PROJECT_DIRECTION.md` ("25. Latency"). Documents go in `docs/milestones/25-latency/`.
+Milestone 25, planned on 2026-10-14, closed on 2026-10-19. The plan is in `PROJECT_DIRECTION.md` ("25. Latency"). Documents go in `docs/milestones/25-latency/`.
 
 - [x] The owner reviews the plan and confirms decisions 1–4 (2026-10-14).
 - [x] Create `docs/milestones/25-latency/` (README, selection, theory, decisions, glossary).
@@ -465,5 +465,5 @@ Milestone 25, planned on 2026-10-14, in progress. The plan is in `PROJECT_DIRECT
 - [x] The owner decides Part 3 (2026-10-19): dropped.
 - [x] Part 2 (2026-10-14): a pipelined journal sync, with durable-before-visible and the failure rule proven by tests (5 pipeline tests, 6 mutations). Maximum rate +41.5% alone and +36.7% replicated; mean latency at 5,000/s −10% to −28%. The measurement found, and the fix and a test now guard, a first version that shipped each group to the replica at once and broke replicated runs at moderate load.
 - Dropped (owner, 2026-10-19): Part 3, a binary record format. Encoding is under 0.4% of latency; at most about +23% of the maximum rate alone; the cost is a journal format change for every reader. Reasons in `docs/milestones/25-latency/decisions.md`.
-- [ ] Part 4: final measurement against the milestone 24 part 2 binary, on the same day, interleaved, with three runs per configuration, tmpfs runs, and per-container CPU.
-- [ ] For each part: a part file and its `performance/` files written in depth; this checklist and `PROJECT_DIRECTION.md` updated; `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests and an independent review.
+- [x] Part 4 (2026-10-19): final measurement against the milestone 24 part 2 binary, same day, interleaved, three runs per configuration, tmpfs runs, per-container CPU. Maximum rate +77% replicated, +17% alone (within that day's spread; +26–28% by the timed follow-up and the cycle model); p99 at 5,000/s −6% to −49%; the median at 5,000/s in-process replicated +15% over 6 balanced runs, within the spread. `docs/milestones/25-latency/performance/04-final-measurement.md`.
+- [x] For each part: a part file and its `performance/` files written in depth; this checklist and `PROJECT_DIRECTION.md` updated; `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests and an independent review (Part 4 changed no code; its scripts and documents were reviewed).

@@ -1,0 +1,226 @@
+
+## stock-m24p2, in-process, replicated no: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 2662   [1929, 3537]
+  p99                11095   [9863, 12663]
+  per sync             1.4   [1.3, 1.5]
+
+## stock-m25final, in-process, replicated no: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 2403   [1727, 3175]
+  p99                 9572   [6815, 11047]
+  mean                3058   [1989, 3833]
+  per sync             1.3   [1.1, 1.5]
+
+## stock-m24p2, in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4999   [4998, 5000]
+  p50                 3284   [3045, 3757]
+  p99                15948   [14367, 18639]
+  per sync             6.9   [6.5, 7.7]
+
+## stock-m25final, in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4999   [4998, 4999]
+  p50                 2849   [2487, 3403]
+  p99                15010   [13303, 16767]
+  mean                4081   [3681, 4374]
+  per sync             5.6   [5.0, 6.3]
+
+## stock-m24p2, in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         43916   [36756, 48597]
+  p50               241279   [221951, 273919]
+  p99               383060   [278783, 555007]
+  per sync          1016.9   [1015.2, 1020.4]
+
+## stock-m25final, in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         51367   [48077, 53178]
+  p50               221652   [212223, 238847]
+  p99               373674   [324095, 437247]
+  mean              227921   [219720, 243235]
+  per sync          1010.1   [1010.1, 1010.1]
+
+## stock-m24p2, http, replicated no: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 3478   [2271, 5495]
+  p99                14236   [8895, 17855]
+  mean                4142   [3125, 5970]
+  unanswered             0   [0, 0]
+  cpu exchange         0.34   [0.31, 0.38]
+  cpu replica         0.00   [0.00, 0.00]
+  cpu generator         0.21   [0.18, 0.25]
+  cpu others          0.34   [0.32, 0.36]
+  cpu host            1.84   [1.66, 1.98]
+
+## stock-m25final, http, replicated no: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 3464   [2773, 4163]
+  p99                14490   [12247, 18239]
+  mean                4519   [4183, 4756]
+  unanswered             0   [0, 0]
+  cpu exchange         0.42   [0.40, 0.44]
+  cpu replica         0.00   [0.00, 0.00]
+  cpu generator         0.23   [0.21, 0.25]
+  cpu others          0.40   [0.36, 0.43]
+  cpu host            1.92   [1.74, 2.05]
+
+## stock-m24p2, http, replicated no: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4999   [4999, 4999]
+  p50                 3269   [3163, 3445]
+  p99                37204   [28255, 49183]
+  mean                6252   [5574, 6790]
+  unanswered             0   [0, 0]
+  cpu exchange         0.73   [0.69, 0.76]
+  cpu replica         0.00   [0.00, 0.00]
+  cpu generator         0.43   [0.40, 0.45]
+  cpu others          0.34   [0.24, 0.40]
+  cpu host            2.09   [1.99, 2.25]
+
+## stock-m25final, http, replicated no: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          5000   [4999, 5000]
+  p50                 3829   [3057, 5315]
+  p99                24154   [18431, 28879]
+  mean                5552   [4831, 6430]
+  unanswered             0   [0, 0]
+  cpu exchange         0.75   [0.73, 0.77]
+  cpu replica         0.00   [0.00, 0.00]
+  cpu generator         0.41   [0.40, 0.42]
+  cpu others          0.33   [0.24, 0.38]
+  cpu host            2.01   [1.99, 2.04]
+
+## stock-m24p2, in-process, replicated yes: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 5222   [4871, 5483]
+  p99                20442   [19551, 21647]
+  per sync             2.1   [2.0, 2.3]
+
+## stock-m25final, in-process, replicated yes: --bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 4380   [4015, 4819]
+  p99                18767   [16751, 19823]
+  mean                6470   [5937, 6790]
+  per sync             2.1   [2.0, 2.1]
+
+## stock-m24p2, in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4999   [4998, 4999]
+  p50                 5419   [4827, 6303]
+  p99                30538   [21983, 35999]
+  per sync            13.6   [12.9, 14.4]
+
+## stock-m25final, in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4997, 4999]
+  p50                 8144   [6163, 9847]
+  p99                25119   [23151, 27375]
+  mean                9035   [8144, 9927]
+  per sync            15.3   [12.2, 19.2]
+
+## stock-m24p2, in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         28127   [24371, 31059]
+  p50               384255   [348927, 420863]
+  p99               573354   [505855, 699903]
+  per sync          1015.2   [1015.2, 1015.2]
+
+## stock-m25final, in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         49842   [45926, 57556]
+  p50               233812   [199039, 251519]
+  p99               312874   [249983, 351743]
+  mean              236322   [201986, 253619]
+  per sync          1013.5   [1010.1, 1015.2]
+
+## stock-m24p2, http, replicated yes: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [1000, 1000]
+  p50                 6288   [5595, 7439]
+  p99                21786   [20575, 22479]
+  mean                7955   [7836, 8090]
+  unanswered             0   [0, 0]
+  cpu exchange         0.54   [0.49, 0.57]
+  cpu replica         0.14   [0.13, 0.15]
+  cpu generator         0.32   [0.30, 0.33]
+  cpu others          0.46   [0.45, 0.46]
+  cpu host            1.80   [1.78, 1.83]
+
+## stock-m25final, http, replicated yes: --http-bench --orders 20000 --rate 1000 (3 runs)
+  throughput          1000   [999, 1000]
+  p50                 5810   [4839, 7503]
+  p99                21087   [19567, 22399]
+  mean                7564   [7039, 8443]
+  unanswered             0   [0, 0]
+  cpu exchange         0.60   [0.57, 0.63]
+  cpu replica         0.14   [0.13, 0.15]
+  cpu generator         0.30   [0.30, 0.31]
+  cpu others          0.45   [0.40, 0.50]
+  cpu host            1.92   [1.86, 1.97]
+
+## stock-m24p2, http, replicated yes: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4997   [4995, 4999]
+  p50                 7771   [5535, 10015]
+  p99                55690   [43967, 62175]
+  mean               12391   [11880, 12850]
+  unanswered             0   [0, 0]
+  cpu exchange         0.93   [0.90, 0.97]
+  cpu replica         0.14   [0.14, 0.14]
+  cpu generator         0.56   [0.53, 0.58]
+  cpu others          0.40   [0.38, 0.41]
+  cpu host            2.25   [2.22, 2.29]
+
+## stock-m25final, http, replicated yes: --http-bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4998   [4997, 4999]
+  p50                 6980   [4923, 10783]
+  p99                28676   [24767, 34303]
+  mean                9269   [7801, 11877]
+  unanswered             0   [0, 0]
+  cpu exchange         0.98   [0.91, 1.07]
+  cpu replica         0.16   [0.15, 0.17]
+  cpu generator         0.55   [0.50, 0.62]
+  cpu others          0.35   [0.32, 0.39]
+  cpu host            2.27   [2.13, 2.37]
+
+## stock-m24p2, tmpfs in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          5000   [5000, 5000]
+  p50                 1522   [1464, 1566]
+  p99                 3878   [3143, 4947]
+  per sync             4.0   [3.9, 4.1]
+
+## stock-m25final, tmpfs in-process, replicated no: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          5000   [5000, 5000]
+  p50                 1646   [1616, 1692]
+  p99                 4498   [3909, 5303]
+  mean                1788   [1755, 1807]
+  per sync             3.9   [3.9, 4.0]
+
+## stock-m24p2, tmpfs in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         65505   [64472, 67338]
+  p50               161450   [158719, 164095]
+  p99               222036   [208895, 238719]
+  per sync          1011.8   [1010.1, 1015.2]
+
+## stock-m25final, tmpfs in-process, replicated no: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         66859   [64929, 67855]
+  p50               176426   [175231, 178687]
+  p99               222378   [211839, 241535]
+  mean              174722   [171742, 180076]
+  per sync          1011.8   [1010.1, 1015.2]
+
+## stock-m24p2, tmpfs in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          4999   [4999, 5000]
+  p50                 1906   [1793, 2013]
+  p99                 5896   [5527, 6583]
+  per sync             4.1   [4.0, 4.3]
+
+## stock-m25final, tmpfs in-process, replicated yes: --bench --orders 100000 --rate 5000 (3 runs)
+  throughput          5000   [4999, 5000]
+  p50                 1865   [1732, 1976]
+  p99                 5647   [5487, 5891]
+  mean                2072   [1913, 2168]
+  per sync             3.5   [3.5, 3.5]
+
+## stock-m24p2, tmpfs in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         50441   [48935, 51487]
+  p50               210132   [206335, 217215]
+  p99               315476   [283135, 355071]
+  per sync          1013.5   [1010.1, 1015.2]
+
+## stock-m25final, tmpfs in-process, replicated yes: --bench --orders 200000 --rate 0 (3 runs)
+  throughput         61192   [59737, 62929]
+  p50               190634   [189183, 192383]
+  p99               253866   [236799, 286207]
+  mean              190556   [185494, 195032]
+  per sync          1011.8   [1010.1, 1015.2]

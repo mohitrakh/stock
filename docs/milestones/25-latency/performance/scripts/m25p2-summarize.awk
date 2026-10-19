@@ -7,13 +7,15 @@
 # Usage: awk -f m25p2-summarize.awk results/m25p2-compare.txt
 function acc(key, v) {
   sum[key] += v
+  seen_runs[key]++
   if (!(key in lo) || v < lo[key]) lo[key] = v
   if (!(key in hi) || v > hi[key]) hi[key] = v
 }
 function show(c, what, digits,   key) {
   key = c SUBSEP what
   if (!(key in sum)) return
-  printf "  %-11s %12." digits "f   [%." digits "f, %." digits "f]\n", what, sum[key] / runs[c], lo[key], hi[key]
+  # Divided by the runs that reported this value: a run can lack one (a "not measured" cpu line).
+  printf "  %-11s %12." digits "f   [%." digits "f, %." digits "f]\n", what, sum[key] / seen_runs[key], lo[key], hi[key]
 }
 /^### stock-/ {
   config = $0
@@ -30,6 +32,17 @@ function show(c, what, digits,   key) {
     if ($i == "p50") acc(config SUBSEP "p50", $(i + 1))
     if ($i == "p99") acc(config SUBSEP "p99", $(i + 1))
     if ($i == "mean") acc(config SUBSEP "mean", $(i + 1))
+  }
+  next
+}
+# Milestone 25 part 4's per-container CPU line, in cores ("+ 0" drops the trailing comma).
+/^  cpu        : window/ {
+  for (i = 1; i <= NF; i++) {
+    if ($i == "exchange") acc(config SUBSEP "cpu exchange", $(i + 1) + 0)
+    if ($i == "replica") acc(config SUBSEP "cpu replica", $(i + 1) + 0)
+    if ($i == "generator") acc(config SUBSEP "cpu generator", $(i + 1) + 0)
+    if ($i == "containers") acc(config SUBSEP "cpu others", $(i + 1) + 0)
+    if ($i == "busy") acc(config SUBSEP "cpu host", $(i + 1) + 0)
   }
   next
 }
@@ -52,6 +65,11 @@ END {
     show(c, "mean", 0)
     show(c, "per sync", 1)
     show(c, "unanswered", 0)
+    show(c, "cpu exchange", 2)
+    show(c, "cpu replica", 2)
+    show(c, "cpu generator", 2)
+    show(c, "cpu others", 2)
+    show(c, "cpu host", 2)
     if (stages[c] == "") continue
     split(substr(stages[c], 2), list, " ")
     for (s = 1; s in list; s++) {

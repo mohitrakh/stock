@@ -123,3 +123,23 @@ example, is in `part-2-pipelined-sync.md`, "The design, and why".
 
   Rejected for now: *coalescing frames on the replica*. It would also work, but it changes the
   replica, which this milestone does not otherwise touch.
+
+## 2026-10-19 — Design choices for Part 4 (the final measurement)
+
+Choices made while writing `performance/scripts/m25p4-final.sh`, recorded so the owner can overrule
+them:
+- **The final binary is rebuilt from the pushed commit** (`67fb6bc`, as `stock-m25final`). Part 2's
+  measured `stock-m25p2` predates one failure-path fix (running alone after a failed publication).
+- **The HTTP generator is the final binary for both builds.** The milestone 24 part 2 generator does
+  not print the end-to-end mean, and one generator for both keeps the client side equal.
+- **In-process runs of the milestone 24 part 2 binary have no mean.** Its `--bench` predates the mean
+  (added in Part 1), and rebuilding it would no longer be the binary milestone 24 measured. Those
+  comparisons use throughput, p50 and p99.
+- **tmpfs runs** put both journals in RAM (`docker run --tmpfs /data`), so a sync costs no disk
+  time. They separate the software's share from the disk's: in-process, alone and replicated, at
+  5,000 orders/s and at the maximum rate.
+- **Per-container CPU is read from cgroup v2** (`/sys/fs/cgroup/system.slice/docker-<id>.scope/cpu.stat`,
+  `usage_usec`) once a second, and the host's from `/proc/stat`. No `docker stats` call, which would
+  load the machine it measures. It covers only the measured orders: from the generator's
+  `http-bench:` line, printed after its setup (a session open, 100 cash deposits and 100 × 100 =
+  10,000 share deposits; no user registrations, since `--logins` is 0), to its `throughput` line. With one sample a second, the window loses up to about a second at each end.

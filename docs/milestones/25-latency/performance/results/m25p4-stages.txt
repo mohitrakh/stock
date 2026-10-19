@@ -1,0 +1,297 @@
+### m25p4-stages: 3 run(s) of each, 2026-10-19T15:38:08+05:30
+### stock-m25p1-timed, in-process, replicated no, run 1: --bench --orders 200000 --rate 0
+# host 2026-10-19T15:38:08+05:30: loadavg 1.39 2.57 3.17, containers running 29
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 51398 orders/s over 3.891 s
+  latency us : p50 205823  p90 251775  p99 290303  p99.9 297727  max 298239  mean 207201.7  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 291484 kB, VmRSS: 291484 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    187751.6   187391   231167   266239   272383   273407
+WaitInGroup      200000      7148.0     7067    11679    16927    20703    24207
+Prepare          200000         5.3        3       12       24       42      900
+Encode           200000         2.8        2        5       10       99     1753
+Commit           200000         3.0        2        5       12       49    31423
+WaitForGroup     200000      5978.8     5495    10751    18431    41759    45823
+Write               197       360.6      345      441      531      540      540
+Sync                197      2937.5     2925     3351     3757     4755     4755
+Publish             197      2337.0     2253     2679     5667     5779     5779
+Release             197       433.9      427      468      757     1475     1475
+Worker           200000     19361.4    18287    23839    30799    52575    52639
+GroupSize           197      1015.2     1024     1024     1024     1024     1024
+### stock-m25p2-timed, in-process, replicated no, run 1: --bench --orders 200000 --rate 0
+# host 2026-10-19T15:38:13+05:30: loadavg 1.36 2.55 3.16, containers running 29
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 63011 orders/s over 3.174 s
+  latency us : p50 186239  p90 206079  p99 229759  p99.9 230527  max 230783  mean 185005.0  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 292828 kB, VmRSS: 292828 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    153107.0   155135   170239   198527   199167   199423
+WaitInGroup      200000      6983.4     6999    11207    15223    18479    40767
+Prepare          200000         4.9        3       11       23       38     1507
+Encode           200000         2.9        1        5       10      117     1306
+Commit           200000         2.8        2        5       11       38    29023
+WaitForGroup     200000      5618.2     5239    10023    17327    36799    40767
+Write               197       348.5      343      388      492      499      499
+Sync                198      3327.6     2833     4655    16879    20895    20895
+WaitForSync      200000     16147.3    15455    18063    28463    44223    44223
+PipelineFull          2      2796.5        3     5591     5591     5591     5591
+Publish             197      2142.2     2107     2279     2987     3761     3761
+Release             197       459.2      457      493      862      949      949
+Worker           200000     31844.0    30543    36031    58943    59423    59519
+GroupSize           197      1015.2     1024     1024     1024     1024     1024
+### stock-m25p2-timed, in-process, replicated no, run 2: --bench --orders 200000 --rate 0
+# host 2026-10-19T15:38:17+05:30: loadavg 1.41 2.54 3.15, containers running 29
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 61525 orders/s over 3.251 s
+  latency us : p50 186623  p90 226303  p99 243327  p99.9 249471  max 250495  mean 188386.1  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 292072 kB, VmRSS: 292072 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    155612.5   155263   189823   208127   210943   211199
+WaitInGroup      200000      7287.6     7071    11583    18831    42527    44671
+Prepare          200000         5.1        3       12       23       40     2765
+Encode           200000         2.9        1        5       10      107     1103
+Commit           200000         2.9        2        5       12       40    31375
+WaitForGroup     200000      5659.9     5315    10199    16263    41055    44639
+Write               197       357.7      342      423      577      748      748
+Sync                198      2826.8     2639     3071     7455    13191    13191
+WaitForSync      200000     16552.4    15495    19935    30863    48191    48191
+Publish             197      2194.1     2117     2537     2965     3733     3733
+Release             197       475.3      462      501      921     1764     1764
+Worker           200000     32662.7    30719    39135    64319    65599    65663
+GroupSize           197      1015.2     1024     1024     1024     1024     1024
+### stock-m25p1-timed, in-process, replicated no, run 2: --bench --orders 200000 --rate 0
+# host 2026-10-19T15:38:22+05:30: loadavg 1.46 2.53 3.15, containers running 29
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 49888 orders/s over 4.009 s
+  latency us : p50 211199  p90 255103  p99 295679  p99.9 304383  max 305407  mean 213896.4  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 290944 kB, VmRSS: 290944 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    193805.4   191743   233727   271103   273151   273407
+WaitInGroup      200000      7103.6     7019    11487    17615    22719    43295
+Prepare          200000         5.3        3       12       25       45      682
+Encode           200000         2.8        2        5       11       85     1684
+Commit           200000         3.0        2        5       12       50    31439
+WaitForGroup     200000      5958.1     5443    10575    21039    39775    42783
+Write               197       357.5      347      404      534      762      762
+Sync                197      3700.7     3053     5855     8959     9207     9207
+Publish             197      2288.8     2235     2543     3781     5767     5767
+Release             197       430.5      427      453      803      851      851
+Worker           200000     20010.1    18767    23471    41727    49631    49695
+GroupSize           197      1015.2     1024     1024     1024     1024     1024
+### stock-m25p1-timed, in-process, replicated no, run 3: --bench --orders 200000 --rate 0
+# host 2026-10-19T15:38:27+05:30: loadavg 1.42 2.50 3.14, containers running 29
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 34337 orders/s over 5.825 s
+  latency us : p50 300799  p90 430335  p99 466687  p99.9 473087  max 475391  mean 311119.6  (queue-bound at max rate)
+  syncs      : 197 (1015.2 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 295904 kB, VmRSS: 295904 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    281614.9   272383   393727   427263   435711   435967
+WaitInGroup      200001      9799.3     8871    18127    30575    40319    54687
+Prepare          200001         8.3        4       17       33      114   129023
+Encode           200001         4.1        2        7       14      245    22303
+Commit           200001         5.3        2        8       17       99   196095
+WaitForGroup     200001      8518.4     7359    16671    31695    51039    54623
+Write               198       440.9      388      522     2261     4075     4075
+Sync                198      6768.5     5975     9439    22719    30271    30271
+Publish             198      2876.5     2619     3635     7315    10575    10575
+Release             198       560.2      432      599     3751     4379     4379
+Worker           200001     29154.8    27199    41471    59807    63455   385279
+GroupSize           198      1010.1     1024     1024     1024     1024     1024
+### stock-m25p2-timed, in-process, replicated no, run 3: --bench --orders 200000 --rate 0
+# host 2026-10-19T15:38:34+05:30: loadavg 1.66 2.52 3.14, containers running 29
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 46034 orders/s over 4.345 s
+  latency us : p50 248063  p90 320255  p99 365567  p99.9 376319  max 376575  mean 253641.4  (queue-bound at max rate)
+  syncs      : 198 (1010.1 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 292552 kB, VmRSS: 292552 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            200000    209663.8   205951   268543   309247   311551   312063
+WaitInGroup      200001      9636.8     9159    16991    25071    32399    58111
+Prepare          200001         8.0        4       17       32       62   137855
+Encode           200001         4.2        2        7       14      229    32287
+Commit           200001         4.7        2        8       16       68   125119
+WaitForGroup     200001      8206.0     7267    15799    26815    52895    58111
+Write               199       423.2      391      524      822     2925     2925
+Sync                199      3188.1     2795     4447    10959    13007    13007
+WaitForSync      200001     22149.1    20351    28671    43231    62335    62335
+Publish             199      2540.2     2385     3225     4175     5459     5459
+Release             199       580.5      476      588     3913     6511     6511
+Worker           200001     43731.4    41471    57087    80895    91135   322815
+GroupSize           199      1005.0     1024     1024     1024     1024     1024
+### stock-m25p1-timed, in-process, replicated yes, run 1: --bench --orders 100000 --rate 5000
+# host 2026-10-19T15:38:41+05:30: loadavg 1.77 2.53 3.13, containers running 29
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4999 orders/s over 20.005 s
+  latency us : p50 4451  p90 17455  p99 29407  p99.9 75391  max 95295  mean 7998.8
+  syncs      : 7608 (13.1 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 163616 kB, VmRSS: 163616 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000      2246.4     1042     6215    12639    46303    65727
+WaitInGroup      100001       440.8      163     1096     3545    14143    61887
+Prepare          100001        12.6        7       27       59      109    46271
+Encode           100001         6.0        4       13       32       71     8043
+Commit           100001         7.7        4       13       33       99    60927
+WaitForGroup     100001       402.4      131     1003     3373    14815    61887
+Write              7609        26.2       21       41      127      194     1365
+Sync               7609      1165.5      797     2285     5671     7231    10199
+Confirm            7609       905.3      647     1444     4671     6667    20271
+Publish            7609        57.6       32      105      562      861     1533
+Release            7609        13.9        8       22      100      430     1394
+Worker           100001      4573.2     2051    10951    17455    27935   128703
+GroupSize          7609        13.1       10       25       65       95      330
+### stock-m25p2-timed, in-process, replicated yes, run 1: --bench --orders 100000 --rate 5000
+# host 2026-10-19T15:39:03+05:30: loadavg 2.10 2.56 3.13, containers running 29
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4996 orders/s over 20.017 s
+  latency us : p50 10583  p90 17583  p99 26271  p99.9 45535  max 54143  mean 10428.2
+  syncs      : 6045 (16.5 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 164936 kB, VmRSS: 164936 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000       244.3       62      430     1801    25119    39679
+WaitInGroup      100001       173.9       82      382     1153     6651    40447
+Prepare          100001        27.7       17       65      134      233    70847
+Encode           100001        14.3        9       31       73      135     7947
+Commit           100001        15.2        9       29       70      205    41567
+WaitForGroup     100001       147.5       58      330     1113     6211    40319
+Write             24889        30.9       22       56      190      352     3013
+Sync               6046      1897.6      953     4639     6879    10127    54591
+Confirm            6046      1351.2      750     3373     5371     8599    13799
+WaitForSync      100001      8259.6     8447    14679    20191    32351    57183
+Publish           24889        34.1       23       70      148      300     2783
+Release           24889         7.4        5       15       49      201     1638
+Worker           100001      9016.1     9287    15863    22383    35327   182527
+GroupSize         24889         4.0        4        7       10       20      200
+### stock-m25p2-timed, in-process, replicated yes, run 2: --bench --orders 100000 --rate 5000
+# host 2026-10-19T15:39:25+05:30: loadavg 3.28 2.79 3.19, containers running 29
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4999 orders/s over 20.005 s
+  latency us : p50 4723  p90 13455  p99 21599  p99.9 45023  max 57695  mean 6974.1
+  syncs      : 9149 (10.9 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 164560 kB, VmRSS: 164560 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000       180.2       53      327     1351    19967    40735
+WaitInGroup      100001       126.5       65      285      845     5303    40095
+Prepare          100001        23.5       14       51      118      207    62207
+Encode           100001        11.8        8       24       63      122    12087
+Commit           100001        12.7        7       24       59      268    51423
+WaitForGroup     100001       107.8       46      244      794     5071    39935
+Write             26558        27.4       17       54      178      313     2975
+Sync               9150      1235.0      876     2507     5339     7939    16463
+Confirm            9150       899.8      697     1466     4243     6391    25855
+WaitForSync      100001      5029.1     3019    10799    16479    34431    47903
+Publish           26558        25.9       18       55      129      315     1333
+Release           26558         7.6        4       14       49      270     2135
+Worker           100001      5537.4     3351    11767    18015    36383   160639
+GroupSize         26558         3.8        4        5       10       15      203
+### stock-m25p1-timed, in-process, replicated yes, run 2: --bench --orders 100000 --rate 5000
+# host 2026-10-19T15:39:48+05:30: loadavg 3.85 2.95 3.24, containers running 29
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4997 orders/s over 20.012 s
+  latency us : p50 4523  p90 18143  p99 39071  p99.9 71487  max 88831  mean 8646.7
+  syncs      : 7188 (13.9 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 164076 kB, VmRSS: 164076 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000      2507.6     1157     6563    16239    36063    48831
+WaitInGroup      100001       589.7      175     1258     6395    23231    35999
+Prepare          100001        13.8        8       27       72      159    73791
+Encode           100001         6.6        4       13       38       97     9999
+Commit           100001         7.9        4       13       40      111    50207
+WaitForGroup     100001       497.6      140     1137     5599    13959    36031
+Write              7189        27.7       21       41      155      312     3901
+Sync               7189      1244.1      814     2919     6195     8791    19279
+Confirm            7189       927.2      668     1693     4527     6923    20047
+Publish            7189        61.2       34      114      666     1112     3837
+Release            7189        15.5        9       23      124      613     2719
+Worker           100001      5027.4     2101    10983    22751    47071   167039
+GroupSize          7189        13.9       10       30       70      125      255
+### stock-m25p1-timed, in-process, replicated yes, run 3: --bench --orders 100000 --rate 5000
+# host 2026-10-19T15:40:10+05:30: loadavg 3.60 2.97 3.24, containers running 29
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 5000 orders/s over 20.002 s
+  latency us : p50 4483  p90 19743  p99 31727  p99.9 44255  max 51935  mean 8762.0
+  syncs      : 7445 (13.4 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 161340 kB, VmRSS: 161340 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000      2454.3     1073     7171    13791    21823    30015
+WaitInGroup      100001       550.1      175     1626     4211     8271    16575
+Prepare          100001        13.9        8       30       72      129    46335
+Encode           100001         6.7        4       14       39       82     8019
+Commit           100001         7.9        4       14       39      104    44511
+WaitForGroup     100001       491.5      141     1468     4057     8035    16543
+Write              7446        27.3       20       41      160      241     1208
+Sync               7446      1165.6      789     2355     6047     8011    19391
+Confirm            7446       913.5      647     1600     4667     7083    37439
+Publish            7446        67.2       32      104      696      980     1213
+Release            7446        13.6        8       22      100      340      890
+Worker           100001      5115.7     2101    12255    19087    27055   148607
+GroupSize          7446        13.4       10       30       70      105      160
+### stock-m25p2-timed, in-process, replicated yes, run 3: --bench --orders 100000 --rate 5000
+# host 2026-10-19T15:40:32+05:30: loadavg 3.22 2.92 3.21, containers running 29
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 100000 orders a day for 1 day(s), rate 5000/s, 100 symbols, 100 users, depth 0 per symbol
+  throughput : 4997 orders/s over 20.013 s
+  latency us : p50 9967  p90 16975  p99 29183  p99.9 55295  max 66239  mean 10318.9
+  syncs      : 5732 (17.4 orders per sync)
+  journal    : 745 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 164812 kB, VmRSS: 164812 kB
+stage            n          mean      p50      p90      p99    p99.9      max  (us; group_size in commands)
+Queue            100000       224.9       55      392     2849    16943    32255
+WaitInGroup      100001       164.5       71      317     1611     8511    31439
+Prepare          100001        23.6       14       51      122      269    59167
+Encode           100001        11.8        7       25       65      140     8303
+Commit           100001        12.9        7       23       63      193    42335
+WaitForGroup     100001       142.2       49      276     1572     7519    19647
+Write             24928        26.7       17       50      175      552     4415
+Sync               5733      2009.8     1081     4547     6835    12711    63295
+Confirm            5733      1414.0      794     3405     5495     9207    15543
+WaitForSync      100001      8159.8     8067    14151    22287    34271    65855
+Publish           24928        27.9       18       59      143      367     2321
+Release           24928        10.5        3       13      104     1079     3649
+Worker           100001      8844.0     8679    15231    24767    46399   180863
+GroupSize         24928         4.0        4        6       10       29      165
+### done

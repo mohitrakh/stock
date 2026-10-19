@@ -91,6 +91,7 @@ using a separate git worktree per commit:
 
 | Binary name | Commit | Build | What it is |
 |---|---|---|---|
+| `stock-m25final` | milestone 25 (this commit or later) | normal | the final binary of milestone 25 (Part 4) |
 | `stock-m25p2` | milestone 25 part 2 (this commit or later) | normal | the pipelined sync |
 | `stock-m25p2-timed` | the same | `--features stage-timing` | its stage-timing build |
 | `stock-m25p1` | `5168bcf` (milestone 25 part 1) | normal | the sync on the worker: Part 2's "before" |
@@ -110,6 +111,7 @@ cd ~/stock-m25
 git worktree add ~/stock-build-m24 28e085a
 git worktree add ~/stock-build-m23 27ce277
 git worktree add ~/stock-build-m25p1 5168bcf
+build ~/stock-m25 stock-m25final
 build ~/stock-m25 stock-m25p2
 build ~/stock-m25 stock-m25p2-timed --features stage-timing
 build ~/stock-build-m25p1 stock-m25p1
@@ -155,6 +157,9 @@ count. Redirect each script into a file:
 | `m25p2-mutate.sh` | `bash ~/stock-scripts/m25p2-mutate.sh > ~/m25-out/m25p2-mutate.txt 2>&1` | builds from `~/stock-m25` (or `TREE=...`) |
 | `m25p2-compare.sh` | `bash ~/stock-scripts/m25p2-compare.sh 3 > ~/m25-out/m25p2-compare.txt 2>&1` | `stock-m25p1`, `stock-m25p2`, generator `stock-m25p1` |
 | `m25p2-stages.sh` | `bash ~/stock-scripts/m25p2-stages.sh 3 > ~/m25-out/m25p2-stages.txt 2>&1` | `stock-m25p1-timed`, `stock-m25p2-timed`, generator `stock-m25p1` |
+| `m25p4-stages.sh` | `bash ~/stock-scripts/m25p4-stages.sh 3 > ~/m25-out/m25p4-stages.txt 2>&1` | `stock-m25p1-timed`, `stock-m25p2-timed` |
+| `m25p4-order.sh` | `bash ~/stock-scripts/m25p4-order.sh 6 > ~/m25-out/m25p4-order.txt 2>&1` | `stock-m24p2`, `stock-m25final` |
+| `m25p4-final.sh` | `bash ~/stock-scripts/m25p4-final.sh 3 > ~/m25-out/m25p4-final.txt 2>&1` (needs cgroup v2, and `m25p4-cpu.awk` in `~/stock-scripts`) | `stock-m24p2`, `stock-m25final`, generator `stock-m25final` |
 
 Then summarize the stage runs the same way the documents did:
 
@@ -164,6 +169,8 @@ awk -f scripts/m25p1-summarize.awk ~/m25-out/m25p1-stages.txt > ~/m25-out/m25p1-
 awk -f scripts/m25p1-decompose.awk ~/m25-out/m25p1-stages-summary.txt
 awk -f scripts/m25p2-summarize.awk ~/m25-out/m25p2-compare.txt > ~/m25-out/m25p2-compare-summary.txt
 awk -f scripts/m25p2-summarize.awk ~/m25-out/m25p2-stages.txt > ~/m25-out/m25p2-stages-summary.txt
+awk -f scripts/m25p2-summarize.awk ~/m25-out/m25p4-final.txt > ~/m25-out/m25p4-final-summary.txt
+awk -f scripts/m25p2-summarize.awk ~/m25-out/m25p4-stages.txt > ~/m25-out/m25p4-stages-summary.txt
 ```
 
 Running every script takes roughly three hours; milestone 25 part 2's comparison and stage scripts
