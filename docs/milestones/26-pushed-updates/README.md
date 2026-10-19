@@ -27,8 +27,8 @@ written to be studied cold.
 
 | Part | What | Status |
 |---|---|---|
-| — | The plan and decisions 1–6 | awaiting the owner's review (2026-10-19) |
-| 1 | The public L2 feed, in the MDP | not started |
+| — | The plan and decisions 1–6 | accepted by the owner as recommended (2026-10-19) |
+| 1 | The public L2 feed, in the MDP | in progress, started 2026-10-19 |
 | 2 | The private feed, in its own process | not started |
 | 3 | Measurement | not started |
 | 4 | Final review and close | not started |

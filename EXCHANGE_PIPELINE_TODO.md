@@ -468,11 +468,11 @@ Milestone 25, planned on 2026-10-14, closed on 2026-10-19. The plan is in `PROJE
 - [x] Part 4 (2026-10-19): final measurement against the milestone 24 part 2 binary, same day, interleaved, three runs per configuration, tmpfs runs, per-container CPU. Maximum rate +77% replicated, +17% alone (within that day's spread; +26–28% by the timed follow-up and the cycle model); p99 at 5,000/s −6% to −49%; the median at 5,000/s in-process replicated +15% over 6 balanced runs, within the spread. `docs/milestones/25-latency/performance/04-final-measurement.md`.
 - [x] For each part: a part file and its `performance/` files written in depth; this checklist and `PROJECT_DIRECTION.md` updated; `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests and an independent review (Part 4 changed no code; its scripts and documents were reviewed).
 
-## Planned Milestone - Pushed Updates
+## Current Milestone - Pushed Updates
 
 Milestone 26, planned on 2026-10-19. The owner reviews the plan in `PROJECT_DIRECTION.md` ("26. Pushed Updates") and decisions 1-6 before any code. Documents go in `docs/milestones/26-pushed-updates/`.
 
-- [ ] The owner reviews the plan and confirms decisions 1-6.
+- [x] The owner reviews the plan and confirms decisions 1-6 (2026-10-19, all as recommended).
 - [x] Create `docs/milestones/26-pushed-updates/` (README, selection, theory, decisions, glossary).
 - [ ] Part 1: the public L2 feed in the MDP (`GET /marketdata/ws`): snapshot + deltas with sequences, gap detection, slow-consumer policy; an oracle test against the projection and the core's `l2_snapshot` at every sequence; write deadline for clients that stop reading.
 - [ ] Part 2: the private feed (`--user-feed`, default `127.0.0.1:4006`): owner map with its own state file, first-message JWT with a deadline and expiry, fills and order status to their owner only, rejections to the submitter, refused cancellations to the requester; an isolation test with several users and colliding order ids.

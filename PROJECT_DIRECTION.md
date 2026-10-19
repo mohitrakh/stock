@@ -1,4 +1,4 @@
-# Project Direction - Milestone 26 (Pushed Updates) Planned, Awaiting Owner Review
+# Project Direction - Milestone 26 (Pushed Updates) In Progress
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -1417,7 +1417,7 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 
 ## 26. Pushed Updates
 
-**Status: planned on 2026-10-19; awaiting the owner's review of the plan and decisions 1–6. No code until then.** Progress will be recorded at the end of this section. Documents go in `docs/milestones/26-pushed-updates/`, with the same layout and depth rules as milestones 24 and 25 (the repository's `CLAUDE.md`).
+**Status: planned on 2026-10-19; the owner accepted the plan and decisions 1–6 as recommended the same day ("accept all decisions, push and start part 1"). Part 1 in progress.** Progress will be recorded at the end of this section. Documents go in `docs/milestones/26-pushed-updates/`, with the same layout and depth rules as milestones 24 and 25 (the repository's `CLAUDE.md`).
 
 ### Why this milestone
 
@@ -1580,7 +1580,7 @@ A client that falls behind is told so and resynchronizes; it never silently hold
 
 ### Progress
 
-Planned on 2026-10-19. Nothing built yet.
+Planned on 2026-10-19; decisions 1–6 accepted the same day. Part 1 started.
 
 ## Known Prototype Limitations
 
@@ -1634,7 +1634,7 @@ Planned on 2026-10-19. Nothing built yet.
 
 ## What Not To Work On Yet
 
-Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, closed on 2026-10-19 (Parts 1, 2 and 4; Part 3 dropped). Milestone 26, pushed updates, is planned and awaits the owner's review of its plan; do not start any other candidate while it is open. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
+Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, closed on 2026-10-19 (Parts 1, 2 and 4; Part 3 dropped). Milestone 26, pushed updates, is in progress; do not start any other candidate while it is open. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
 
 After milestone 26, the remaining candidate (the owner selects):
 1. **Set-based reporter writes or `COPY`.** The reporter applies about 1,600 commands/s against the exchange's 35,000+. It is off the trading path and catches up afterwards, so this matters only at sustained volume.

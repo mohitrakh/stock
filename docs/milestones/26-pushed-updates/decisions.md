@@ -14,7 +14,12 @@ milestone 26".
 - set-based reporter writes or `COPY`: the reporter is off the trading path and catches up, so this
   matters only under sustained volume.
 
-## 2026-10-19 — Decisions awaiting the owner
+## 2026-10-19 — Decisions 1–6 accepted
+
+The owner answered "accept all decisions, push and start part 1": each decision below is accepted
+as recommended.
+
+## 2026-10-19 — Decisions as proposed
 
 Proposed in `PROJECT_DIRECTION.md`, "26. Pushed Updates", "Decisions for the owner". The theory
 behind each is in `01-theory.md`.
