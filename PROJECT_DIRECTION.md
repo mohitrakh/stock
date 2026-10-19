@@ -1,4 +1,4 @@
-# Project Direction - Milestone 25 (Latency) In Progress: Parts 1 and 2 Complete
+# Project Direction - Milestone 25 (Latency) In Progress: Parts 1-2 Complete, Part 3 Dropped, Part 4 Running
 
 This is the canonical project journal and direction file. Read it first when returning to the project, then read:
 
@@ -1252,7 +1252,7 @@ Rules for every file:
 
 ## 25. Latency
 
-**Status: selected and planned on 2026-10-14; the owner accepted the plan and decisions 1–4 as recommended. Parts 1 and 2 complete on 2026-10-14; Part 3 awaits the owner's decision.** Progress is recorded at the end of this section. Its documents will go in `docs/milestones/25-latency/`, with the same layout and depth rules as milestone 24 (see milestone 24, "Documentation for this milestone"). The decisions marked *proposed* need the owner's confirmation before the part that uses them.
+**Status: selected and planned on 2026-10-14; the owner accepted the plan and decisions 1–4 as recommended. Parts 1 and 2 complete on 2026-10-14; Part 3 dropped by the owner on 2026-10-19; Part 4 in progress.** Progress is recorded at the end of this section. Its documents will go in `docs/milestones/25-latency/`, with the same layout and depth rules as milestone 24 (see milestone 24, "Documentation for this milestone"). The decisions marked *proposed* need the owner's confirmation before the part that uses them.
 
 ### Why this milestone
 
@@ -1404,7 +1404,9 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
   - a mutation check of 6 mutations, each failing its test;
   - two rounds of independent review: the reviews found no way to show anything before it is durable, or out of order; three code and test fixes were made (a test made deterministic, the publication-failure answers, running alone after a failed publication), plus fixes to the summary awk and the documents.
 
-**Decision for the owner before Part 3:** Part 3, a binary record format. Part 1 measured `Encode` at 0.05–0.33% of latency and at most about 15% of maximum throughput. With the pipeline, the worker's own work is now what limits the maximum rate alone, so encoding's share there is 3.0 µs of 15.9 µs per command (16.12 ms / 1,011.8), about 19%: a free encoder could raise the maximum rate by at most about 23% (1 / (1 − 0.19)), an estimate. It costs a journal format change that every reader must follow. Recommendation unchanged: drop it, or keep it as a learning exercise. After Part 3 (or without it), Part 4, the final measurement against the milestone 24 part 2 binary.
+**Part 3, dropped (owner, 2026-10-19):** "drop part 3, push and start part 4". A binary record format would gain nothing measurable in latency (`Encode` is 0.05–0.33% of it) and at most about 23% of the maximum rate alone (an estimate; `Encode` is about 19% of the worker's 15.9 µs per command), for a journal format change every reader must follow. Reasons in `docs/milestones/25-latency/decisions.md`.
+
+**Part 4, started 2026-10-19: the final measurement.** The milestone 24 part 2 binary against the final binary, as planned above.
 
 ## Known Prototype Limitations
 
@@ -1458,7 +1460,7 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 
 ## What Not To Work On Yet
 
-Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, is in progress: Parts 1 and 2 are complete, and Part 3 (a binary format) awaits the owner's decision. Do not start any other candidate while it is open. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
+Milestone 24 closed on 2026-10-14 after Part 2; its Parts 3 to 6 (product list, operator-only deposits, rate limits) were dropped by the owner and are not to be restarted unless the owner asks. Milestone 25, latency, is in progress: Parts 1 and 2 are complete, Part 3 (a binary format) was dropped, and Part 4 (the final measurement) is in progress. Do not start any other candidate while it is open. Do not grow two machines into automatic failover, promotion on missed heartbeats, leader election, more than one replica, reliable UDP, or Raft: each needs its own failure model, and a three-machine quorum is the recorded follow-up after it.
 
 After milestone 25, the remaining candidates (the owner selects):
 1. **Pushed updates (WebSocket)** of a user's own fills and the L2 book. The design requires that a client "receive matched trades in real-time" and "view the real-time order book". Today clients must poll, so a functional requirement is unmet.

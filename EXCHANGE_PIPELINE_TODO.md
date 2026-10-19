@@ -462,8 +462,8 @@ Milestone 25, planned on 2026-10-14, in progress. The plan is in `PROJECT_DIRECT
 - [x] Create `docs/milestones/25-latency/` (README, selection, theory, decisions, glossary).
 - [x] Part 1 (2026-10-14): a stage-by-stage timing of an order (in-process and HTTP, alone and replicated). The stage means account for the end-to-end mean (means add up, medians do not; see the theory).
 - [x] The owner confirms Part 2 (2026-10-14).
-- [ ] The owner decides Part 3, given Parts 1 and 2's findings.
+- [x] The owner decides Part 3 (2026-10-19): dropped.
 - [x] Part 2 (2026-10-14): a pipelined journal sync, with durable-before-visible and the failure rule proven by tests (5 pipeline tests, 6 mutations). Maximum rate +41.5% alone and +36.7% replicated; mean latency at 5,000/s −10% to −28%. The measurement found, and the fix and a test now guard, a first version that shipped each group to the replica at once and broke replicated runs at moderate load.
-- [ ] Part 3: a binary record format, only if Part 1 shows JSON encoding matters; otherwise dropped, with the reason.
+- Dropped (owner, 2026-10-19): Part 3, a binary record format. Encoding is under 0.4% of latency; at most about +23% of the maximum rate alone; the cost is a journal format change for every reader. Reasons in `docs/milestones/25-latency/decisions.md`.
 - [ ] Part 4: final measurement against the milestone 24 part 2 binary, on the same day, interleaved, with three runs per configuration, tmpfs runs, and per-container CPU.
 - [ ] For each part: a part file and its `performance/` files written in depth; this checklist and `PROJECT_DIRECTION.md` updated; `cargo fmt -- --check`, `cargo test --locked`, the PostgreSQL acceptance tests and an independent review.

@@ -69,6 +69,20 @@ The owner answered "go ahead with next steps of our current milestone". That is 
 question 1. Question 2 was not answered. Part 3 is not started, and is put to the owner again with
 Part 2's results.
 
+## 2026-10-19 — Part 3 dropped
+
+After Part 2's results the owner answered "drop part 3, push and start part 4". The binary record
+format is dropped. The reasons, from the measurements:
+- latency: `Encode` is 0.05–0.33% of an order's latency at 1,000 and 5,000 orders/s
+  (`performance/02-where-the-time-goes.md`), so a free encoder changes nothing measurable;
+- throughput: with the pipeline, the worker's own work limits the maximum rate alone, and `Encode`
+  is 3.0 µs of the 15.9 µs per command there (16.12 ms / 1,011.8), about 19%; a free encoder could
+  raise the maximum rate by at most about 23% (1 / (1 − 0.19)), an estimate
+  (`performance/03-pipelined-sync.md`);
+- replicated, the shared SSD limits the maximum rate, not the worker's CPU;
+- the cost: a new journal format (`EXCHLOG3`), a new journal, and changes to every reader
+  (recovery, the replica, the mmap stream, the MDP, the reporter, the probe).
+
 ## 2026-10-14 — Design choices inside decision 2 (made while building Part 2)
 
 Implementation choices, recorded so the owner can overrule them. The reasoning, with a worked

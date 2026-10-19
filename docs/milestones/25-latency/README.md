@@ -29,8 +29,8 @@ decisions, and a glossary. It is written to be studied cold.
 |---|---|---|
 | 1 | Where the time goes: stage-by-stage timing (`--features stage-timing`) | complete, 2026-10-14 |
 | 2 | A pipelined journal sync | complete, 2026-10-14: maximum rate +41.5% alone, +36.7% replicated; mean latency at 5,000/s −10% to −28% |
-| 3 | A binary record format, only if Part 1 shows it matters | not started; the owner's decision is pending |
-| 4 | Final measurement against the milestone 24 part 2 binary | not started |
+| 3 | A binary record format, only if Part 1 shows it matters | dropped by the owner, 2026-10-19 (`decisions.md`) |
+| 4 | Final measurement against the milestone 24 part 2 binary | in progress, started 2026-10-19 |
 
 ## Files
 
