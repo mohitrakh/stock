@@ -539,3 +539,106 @@ fn mdp_refuses_corrupt_saved_state_without_database_configuration() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("market data:"));
 }
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The next text message from the feed, as JSON, skipping pings; `Err` with the close code when
+/// the server closes the connection instead.
+async fn next_message(socket: &mut Socket) -> Result<serde_json::Value, Option<u16>> {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(10), socket.next())
+            .await
+            .expect("nothing from the feed within 10 s");
+        match message {
+            Some(Ok(Message::Text(text))) => {
+                return Ok(serde_json::from_str(text.as_str()).unwrap());
+            }
+            Some(Ok(Message::Close(frame))) => return Err(frame.map(|frame| frame.code.into())),
+            Some(Ok(_)) => {}
+            None | Some(Err(_)) => return Err(None),
+        }
+    }
+}
+
+/// Milestone 26 part 1, through the shipped executable: the WebSocket snapshot equals the REST
+/// view, a live batch arrives as a delta chained to it and leaves both agreeing, no message
+/// carries a user, and a broken stream closes the connection with 1011.
+#[tokio::test(flavor = "multi_thread")]
+async fn mdp_pushes_the_book_over_websocket_and_closes_when_the_stream_breaks() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let fixture = Fixture::new();
+    fixture.initialize(
+        &[
+            accepted_order(1, "sell-101", "private-seller", "sell", 101, 5, 1),
+            accepted_order(3, "buy-99", "private-buyer", "buy", 99, 2, 2),
+        ],
+        4,
+    );
+    let address = unused_address();
+    let mut child = fixture.spawn(&address);
+    wait_for(&mut child, &address, "/health", |status, _| status == 200);
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/marketdata/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            r#"{"type":"subscribe","channel":"book","symbol":"AAPL"}"#.into(),
+        ))
+        .await
+        .unwrap();
+    let snapshot = next_message(&mut socket).await.unwrap();
+    assert_eq!(snapshot["type"], "snapshot");
+    assert_eq!(
+        (snapshot["seq"].as_u64(), snapshot["last"].as_u64()),
+        (Some(4), Some(4))
+    );
+    let (_, body) = request(&address, "/marketdata/orderbook/AAPL").unwrap();
+    let rest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (&snapshot["bids"], &snapshot["asks"]),
+        (&rest["bids"], &rest["asks"])
+    );
+
+    // A buy of 4 at 101 takes 4 of the 5 resting at 101.
+    fixture.append_and_publish(
+        &accepted_buy_with_trade(5, "buy-101", 4, 3, "sell-101", 101, 1.0),
+        8,
+    );
+    let delta = next_message(&mut socket).await.unwrap();
+    assert_eq!(delta["type"], "delta");
+    assert_eq!(
+        (delta["seq"].as_u64(), delta["prev"].as_u64()),
+        (Some(8), Some(4))
+    );
+    assert_eq!(
+        delta["asks"],
+        serde_json::json!([{"price":101,"quantity":1}])
+    );
+    assert_eq!(delta["bids"], serde_json::json!([]));
+    let (_, body) = wait_for(
+        &mut child,
+        &address,
+        "/marketdata/orderbook/AAPL",
+        |status, body| status == 200 && body.contains(r#"{"price":101,"quantity":1}"#),
+    );
+    let rest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rest["bids"], snapshot["bids"]);
+    for message in [&snapshot, &delta] {
+        assert!(!message.to_string().contains("private-"), "{message}");
+    }
+
+    fixture.interrupt_stream_publication();
+    let closed = loop {
+        match next_message(&mut socket).await {
+            Ok(_) => {}
+            Err(code) => break code,
+        }
+    };
+    assert_eq!(closed, Some(1011));
+    child.stop();
+}

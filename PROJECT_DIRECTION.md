@@ -1580,7 +1580,13 @@ A client that falls behind is told so and resynchronizes; it never silently hold
 
 ### Progress
 
-Planned on 2026-10-19; decisions 1–6 accepted the same day. Part 1 started.
+Planned on 2026-10-19; decisions 1–6 accepted the same day.
+
+**Part 1, complete (2026-10-19): the public L2 book feed.** Write-up: `docs/milestones/26-pushed-updates/part-1-public-book-feed.md`.
+- **The feed.** `GET /marketdata/ws` on the MDP. A client subscribes to symbols and gets a full-depth snapshot (`seq`, `last`), then a delta per committed batch that changes the book (`seq`, `prev`, levels with their new quantities). The follower publishes under the view's write lock and a subscriber joins under the read lock, so no delta falls between a snapshot and its join. Each symbol's `last` lives outside the book map, so it survives a book emptying.
+- **Fan-out.** One `tokio::sync::broadcast` ring per symbol, each delta serialized once; per connection a bounded queue fed by one forwarder per subscription; a deadline on every socket write. A slow consumer is closed with 1013, a halted follower closes everything with 1011, a client silent for more than three ping intervals is closed with 1001, and the server completes the WebSocket closing handshake. Rings are freed when their last subscriber leaves.
+- **Proof.** An oracle test (2,000 random orders and cancellations through the authoritative core; after every batch two clients equal the projection and the core), durability with a held sync, the close and the next day, the socket protocol and every refusal, resubscription, three slow-consumer and silence cases, a halt, and the shipped executable against its REST view. 232 tests (218 + 14), 235 with `stage-timing`, 4 MDP integration tests, the 3 PostgreSQL acceptance tests; a mutation check of 7 mutations, each failing its test; two review rounds, no way found to miss or double a delta; their findings fixed (a resubscription test, a ring leak on two paths, pings that detected nothing, an abort not awaited, and a closing-handshake bug the new silence test exposed).
+- **New dependency:** axum's `ws` feature (`tokio-tungstenite` and `tungstenite` 0.29, plus six small crates).
 
 ## Known Prototype Limitations
 

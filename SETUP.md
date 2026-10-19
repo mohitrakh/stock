@@ -24,13 +24,13 @@ The scripts were written for the office machine and use fixed paths:
 | `~/stock-m25` | the repository, on branch `dev-rakh` | milestone 25 scripts (`MIGRATIONS`, the mutate script) |
 | `~/stock-m24` | a second checkout of the same commit (a git worktree, not a symlink) | milestone 24 scripts (`MIGRATIONS` default, the mutate script) |
 | `~/stock-scripts/` | every script, `check.sh`, and the built binaries | every script mounts it at `/scripts` |
-| `~/m24-out/`, `~/m25-out/` | where the outputs were written | your own redirections |
+| `~/m24-out/`, `~/m25-out/`, `~/m26-out/` | where the outputs were written | your own redirections |
 
 ```bash
 git clone <this repository's URL> ~/stock-m25
 cd ~/stock-m25 && git checkout dev-rakh
 git worktree add --detach ~/stock-m24 HEAD
-mkdir -p ~/stock-scripts ~/m24-out ~/m25-out
+mkdir -p ~/stock-scripts ~/m24-out ~/m25-out ~/m26-out
 cp tools/check.sh docs/milestones/*/performance/scripts/* ~/stock-scripts/
 chmod +x ~/stock-scripts/*.sh
 ```
@@ -160,6 +160,7 @@ count. Redirect each script into a file:
 | `m25p4-stages.sh` | `bash ~/stock-scripts/m25p4-stages.sh 3 > ~/m25-out/m25p4-stages.txt 2>&1` | `stock-m25p1-timed`, `stock-m25p2-timed` |
 | `m25p4-order.sh` | `bash ~/stock-scripts/m25p4-order.sh 6 > ~/m25-out/m25p4-order.txt 2>&1` | `stock-m24p2`, `stock-m25final` |
 | `m25p4-final.sh` | `bash ~/stock-scripts/m25p4-final.sh 3 > ~/m25-out/m25p4-final.txt 2>&1` (needs cgroup v2, and `m25p4-cpu.awk` in `~/stock-scripts`) | `stock-m24p2`, `stock-m25final`, generator `stock-m25final` |
+| `m26p1-mutate.sh` | `TREE=~/stock-m25 bash ~/stock-scripts/m26p1-mutate.sh > ~/m26-out/m26p1-mutate.txt 2>&1` | builds from `$TREE` (milestone 26 code) |
 
 Then summarize the stage runs the same way the documents did:
 

@@ -3,7 +3,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     error::Error,
     fs::{File, OpenOptions},
     io::{self, Write},
@@ -17,14 +17,19 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, Query, State},
+    extract::{
+        Path as AxumPath, Query, State,
+        ws::{Utf8Bytes, WebSocketUpgrade},
+    },
     http::StatusCode,
     response::IntoResponse,
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 use super::{
+    book_feed::{self, BookChange, BookFeed, Limits},
     candles::{Candle, CandleProjection},
     committed_batch::{self, CancelOutcome, CommittedCommand, ExpiredOrder, NewOrderOutcome},
     event_stream::{ReaderCheckpoint, StreamReader},
@@ -75,6 +80,8 @@ impl ProjectedBook {
 struct MarketDataProjection {
     orders: HashMap<String, ProjectedOrder>,
     books: HashMap<String, ProjectedBook>,
+    /// Every level changed since the last `take_changes`, for the book feed (milestone 26).
+    touched: Vec<(String, Side, u64)>,
 }
 
 impl MarketDataProjection {
@@ -83,7 +90,56 @@ impl MarketDataProjection {
         for order in orders {
             projection.insert_order(order)?;
         }
+        // Loading a saved state is not a change anyone was told about.
+        projection.touched.clear();
         Ok(projection)
+    }
+
+    /// The levels changed since the last call, one entry per symbol, each level with its new
+    /// aggregate quantity (0 when it was removed). Bids highest price first, asks lowest first.
+    fn take_changes(&mut self) -> Vec<BookChange> {
+        let mut by_symbol: BTreeMap<String, (BTreeSet<u64>, BTreeSet<u64>)> = BTreeMap::new();
+        for (symbol, side, price) in self.touched.drain(..) {
+            let (bids, asks) = by_symbol.entry(symbol).or_default();
+            match side {
+                Side::Buy => bids.insert(price),
+                Side::Sell => asks.insert(price),
+            };
+        }
+        by_symbol
+            .into_iter()
+            .map(|(symbol, (bids, asks))| {
+                let book = self.books.get(&symbol);
+                let bids = bids
+                    .into_iter()
+                    .rev()
+                    .map(|price| L2Level {
+                        price,
+                        quantity: book
+                            .and_then(|book| book.bids.get(&Reverse(price)))
+                            .copied()
+                            .unwrap_or(0),
+                    })
+                    .collect();
+                let asks = asks
+                    .into_iter()
+                    .map(|price| L2Level {
+                        price,
+                        quantity: book
+                            .and_then(|book| book.asks.get(&price))
+                            .copied()
+                            .unwrap_or(0),
+                    })
+                    .collect();
+                BookChange { symbol, bids, asks }
+            })
+            .collect()
+    }
+
+    /// Every level of a symbol's book; both sides empty when it has no orders.
+    fn levels(&self, symbol: &str) -> (Vec<L2Level>, Vec<L2Level>) {
+        self.view(symbol, usize::MAX)
+            .map_or_else(Default::default, |view| (view.bids, view.asks))
     }
 
     fn persisted_orders(&self) -> Vec<ProjectedOrder> {
@@ -124,6 +180,7 @@ impl MarketDataProjection {
         *level = level
             .checked_add(quantity)
             .ok_or_else(|| format!("L2 aggregate overflow for {symbol} at {price}"))?;
+        self.touched.push((symbol.to_string(), side.clone(), price));
         Ok(())
     }
 
@@ -169,6 +226,7 @@ impl MarketDataProjection {
         if empty {
             self.books.remove(symbol);
         }
+        self.touched.push((symbol.to_string(), side.clone(), price));
         Ok(())
     }
 
@@ -520,6 +578,7 @@ type Served = Arc<RwLock<Option<View>>>;
 struct Follower {
     reader: StreamReader,
     served: Served,
+    feed: Arc<BookFeed>,
     state_path: PathBuf,
     save_interval: Duration,
     unsaved: u64,
@@ -530,12 +589,14 @@ impl Follower {
     fn new(
         reader: StreamReader,
         served: Served,
+        feed: Arc<BookFeed>,
         state_path: PathBuf,
         save_interval: Duration,
     ) -> Self {
         Self {
             reader,
             served,
+            feed,
             state_path,
             save_interval,
             unsaved: 0,
@@ -562,6 +623,11 @@ impl Follower {
         if let Err(error) = view.apply_batch(&batch, after) {
             *served = None;
             return Err(invalid(error).into());
+        }
+        // Published before the lock is released, so a subscriber's snapshot and its join happen
+        // between two batches, never inside one (01-theory.md §4).
+        if let Some(last) = batch.last() {
+            self.feed.publish(last.seq_num, view.orders.take_changes());
         }
         drop(served);
         self.unsaved += 1;
@@ -617,8 +683,8 @@ impl Follower {
 }
 
 /// Withdraws the view when the follower thread ends for any reason, including a panic, so the
-/// process never keeps serving a view that has stopped moving.
-struct WithdrawOnExit(Served);
+/// process never keeps serving a view that has stopped moving, and closes every feed connection.
+struct WithdrawOnExit(Served, Arc<BookFeed>);
 
 impl Drop for WithdrawOnExit {
     fn drop(&mut self) {
@@ -627,12 +693,46 @@ impl Drop for WithdrawOnExit {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *served = None;
+        drop(served);
+        self.1.halt();
     }
 }
 
 #[derive(Clone)]
 struct MarketDataState {
     served: Served,
+    feed: Arc<BookFeed>,
+}
+
+/// A book subscription: the whole book as a snapshot message, and a receiver joined at exactly
+/// that point. Both are taken under the view's read lock, which the follower's publication needs
+/// as a write lock, so no batch falls between them. `None` when market data is unavailable.
+fn subscribe_book(
+    served: &Served,
+    feed: &BookFeed,
+    symbol: &str,
+) -> Option<(Utf8Bytes, broadcast::Receiver<Utf8Bytes>)> {
+    let served = served.read().ok()?;
+    let view = served.as_ref()?;
+    let (last, receiver) = feed.join(symbol)?;
+    let (bids, asks) = view.orders.levels(symbol);
+    let seq = view.applied.next_sequence - 1;
+    Some((
+        book_feed::snapshot(symbol, seq, last, &bids, &asks),
+        receiver,
+    ))
+}
+
+async fn book_socket(
+    State(state): State<MarketDataState>,
+    upgrade: WebSocketUpgrade,
+) -> impl IntoResponse {
+    upgrade.on_upgrade(move |socket| {
+        let feed = Arc::clone(&state.feed);
+        book_feed::serve(socket, feed, move |symbol| {
+            subscribe_book(&state.served, &state.feed, symbol)
+        })
+    })
 }
 
 #[derive(Deserialize)]
@@ -731,7 +831,14 @@ pub async fn run(args: &[String]) -> MdResult<()> {
         candles,
         applied,
     })));
-    let mut follower = Follower::new(reader, Arc::clone(&served), state_path, SAVE_INTERVAL);
+    let feed = Arc::new(BookFeed::new(Limits::DEFAULT));
+    let mut follower = Follower::new(
+        reader,
+        Arc::clone(&served),
+        Arc::clone(&feed),
+        state_path,
+        SAVE_INTERVAL,
+    );
     // Catch up before binding, saving on the usual cadence, then save once more so the state on
     // disk matches what the listener is about to serve.
     while follower.step()? {
@@ -739,7 +846,7 @@ pub async fn run(args: &[String]) -> MdResult<()> {
     }
     follower.save()?;
 
-    let withdraw = WithdrawOnExit(Arc::clone(&served));
+    let withdraw = WithdrawOnExit(Arc::clone(&served), Arc::clone(&feed));
     thread::Builder::new()
         .name("market-data-follower".into())
         .spawn(move || {
@@ -749,15 +856,19 @@ pub async fn run(args: &[String]) -> MdResult<()> {
             }
         })?;
 
-    let app = Router::new()
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    println!("Market data is listening on {}", listener.local_addr()?);
+    axum::serve(listener, router(served, feed)).await?;
+    Ok(())
+}
+
+fn router(served: Served, feed: Arc<BookFeed>) -> Router {
+    Router::new()
         .route("/health", get(health))
         .route("/marketdata/orderbook/{symbol}", get(order_book))
         .route("/marketdata/candles", get(candle_history))
-        .with_state(MarketDataState { served });
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    println!("Market data is listening on {}", listener.local_addr()?);
-    axum::serve(listener, app).await?;
-    Ok(())
+        .route("/marketdata/ws", get(book_socket))
+        .with_state(MarketDataState { served, feed })
 }
 
 #[cfg(test)]
@@ -1390,6 +1501,7 @@ mod tests {
         let mut follower = Follower::new(
             reader,
             Arc::clone(&served),
+            Arc::new(BookFeed::new(Limits::DEFAULT)),
             state_path.clone(),
             Duration::ZERO,
         );
@@ -1423,6 +1535,7 @@ mod tests {
         let mut follower = Follower::new(
             reader,
             Arc::clone(&served),
+            Arc::new(BookFeed::new(Limits::DEFAULT)),
             state_path.clone(),
             Duration::from_secs(3600),
         );
@@ -1504,6 +1617,7 @@ mod tests {
         let mut first = Follower::new(
             reader,
             Arc::clone(&served),
+            Arc::new(BookFeed::new(Limits::DEFAULT)),
             state_path.clone(),
             Duration::from_secs(3600),
         );
@@ -1534,6 +1648,7 @@ mod tests {
         let mut second = Follower::new(
             reader,
             Arc::clone(&served),
+            Arc::new(BookFeed::new(Limits::DEFAULT)),
             state_path,
             Duration::from_secs(3600),
         );
@@ -1760,5 +1875,783 @@ mod tests {
                 quantity: 4,
             }]
         );
+    }
+
+    // Milestone 26 part 1: the public book feed.
+
+    fn parsed(text: &Utf8Bytes) -> serde_json::Value {
+        serde_json::from_str(text.as_str()).unwrap()
+    }
+
+    /// A feed client's copy of one book, kept by the protocol's rules (01-theory.md §3).
+    #[derive(Debug, Default)]
+    struct ClientBook {
+        seq: u64,
+        last: u64,
+        bids: BTreeMap<Reverse<u64>, u64>,
+        asks: BTreeMap<u64, u64>,
+    }
+
+    impl ClientBook {
+        fn from_snapshot(message: &serde_json::Value) -> Self {
+            assert_eq!(message["type"], "snapshot", "{message}");
+            let mut book = ClientBook {
+                seq: message["seq"].as_u64().unwrap(),
+                last: message["last"].as_u64().unwrap(),
+                ..Default::default()
+            };
+            book.set_levels(message);
+            book
+        }
+
+        fn set_levels(&mut self, message: &serde_json::Value) {
+            for level in message["bids"].as_array().unwrap() {
+                let (price, quantity) = (
+                    level["price"].as_u64().unwrap(),
+                    level["quantity"].as_u64().unwrap(),
+                );
+                match quantity {
+                    0 => self.bids.remove(&Reverse(price)),
+                    _ => self.bids.insert(Reverse(price), quantity),
+                };
+            }
+            for level in message["asks"].as_array().unwrap() {
+                let (price, quantity) = (
+                    level["price"].as_u64().unwrap(),
+                    level["quantity"].as_u64().unwrap(),
+                );
+                match quantity {
+                    0 => self.asks.remove(&price),
+                    _ => self.asks.insert(price, quantity),
+                };
+            }
+        }
+
+        /// The drop rule first, then the gap rule. `Err` on a gap.
+        fn apply(&mut self, message: &serde_json::Value) -> Result<(), String> {
+            assert_eq!(message["type"], "delta", "{message}");
+            let seq = message["seq"].as_u64().unwrap();
+            let prev = message["prev"].as_u64().unwrap();
+            if seq <= self.seq {
+                return Ok(()); // already in the snapshot
+            }
+            if prev != self.last {
+                return Err(format!("gap: prev {prev}, last known {}", self.last));
+            }
+            self.set_levels(message);
+            self.last = seq;
+            Ok(())
+        }
+
+        fn levels(&self) -> (Vec<L2Level>, Vec<L2Level>) {
+            (
+                self.bids
+                    .iter()
+                    .map(|(price, quantity)| L2Level {
+                        price: price.0,
+                        quantity: *quantity,
+                    })
+                    .collect(),
+                self.asks
+                    .iter()
+                    .map(|(price, quantity)| L2Level {
+                        price: *price,
+                        quantity: *quantity,
+                    })
+                    .collect(),
+            )
+        }
+
+        fn crossed(&self) -> bool {
+            matches!(
+                (self.bids.keys().next(), self.asks.keys().next()),
+                (Some(bid), Some(ask)) if bid.0 >= *ask
+            )
+        }
+    }
+
+    /// A client joined at the projection's current point: what `subscribe_book` does.
+    fn joined(
+        feed: &BookFeed,
+        projection: &MarketDataProjection,
+        symbol: &str,
+        seq: u64,
+    ) -> (ClientBook, broadcast::Receiver<Utf8Bytes>) {
+        let (last, receiver) = feed.join(symbol).unwrap();
+        let (bids, asks) = projection.levels(symbol);
+        let snapshot = book_feed::snapshot(symbol, seq, last, &bids, &asks);
+        (ClientBook::from_snapshot(&parsed(&snapshot)), receiver)
+    }
+
+    fn order_in(
+        symbol: &str,
+        id: &str,
+        user: &str,
+        side: &str,
+        price: u64,
+        quantity: u32,
+    ) -> Order {
+        Order::new(
+            id.to_string(),
+            user.to_string(),
+            symbol.to_string(),
+            side,
+            price,
+            quantity,
+            None,
+            1.0,
+            0,
+        )
+        .unwrap()
+    }
+
+    fn canceled_by(order_id: &str, user_id: &str, seq_num: u64) -> Vec<EventEnvelope> {
+        envelopes(
+            ExchangeInputEvent::CancelOrderRequested {
+                order_id: order_id.to_string(),
+                user_id: user_id.to_string(),
+            },
+            vec![ExchangeOutputEvent::OrderCanceled {
+                order_id: order_id.to_string(),
+                seq_num,
+            }],
+        )
+    }
+
+    /// The oracle test: 2,000 random orders and cancellations from three users on two symbols,
+    /// through the authoritative core. After every batch, a client that subscribed at the start
+    /// and one that subscribed part-way hold exactly the projection's book and the core's.
+    #[test]
+    fn feed_snapshots_and_deltas_rebuild_every_book_at_every_sequence() {
+        let symbols = ["AAPL", "MSFT"];
+        let users = ["alice", "bob", "carol"];
+        let mut core = ExchangeCore::new();
+        for user in users {
+            core.deposit(user.into(), 1_000_000_000).unwrap();
+            for symbol in symbols {
+                core.deposit_shares(user, symbol, 1_000_000).unwrap();
+            }
+        }
+        let mut projection = MarketDataProjection::default();
+        let feed = BookFeed::new(Limits::DEFAULT);
+        let mut clients: Vec<(&str, ClientBook, broadcast::Receiver<Utf8Bytes>)> = symbols
+            .iter()
+            .map(|symbol| {
+                let (book, receiver) = joined(&feed, &projection, symbol, 0);
+                (*symbol, book, receiver)
+            })
+            .collect();
+        let mut resting: Vec<(String, String)> = Vec::new();
+        let (mut random, mut next, mut crossed, mut deltas) =
+            (0x9E37_79B9_7F4A_7C15u64, 1, false, 0);
+        for step in 0..2_000 {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let r = random >> 33;
+            let batch = if r % 5 == 0 && !resting.is_empty() {
+                let (id, user) = resting.swap_remove((r as usize / 5) % resting.len());
+                match core.cancel_order_for_user(&id, &user) {
+                    Ok(seq) => canceled_by(&id, &user, seq),
+                    Err(_) => continue, // filled since it rested
+                }
+            } else {
+                let order = order_in(
+                    symbols[(r % 2) as usize],
+                    &format!("o{step}"),
+                    users[((r >> 3) % 3) as usize],
+                    if (r >> 5) % 2 == 0 { "BUY" } else { "SELL" },
+                    95 + (r >> 7) % 11,
+                    1 + ((r >> 11) % 9) as u32,
+                );
+                match core.add_order(order.clone()) {
+                    Ok(outcome) => {
+                        if outcome.view.remaining_quantity > 0 {
+                            resting.push((order.order_id.clone(), order.user_id.clone()));
+                        }
+                        accepted(order, outcome.executions)
+                    }
+                    Err(_) => rejected(order),
+                }
+            };
+            let batch = numbered(batch, &mut next);
+            let seq = batch.last().unwrap().seq_num;
+            projection.apply_batch(&batch).unwrap();
+            feed.publish(seq, projection.take_changes());
+            if step == 700 {
+                for symbol in symbols {
+                    let (book, receiver) = joined(&feed, &projection, symbol, seq);
+                    clients.push((symbol, book, receiver));
+                }
+            }
+            for (symbol, book, receiver) in clients.iter_mut() {
+                while let Ok(text) = receiver.try_recv() {
+                    book.apply(&parsed(&text)).unwrap();
+                    deltas += 1;
+                }
+                let core_book = core
+                    .l2_snapshot(symbol, usize::MAX)
+                    .map_or_else(Default::default, |view| (view.bids, view.asks));
+                assert_eq!(
+                    book.levels(),
+                    projection.levels(symbol),
+                    "step {step}, {symbol}"
+                );
+                assert_eq!(book.levels(), core_book, "step {step}, {symbol}");
+                crossed |= book.crossed();
+            }
+        }
+        // One user's buy and sell can rest crossed; the feed publishes that book as it is.
+        assert!(crossed, "the flow never crossed a book");
+        assert!(deltas > 1_000, "only {deltas} deltas");
+    }
+
+    /// The drop rule keeps a delta already in the snapshot from being applied twice, and the gap
+    /// rule catches a delta that never arrived.
+    #[test]
+    fn a_delta_in_the_snapshot_is_dropped_and_a_missing_one_is_a_gap() {
+        let feed = BookFeed::new(Limits::DEFAULT);
+        let mut projection = MarketDataProjection::default();
+        let (last, mut receiver) = feed.join("AAPL").unwrap();
+        let mut next = 1;
+        for (id, price) in [("a", 100), ("b", 101), ("c", 102)] {
+            let batch = numbered(
+                accepted(order(id, "seller", "SELL", price, 1), vec![]),
+                &mut next,
+            );
+            projection.apply_batch(&batch).unwrap();
+            feed.publish(batch.last().unwrap().seq_num, projection.take_changes());
+        }
+        let deltas: Vec<_> = (0..3)
+            .map(|_| parsed(&receiver.try_recv().unwrap()))
+            .collect();
+
+        // Joined before the first batch, snapshot taken after it: the first delta is in it.
+        let (bids, asks) = (
+            vec![],
+            vec![L2Level {
+                price: 100,
+                quantity: 1,
+            }],
+        );
+        let first_seq = deltas[0]["seq"].as_u64().unwrap();
+        let mut book = ClientBook::from_snapshot(&parsed(&book_feed::snapshot(
+            "AAPL", first_seq, first_seq, &bids, &asks,
+        )));
+        book.apply(&deltas[0]).unwrap();
+        assert_eq!(book.asks.len(), 1, "applied twice");
+        book.apply(&deltas[1]).unwrap();
+        assert_eq!(book.asks.len(), 2);
+
+        let mut missed =
+            ClientBook::from_snapshot(&parsed(&book_feed::snapshot("AAPL", 0, last, &[], &[])));
+        missed.apply(&deltas[0]).unwrap();
+        assert!(missed.apply(&deltas[2]).unwrap_err().contains("gap"));
+    }
+
+    /// Durable before visible: while the journal sync of an order is held, the stream publishes
+    /// nothing of it, so the feed sends nothing; once synced, its delta arrives.
+    #[test]
+    fn nothing_is_published_before_its_sync() {
+        let fixture = Fixture::new();
+        let (tx, rx) = mpsc::channel(16);
+        let mut runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let (gate, arrived) = runtime.hold_syncs_for_test();
+        let worker = thread::spawn(move || runtime.run());
+        let synced = |command: ExchangeCommand| {
+            send(&tx, command);
+            arrived.recv().unwrap();
+            gate.send(true).unwrap();
+        };
+        let (respond_to, opened) = oneshot::channel();
+        synced(ExchangeCommand::OpenMarket {
+            trading_day: chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+            respond_to,
+        });
+        opened.blocking_recv().unwrap().unwrap();
+        let (respond_to, deposited) = oneshot::channel();
+        synced(ExchangeCommand::DepositShares {
+            user_id: "seller".into(),
+            symbol: "AAPL".into(),
+            quantity: 5,
+            respond_to,
+        });
+        deposited.blocking_recv().unwrap().unwrap();
+
+        let reader = fixture.reader();
+        let served = empty_view(&reader);
+        let feed = Arc::new(BookFeed::new(Limits::DEFAULT));
+        let mut follower = Follower::new(
+            reader,
+            Arc::clone(&served),
+            Arc::clone(&feed),
+            fixture.dir.join("market-data.json"),
+            Duration::from_secs(3600),
+        );
+        while follower.step().unwrap() {}
+        let (_, mut receiver) = feed.join("AAPL").unwrap();
+
+        let (respond_to, placed) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::place_order(order("sell", "seller", "SELL", 101, 5), respond_to),
+        );
+        arrived.recv().unwrap(); // its sync is held
+        assert!(!follower.step().unwrap(), "published before its sync");
+        assert!(receiver.try_recv().is_err(), "a delta before its sync");
+
+        gate.send(true).unwrap();
+        placed.blocking_recv().unwrap().unwrap();
+        assert!(follower.step().unwrap());
+        let delta = parsed(&receiver.try_recv().unwrap());
+        assert_eq!(delta["asks"][0]["price"], 101);
+        assert_eq!(delta["asks"][0]["quantity"], 5);
+        drop(gate);
+        drop(tx);
+        worker.join().unwrap();
+    }
+
+    /// The close empties every book through ordinary deltas; a client subscribing afterwards gets
+    /// an empty snapshot whose `last` is the close, and the next day's first delta follows it.
+    #[test]
+    fn the_close_empties_books_on_the_feed_and_a_later_subscriber_follows_the_next_day() {
+        let fixture = Fixture::new();
+        let (tx, rx) = mpsc::channel(16);
+        let runtime = recover_runtime_with_stream(rx, &fixture.log, &fixture.bus).unwrap();
+        let worker = thread::spawn(move || runtime.run());
+        open_market(&tx);
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::DepositShares {
+                user_id: "seller".into(),
+                symbol: "AAPL".into(),
+                quantity: 10,
+                respond_to,
+            },
+        );
+        reply.blocking_recv().unwrap().unwrap();
+        for (id, price) in [("sell-1", 101), ("sell-2", 102)] {
+            let (respond_to, reply) = oneshot::channel();
+            send(
+                &tx,
+                ExchangeCommand::place_order(order(id, "seller", "SELL", price, 5), respond_to),
+            );
+            reply.blocking_recv().unwrap().unwrap();
+        }
+        let (respond_to, reply) = oneshot::channel();
+        send(&tx, ExchangeCommand::CloseMarket { respond_to });
+        reply.blocking_recv().unwrap().unwrap();
+
+        let mut reader = StreamReader::open(&fixture.log, &fixture.bus, None).unwrap();
+        let mut projection = MarketDataProjection::default();
+        let feed = BookFeed::new(Limits::DEFAULT);
+        let (mut early, mut receiver) = joined(&feed, &projection, "AAPL", 0);
+        let mut close_seq = 0;
+        while let Some(batch) = reader.next_batch().unwrap() {
+            projection.apply_batch(&batch).unwrap();
+            close_seq = batch.last().unwrap().seq_num;
+            feed.publish(close_seq, projection.take_changes());
+        }
+        while let Ok(text) = receiver.try_recv() {
+            early.apply(&parsed(&text)).unwrap();
+        }
+        assert_eq!(early.levels(), (vec![], vec![]));
+
+        let (mut late, mut late_receiver) = joined(&feed, &projection, "AAPL", close_seq);
+        assert_eq!((late.last, late.levels()), (close_seq, (vec![], vec![])));
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::OpenMarket {
+                trading_day: chrono::NaiveDate::from_ymd_opt(2026, 10, 2).unwrap(),
+                respond_to,
+            },
+        );
+        reply.blocking_recv().unwrap().unwrap();
+        let (respond_to, reply) = oneshot::channel();
+        send(
+            &tx,
+            ExchangeCommand::place_order(order("sell-1", "seller", "SELL", 105, 4), respond_to),
+        );
+        reply.blocking_recv().unwrap().unwrap();
+        drop(tx);
+        worker.join().unwrap();
+        while let Some(batch) = reader.next_batch().unwrap() {
+            projection.apply_batch(&batch).unwrap();
+            feed.publish(batch.last().unwrap().seq_num, projection.take_changes());
+        }
+        late.apply(&parsed(&late_receiver.try_recv().unwrap()))
+            .unwrap();
+        assert_eq!(
+            late.levels().1,
+            vec![L2Level {
+                price: 105,
+                quantity: 4
+            }]
+        );
+    }
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn feed_server(served: Served, feed: Arc<BookFeed>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(served, feed)).await.unwrap() });
+        format!("ws://{address}/marketdata/ws")
+    }
+
+    /// A client with a small receive buffer (64 KiB), so the slow-consumer tests fill the
+    /// connection's buffers with the same volume whatever the host's TCP tuning. The server's
+    /// send buffer is still the host's; Linux's default maximum is 4 MiB.
+    async fn connect(url: &str) -> Client {
+        let address = url
+            .trim_start_matches("ws://")
+            .split('/')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(64 * 1024).unwrap();
+        let stream = socket.connect(address).await.unwrap();
+        tokio_tungstenite::client_async(url, tokio_tungstenite::MaybeTlsStream::Plain(stream))
+            .await
+            .unwrap()
+            .0
+    }
+
+    async fn request(client: &mut Client, text: &str) {
+        use futures_util::SinkExt;
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
+            .await
+            .unwrap();
+    }
+
+    fn subscription(kind: &str, symbol: &str) -> String {
+        format!(r#"{{"type":"{kind}","channel":"book","symbol":"{symbol}"}}"#)
+    }
+
+    /// The next text message, skipping pings.
+    async fn next_json(client: &mut Client) -> serde_json::Value {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(10), client.next())
+                .await
+                .expect("no message within 10 s")
+                .expect("connection ended")
+                .unwrap();
+            match message {
+                Message::Text(text) => return serde_json::from_str(text.as_str()).unwrap(),
+                Message::Ping(_) | Message::Pong(_) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// Reads until the connection ends: the close code, if a close frame came.
+    /// One deadline for the whole wait, so steady pings cannot keep it waiting forever.
+    async fn close_code(client: &mut Client) -> Option<u16> {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            match tokio::time::timeout_at(deadline, client.next())
+                .await
+                .expect("the connection was not closed within 20 s")
+            {
+                Some(Ok(Message::Close(frame))) => return frame.map(|frame| frame.code.into()),
+                Some(Ok(_)) => {}
+                None | Some(Err(_)) => return None,
+            }
+        }
+    }
+
+    fn feed_on_journal(fixture: &Fixture, limits: Limits) -> (Served, Arc<BookFeed>, Follower) {
+        let reader = fixture.reader();
+        let served = empty_view(&reader);
+        let feed = Arc::new(BookFeed::new(limits));
+        let follower = Follower::new(
+            reader,
+            Arc::clone(&served),
+            Arc::clone(&feed),
+            fixture.dir.join("market-data.json"),
+            Duration::from_secs(3600),
+        );
+        (served, feed, follower)
+    }
+
+    /// The WebSocket end to end: a snapshot with its sequences, a live delta chained to it, an
+    /// empty book, unsubscribing, and every refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_socket_serves_snapshots_deltas_and_refusals() {
+        let fixture = Fixture::new();
+        let (mut store, mut writer) = fixture.start(4096);
+        let mut next = 1;
+        publish(
+            &mut store,
+            &mut writer,
+            &numbered(
+                accepted(order("sell-1", "seller", "SELL", 101, 1), vec![]),
+                &mut next,
+            ),
+        );
+        let (served, feed, mut follower) = feed_on_journal(&fixture, Limits::DEFAULT);
+        assert!(follower.step().unwrap());
+        let url = feed_server(served, feed).await;
+        let mut client = connect(&url).await;
+
+        request(&mut client, &subscription("subscribe", "AAPL")).await;
+        let snapshot = next_json(&mut client).await;
+        assert_eq!(
+            (&snapshot["type"], &snapshot["seq"], &snapshot["last"]),
+            (&"snapshot".into(), &2.into(), &2.into())
+        );
+        assert_eq!(snapshot["asks"][0]["price"], 101);
+
+        publish(
+            &mut store,
+            &mut writer,
+            &numbered(
+                accepted(order("sell-2", "seller", "SELL", 102, 3), vec![]),
+                &mut next,
+            ),
+        );
+        assert!(follower.step().unwrap());
+        let delta = next_json(&mut client).await;
+        assert_eq!(
+            (&delta["type"], &delta["seq"], &delta["prev"]),
+            (&"delta".into(), &4.into(), &2.into())
+        );
+        assert_eq!(
+            (&delta["asks"][0]["price"], &delta["asks"][0]["quantity"]),
+            (&102.into(), &3.into())
+        );
+
+        request(&mut client, &subscription("subscribe", "MSFT")).await;
+        let empty = next_json(&mut client).await;
+        assert_eq!(
+            (&empty["last"], &empty["bids"], &empty["asks"]),
+            (&0.into(), &serde_json::json!([]), &serde_json::json!([]))
+        );
+
+        for (text, error) in [
+            (subscription("subscribe", "AAPL"), "already subscribed"),
+            (subscription("subscribe", " AAPL"), "invalid symbol"),
+            (
+                r#"{"type":"subscribe","channel":"trades","symbol":"AAPL"}"#.to_string(),
+                "unknown channel",
+            ),
+            ("not json".to_string(), "expected"),
+            (subscription("unsubscribe", "IBM"), "not subscribed"),
+        ] {
+            request(&mut client, &text).await;
+            let reply = next_json(&mut client).await;
+            assert_eq!(reply["type"], "error", "{text}");
+            assert!(
+                reply["message"].as_str().unwrap().contains(error),
+                "{text}: {reply}"
+            );
+        }
+        {
+            use futures_util::SinkExt;
+            client
+                .send(tokio_tungstenite::tungstenite::Message::Binary(
+                    vec![1, 2].into(),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(next_json(&mut client).await["type"], "error");
+
+        request(&mut client, &subscription("unsubscribe", "AAPL")).await;
+        assert_eq!(next_json(&mut client).await["type"], "unsubscribed");
+        // No user id ever appears in a public message.
+        assert!(!snapshot.to_string().contains("seller") && !delta.to_string().contains("seller"));
+    }
+
+    fn wide_change(levels: u64) -> BookChange {
+        BookChange {
+            symbol: "AAPL".into(),
+            bids: (1..=levels)
+                .map(|price| L2Level {
+                    price,
+                    quantity: price,
+                })
+                .collect(),
+            asks: vec![],
+        }
+    }
+
+    /// A client that stops reading entirely is disconnected: its socket fills, and the write that
+    /// waits for it misses its deadline. The queue and ring are large here, so only the deadline
+    /// can end the connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_stops_reading_is_disconnected_at_the_write_deadline() {
+        let fixture = Fixture::new();
+        let (_store, _writer) = fixture.start(4096);
+        let limits = Limits {
+            ring: 4_096,
+            queue: 1_024,
+            write_deadline: Duration::from_millis(300),
+            ping: Duration::from_secs(60),
+        };
+        let (served, feed, _follower) = feed_on_journal(&fixture, limits);
+        let url = feed_server(served, Arc::clone(&feed)).await;
+        let mut client = connect(&url).await;
+        request(&mut client, &subscription("subscribe", "AAPL")).await;
+        next_json(&mut client).await;
+
+        // About 300 deltas of 2,500 levels, roughly 25 MB: more than loopback buffers hold.
+        for seq in 1..=300 {
+            feed.publish(seq, vec![wide_change(2_500)]);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // The connection ends, with or without a close frame: the server gave up on it.
+        close_code(&mut client).await;
+    }
+
+    /// A client whose queue fills while its socket is blocked is closed as a slow consumer
+    /// (1013) once the socket drains.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_whose_queue_overflows_is_closed_as_a_slow_consumer() {
+        let fixture = Fixture::new();
+        let (_store, _writer) = fixture.start(4096);
+        let limits = Limits {
+            ring: 4_096,
+            queue: 1,
+            write_deadline: Duration::from_secs(60),
+            ping: Duration::from_secs(60),
+        };
+        let (served, feed, _follower) = feed_on_journal(&fixture, limits);
+        let url = feed_server(served, Arc::clone(&feed)).await;
+        let mut client = connect(&url).await;
+        request(&mut client, &subscription("subscribe", "AAPL")).await;
+        next_json(&mut client).await;
+        for seq in 1..=300 {
+            feed.publish(seq, vec![wide_change(2_500)]);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(close_code(&mut client).await, Some(1013));
+    }
+
+    /// Unsubscribing while deltas flow, then subscribing again: the client ignores the symbol's
+    /// deltas between the two, starts again from the new snapshot, and follows with no gap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resubscribing_starts_from_a_fresh_snapshot_with_no_gap() {
+        let fixture = Fixture::new();
+        let (mut store, mut writer) = fixture.start(4096);
+        let (served, feed, mut follower) = feed_on_journal(&fixture, Limits::DEFAULT);
+        let url = feed_server(Arc::clone(&served), feed).await;
+        let mut client = connect(&url).await;
+        let mut next = 1;
+        let mut place = |id: &str, price: u64, follower: &mut Follower| {
+            publish(
+                &mut store,
+                &mut writer,
+                &numbered(
+                    accepted(order(id, "seller", "SELL", price, 1), vec![]),
+                    &mut next,
+                ),
+            );
+            assert!(follower.step().unwrap());
+        };
+
+        request(&mut client, &subscription("subscribe", "AAPL")).await;
+        let mut book = ClientBook::from_snapshot(&next_json(&mut client).await);
+        place("a", 100, &mut follower);
+        place("b", 101, &mut follower);
+        request(&mut client, &subscription("unsubscribe", "AAPL")).await;
+        // Up to the reply, deltas are applied.
+        loop {
+            let message = next_json(&mut client).await;
+            match message["type"].as_str().unwrap() {
+                "delta" => book.apply(&message).unwrap(),
+                "unsubscribed" => break,
+                other => panic!("unexpected {other}: {message}"),
+            }
+        }
+        place("c", 102, &mut follower);
+        request(&mut client, &subscription("subscribe", "AAPL")).await;
+        // Deltas queued before the unsubscription may still arrive after its reply. Each must be
+        // already in the new snapshot, which the drop rule then discards.
+        let mut stale = Vec::new();
+        let second = loop {
+            let message = next_json(&mut client).await;
+            match message["type"].as_str().unwrap() {
+                "delta" => stale.push(message["seq"].as_u64().unwrap()),
+                "snapshot" => break message,
+                other => panic!("unexpected {other}: {message}"),
+            }
+        };
+        let snapshot_seq = second["seq"].as_u64().unwrap();
+        assert!(
+            stale.iter().all(|seq| *seq <= snapshot_seq),
+            "{stale:?} after {snapshot_seq}"
+        );
+        book = ClientBook::from_snapshot(&second);
+        assert!(book.asks.contains_key(&102), "the new snapshot misses c");
+        place("d", 103, &mut follower);
+        place("e", 104, &mut follower);
+        while !book.asks.contains_key(&104) {
+            book.apply(&next_json(&mut client).await).unwrap();
+        }
+        let served = served.read().unwrap();
+        assert_eq!(
+            book.levels(),
+            served.as_ref().unwrap().orders.levels("AAPL")
+        );
+    }
+
+    /// A client that answers nothing, not even pings, is closed as gone (1001) at the first ping
+    /// after three silent intervals (here about 0.8 s), although every write to it succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_never_answers_pings_is_closed_as_gone() {
+        let fixture = Fixture::new();
+        let (_store, _writer) = fixture.start(4096);
+        let limits = Limits {
+            ping: Duration::from_millis(200),
+            ..Limits::DEFAULT
+        };
+        let (served, feed, _follower) = feed_on_journal(&fixture, limits);
+        let url = feed_server(served, feed).await;
+        let mut client = connect(&url).await;
+        request(&mut client, &subscription("subscribe", "AAPL")).await;
+        next_json(&mut client).await;
+        // Not reading, the client sends no pongs.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(close_code(&mut client).await, Some(1001));
+    }
+
+    /// A halted follower closes every connection (1011), and a connection made afterwards is
+    /// closed at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_halted_follower_closes_every_connection() {
+        let fixture = Fixture::new();
+        let (_store, _writer) = fixture.start(4096);
+        // Pings rarer than `close_code`'s 20 s wait, so a connection the halt failed to close
+        // fails the test instead of being kept alive by pings.
+        let limits = Limits {
+            ping: Duration::from_secs(60),
+            ..Limits::DEFAULT
+        };
+        let (served, feed, follower) = feed_on_journal(&fixture, limits);
+        let url = feed_server(Arc::clone(&served), Arc::clone(&feed)).await;
+        let mut subscribed = connect(&url).await;
+        request(&mut subscribed, &subscription("subscribe", "AAPL")).await;
+        next_json(&mut subscribed).await;
+        let mut idle = connect(&url).await;
+
+        // What the follower thread's guard does when it ends.
+        drop(WithdrawOnExit(Arc::clone(&served), Arc::clone(&feed)));
+        drop(follower);
+        assert_eq!(close_code(&mut subscribed).await, Some(1011));
+        assert_eq!(close_code(&mut idle).await, Some(1011));
+        let mut late = connect(&url).await;
+        assert_eq!(close_code(&mut late).await, Some(1011));
     }
 }

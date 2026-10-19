@@ -328,6 +328,7 @@ The separate MDP listener has its own public routes and no database dependency:
 | GET | `/marketdata/orderbook/{symbol}?depth=N` | public L2; depth defaults to 10 and is clamped to 1-50; unknown symbol is 404 |
 | GET | `/marketdata/candles?symbol=&start_time=&end_time=` | public ascending one-minute OHLCV candles for an inclusive epoch-second range; all parameters are required, invalid bounds are 400, and no matching trades return an empty array |
 | GET | `/health` | 200 after catch-up while following is healthy; otherwise 503 |
+| GET | `/marketdata/ws` | WebSocket book feed (milestone 26 part 1): `{"type":"subscribe","channel":"book","symbol":...}` gives a full-depth `snapshot` (`seq`, `last`), then a `delta` per committed batch that changes the book (`seq`, `prev`, levels with their new quantity, 0 removed); `unsubscribe`; errors answered with `{"type":"error"}`. Closes with 1013 for a slow consumer (queue full, ring overrun or a socket write past its 5 s deadline), 1011 when the follower halts, 1001 for a client silent for more than three 15 s ping intervals |
 
 The previous `/exchange/orderbook/{symbol}` route and `ExchangeCommand::GetOrderBook` path have been removed. Internal core L2 methods remain for correctness tests.
 

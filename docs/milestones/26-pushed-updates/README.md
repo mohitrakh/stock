@@ -28,7 +28,7 @@ written to be studied cold.
 | Part | What | Status |
 |---|---|---|
 | — | The plan and decisions 1–6 | accepted by the owner as recommended (2026-10-19) |
-| 1 | The public L2 feed, in the MDP | in progress, started 2026-10-19 |
+| 1 | The public L2 feed, in the MDP | complete, 2026-10-19 |
 | 2 | The private feed, in its own process | not started |
 | 3 | Measurement | not started |
 | 4 | Final review and close | not started |
@@ -41,6 +41,8 @@ written to be studied cold.
 | `01-theory.md` | Eight sections of theory, with worked examples. |
 | `decisions.md` | The owner's decisions, and the design choices made inside them. |
 | `glossary.md` | Definitions. |
+| `part-1-public-book-feed.md` | The WebSocket book feed: the protocol, every code change, the tests (an oracle at every sequence, durability, slow consumers, halt, silence, resubscription, the shipped executable), the mutation check, two review rounds. |
+| `performance/scripts/m26p1-mutate.sh`, `performance/results/m26p1-mutate*.txt` | Part 1's mutation check and its runs. |
 
 ## Conventions
 

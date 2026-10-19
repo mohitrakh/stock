@@ -177,7 +177,7 @@ pub struct RiskLimitView {
 }
 
 /// One aggregated price point of an L2 book: a price and the total size resting on it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct L2Level {
     pub price: u64,
     pub quantity: u64,

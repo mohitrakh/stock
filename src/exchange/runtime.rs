@@ -1153,6 +1153,22 @@ impl ExchangeRuntime {
             .map_err(|error| error.to_string())
     }
 
+    /// Holds this runtime's journal syncs at a test gate, for tests in other modules too. Returns
+    /// the gate (send `true` to let one sync run, `false` to fail it; drop it to let every sync
+    /// run) and where the journaler reports the end each held sync covers.
+    #[cfg(test)]
+    pub(crate) fn hold_syncs_for_test(
+        &mut self,
+    ) -> (
+        std::sync::mpsc::Sender<bool>,
+        std::sync::mpsc::Receiver<u64>,
+    ) {
+        let (gate, held) = std::sync::mpsc::channel();
+        let (arrive, arrived) = std::sync::mpsc::channel();
+        self.sync_gate = Some((arrive, held));
+        (gate, arrived)
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_stream_publication_for_test(&mut self) {
         self.stream
@@ -3488,10 +3504,7 @@ mod tests {
         std::sync::mpsc::Sender<bool>,
         std::sync::mpsc::Receiver<u64>,
     ) {
-        let (gate, held) = std::sync::mpsc::channel();
-        let (arrive, arrived) = std::sync::mpsc::channel();
-        runtime.sync_gate = Some((arrive, held));
-        (gate, arrived)
+        runtime.hold_syncs_for_test()
     }
 
     /// Milestone 25 part 2. While the journaler's sync of one group is held, the worker takes and

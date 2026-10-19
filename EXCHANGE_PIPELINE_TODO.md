@@ -474,7 +474,7 @@ Milestone 26, planned on 2026-10-19. The owner reviews the plan in `PROJECT_DIRE
 
 - [x] The owner reviews the plan and confirms decisions 1-6 (2026-10-19, all as recommended).
 - [x] Create `docs/milestones/26-pushed-updates/` (README, selection, theory, decisions, glossary).
-- [ ] Part 1: the public L2 feed in the MDP (`GET /marketdata/ws`): snapshot + deltas with sequences, gap detection, slow-consumer policy; an oracle test against the projection and the core's `l2_snapshot` at every sequence; write deadline for clients that stop reading.
+- [x] Part 1 (2026-10-19): the public L2 feed in the MDP (`GET /marketdata/ws`): snapshot + deltas with sequences, gap detection, slow-consumer policy; an oracle test against the projection and the core's `l2_snapshot` at every sequence; write deadline for clients that stop reading.
 - [ ] Part 2: the private feed (`--user-feed`, default `127.0.0.1:4006`): owner map with its own state file, first-message JWT with a deadline and expiry, fills and order status to their owner only, rejections to the submitter, refused cancellations to the requester; an isolation test with several users and colliding order ids.
 - [ ] Part 3: measurement (`--feed-bench`): push latency against the number of clients, the feeds' CPU, whether the MDP keeps up at the maximum rate, and the exchange with feeds against without, interleaved, six runs each with the order balanced (mean within 10% or explained).
 - [ ] Part 4: final review and close.

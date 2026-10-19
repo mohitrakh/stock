@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod book_feed;
 pub mod candles;
 pub mod committed_batch;
 pub mod core;

@@ -1,0 +1,13 @@
+### m26p1-mutate: 2026-10-19T17:26:58+05:30, tree /home/ubuntu/stock-m26
+## control: the real tree, each test alone (own target volume, fresh build)
+  feed_snapshots_and_deltas_rebuild_every_book_at_every_sequence: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 229 filtered out; finished in 0.20s
+  a_client_that_stops_reading: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 229 filtered out; finished in 2.48s
+  a_client_whose_queue_overflows: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 229 filtered out; finished in 1.19s
+  a_halted_follower_closes_every_connection: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 229 filtered out; finished in 0.01s
+  a delta's prev is not chained (last never moves) -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 229 filtered out; finished in 0.00s (feed_snapshots_and_deltas_rebuild_every_book_at_every_sequence)
+  a snapshot's last is always 0 -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 229 filtered out; finished in 0.06s (feed_snapshots_and_deltas_rebuild_every_book_at_every_sequence)
+  an emptied level is never reported (removals not recorded) -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 229 filtered out; finished in 0.00s (feed_snapshots_and_deltas_rebuild_every_book_at_every_sequence)
+  no write deadline -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 229 filtered out; finished in 23.42s (a_client_that_stops_reading)
+  a full queue is not reported -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 229 filtered out; finished in 21.20s (a_client_whose_queue_overflows)
+  a halt does not reach idle connections ->  (a_halted_follower_closes_every_connection)
+### done
