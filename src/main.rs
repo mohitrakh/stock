@@ -89,6 +89,13 @@ async fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--feed-bench") {
+        if let Err(error) = exchange::feed_bench::run(&args[1..]).await {
+            eprintln!("feed-bench: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--sync-probe") {
         if let Err(error) = exchange::probes::sync_probe(&args[1..]) {
             eprintln!("sync-probe: {error}");
@@ -162,7 +169,7 @@ async fn main() {
     }
     if !args.is_empty() {
         eprintln!(
-            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --user-feed JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --replica PRIMARY_ADDR JOURNAL STREAM | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR] | --bench EMPTY_DIR [OPTIONS] | --http-bench [OPTIONS] | --sync-probe EMPTY_DIR [OPTIONS] | --bcrypt-probe [OPTIONS]]"
+            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --user-feed JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --replica PRIMARY_ADDR JOURNAL STREAM | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR] | --bench EMPTY_DIR [OPTIONS] | --http-bench [OPTIONS] | --feed-bench [OPTIONS] | --sync-probe EMPTY_DIR [OPTIONS] | --bcrypt-probe [OPTIONS]]"
         );
         std::process::exit(1);
     }

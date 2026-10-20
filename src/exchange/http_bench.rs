@@ -51,7 +51,7 @@ use crate::{
     models::user::Claims,
 };
 
-const USAGE: &str = "usage: stock --http-bench [--orders N] [--rate ORDERS_PER_SEC|0] [--users N] [--symbols N] [--logins N] [--deadline SECONDS] [--target orders|health] [--base URL] [--operator URL] [--day YYYY-MM-DD]";
+const USAGE: &str = "usage: stock --http-bench [--orders N] [--rate ORDERS_PER_SEC|0] [--users N] [--symbols N] [--logins N] [--deadline SECONDS] [--target orders|health] [--base URL] [--operator URL] [--day YYYY-MM-DD] [--start-at UNIX_MS]";
 
 /// Setup requests in flight at once: enough to fill the exchange's groups, few enough that setup
 /// does not open thousands of connections.
@@ -74,6 +74,10 @@ struct Config {
     /// Seconds after the first order's intended time at which unanswered orders are abandoned
     /// and counted; 0 waits for every answer.
     deadline: u64,
+    /// `--start-at`: the wall-clock time (Unix milliseconds) at which the first order is due, after
+    /// setup. A feed client given the same time and rate knows every order's intended send time,
+    /// `start_at + i / rate`, from its id alone (milestone 26 part 3, `--feed-bench`).
+    start_at: Option<u64>,
 }
 
 fn parse(args: &[String]) -> Result<Config, String> {
@@ -88,6 +92,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
         day: "2026-01-02".to_string(),
         health: false,
         deadline: 0,
+        start_at: None,
     };
     let mut args = args.iter();
     while let Some(flag) = args.next() {
@@ -109,6 +114,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
             "--symbols" => config.symbols = number()?.max(1),
             "--logins" => config.logins = number()?,
             "--deadline" => config.deadline = number()?,
+            "--start-at" => config.start_at = Some(number()?),
             "--target" => {
                 config.health = match value.as_str() {
                     "orders" => false,
@@ -216,7 +222,7 @@ fn bearer(secret: &[u8], user: &str, expires: usize) -> Result<String, String> {
 /// This process's CPU time so far (user + system), in microseconds. `/proc/self/stat` counts in
 /// clock ticks of `USER_HZ`, which Linux fixes at 100 per second for this file: a resolution of
 /// 10 ms, ample over runs of many seconds.
-fn cpu_micros() -> u64 {
+pub(super) fn cpu_micros() -> u64 {
     cpu_micros_from(&std::fs::read_to_string("/proc/self/stat").unwrap_or_default())
 }
 
@@ -236,7 +242,12 @@ fn cpu_micros_from(stat: &str) -> u64 {
     (ticks(11) + ticks(12)) * 10_000
 }
 
-fn percentiles(histogram: &Histogram<u64>) -> String {
+pub(super) fn unix_micros(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros())
+}
+
+pub(super) fn percentiles(histogram: &Histogram<u64>) -> String {
     format!(
         "p50 {}  p90 {}  p99 {}  p99.9 {}  max {}  mean {:.1}",
         histogram.value_at_quantile(0.50),
@@ -413,8 +424,24 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         None,
     )
     .await;
+    // The schedule's origin, on the monotonic clock and on the wall clock. With `--start-at` it is
+    // that wall-clock time itself, not the moment the sleep happens to end: a timer wakes late (by
+    // up to its 1 ms tick, more on a busy host), and a late origin would shift every order after
+    // the time `--feed-bench` assumes. Any lateness instead shows as send lag, charged to latency.
+    let (start, start_wall) = match config.start_at {
+        Some(start_at) => {
+            let due = UNIX_EPOCH + Duration::from_millis(start_at);
+            let wait = due
+                .duration_since(SystemTime::now())
+                .map_err(|_| format!("--start-at {start_at} passed before setup finished"))?;
+            let start = Instant::now() + wait;
+            tokio::time::sleep_until(start.into()).await;
+            (start, due)
+        }
+        None => (Instant::now(), SystemTime::now()),
+    };
     let cpu_before = cpu_micros();
-    let start = Instant::now();
+    println!("  start      : unix us {}", unix_micros(start_wall));
     for i in 0..config.orders {
         let intended = if config.rate == 0 {
             Instant::now()
@@ -536,6 +563,10 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         }
     );
     println!("  send lag us: {}", percentiles(&send_lag));
+    println!(
+        "  last reply : unix us {}",
+        unix_micros(start_wall + last_reply.duration_since(start))
+    );
     let statuses: Vec<String> = statuses
         .iter()
         .map(|(status, count)| format!("{status} x {count}"))

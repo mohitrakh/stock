@@ -31,7 +31,7 @@ use crate::{
     types::types::{ExchangeCommand, Order, SessionView},
 };
 
-const USAGE: &str = "usage: stock --bench EMPTY_DIR [--orders N_PER_DAY] [--days N] [--rate ORDERS_PER_SEC|0] [--symbols N] [--users N] [--depth RESTING_ORDERS_PER_SYMBOL]";
+const USAGE: &str = "usage: stock --bench EMPTY_DIR [--orders N_PER_DAY] [--days N] [--rate ORDERS_PER_SEC|0] [--symbols N] [--users N] [--depth RESTING_ORDERS_PER_SYMBOL] [--start-at UNIX_MS]";
 
 /// Every measured order is priced inside this band, so roughly half of them cross.
 pub(crate) const BAND_LOW: u64 = 1_000;
@@ -55,6 +55,10 @@ struct Config {
     symbols: u64,
     users: u64,
     depth: u64,
+    /// `--start-at`: the wall-clock time (Unix milliseconds) at which the first day's first order
+    /// is due, after setup, so feed processes and their clients can be ready before it
+    /// (milestone 26 part 3). The run then prints its start and last reply on the wall clock.
+    start_at: Option<u64>,
 }
 
 fn parse(args: &[String]) -> Result<Config, String> {
@@ -68,6 +72,7 @@ fn parse(args: &[String]) -> Result<Config, String> {
         symbols: 100,
         users: 100,
         depth: 0,
+        start_at: None,
     };
     while let Some(flag) = args.next() {
         let value: u64 = args
@@ -81,8 +86,14 @@ fn parse(args: &[String]) -> Result<Config, String> {
             "--symbols" => config.symbols = value.max(1),
             "--users" => config.users = value.max(2),
             "--depth" => config.depth = value,
+            "--start-at" => config.start_at = Some(value),
             _ => return Err(USAGE.to_string()),
         }
+    }
+    // Each day reuses the order ids `o{i}`, so a feed client given one start time could not tell
+    // which day's order a message belongs to.
+    if config.start_at.is_some() && config.days > 1 {
+        return Err(format!("--start-at needs --days 1\n{USAGE}"));
     }
     Ok(config)
 }
@@ -312,7 +323,24 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         let syncs_before = JOURNAL_SYNCS.load(Ordering::Relaxed);
         let journal_before = journal_len()?;
         let mut pending = Vec::with_capacity(config.orders as usize);
-        let start = Instant::now();
+        // With `--start-at`, the first day starts at that wall-clock time itself, as
+        // `--http-bench` does it: a late wake-up shows as latency, not as a shifted schedule.
+        let (start, start_wall) = match config.start_at.filter(|_| day == 0) {
+            Some(start_at) => {
+                let due = UNIX_EPOCH + Duration::from_millis(start_at);
+                let wait = due
+                    .duration_since(SystemTime::now())
+                    .map_err(|_| format!("--start-at {start_at} passed before setup finished"))?;
+                let start = Instant::now() + wait;
+                tokio::time::sleep_until(start.into()).await;
+                println!(
+                    "  start      : unix us {}",
+                    crate::exchange::http_bench::unix_micros(due)
+                );
+                (start, due)
+            }
+            None => (Instant::now(), SystemTime::now()),
+        };
         for i in 0..config.orders {
             let intended = if config.rate == 0 {
                 Instant::now()
@@ -348,6 +376,14 @@ pub async fn run(args: &[String]) -> Result<(), String> {
         }
         let day_seconds = last_reply.duration_since(start).as_secs_f64();
         elapsed += day_seconds;
+        if config.start_at.is_some() && day == 0 {
+            println!(
+                "  last reply : unix us {}",
+                crate::exchange::http_bench::unix_micros(
+                    start_wall + last_reply.duration_since(start)
+                )
+            );
+        }
         syncs += JOURNAL_SYNCS.load(Ordering::Relaxed) - syncs_before;
         journal_bytes += journal_len()? - journal_before;
 

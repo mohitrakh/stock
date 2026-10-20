@@ -1,0 +1,41 @@
+### D: alone, rate 5000, 100 clients of each feed, 10 stalled, run 1
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-20T11:59:29+05:30: loadavg 3.76 2.98 3.29, containers running 32
+http-bench: 100000 orders, rate 5000/s, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  start      : unix us 1792477789280000
+  throughput : 4998 orders/s over 20.007 s (100000 answered)
+  unanswered : 0 (no answer within the 120 s deadline)
+  latency us : p50 7987  p90 14783  p99 44223  p99.9 106879  max 145535  mean 9761.4
+  send lag us: p50 1065  p90 2053  p99 5155  p99.9 10647  max 17951  mean 1246.5
+  last reply : unix us 1792477809286905
+  statuses   : 201 x 100000
+  errors     : 0
+  client cpu : 68.5 us per order, 34% of one hardware thread (user + system, includes the login loops)
+feed-bench: 100 book clients (one symbol each, of 100), 100 user clients (one user each, of 100), 10 stalled (every symbol, from the start), rate 5000/s, 100000 orders from unix ms 1792477789280
+  book       : 100000 messages, 100000 with a sequence (0 not from an order), covering 100000 of 100000 orders; latency us p50 15087  p90 28847  p99 95999  p99.9 135423  max 147839  mean 18573.0; first fifth p50 17407 p99 52991, last fifth p50 17583 p99 129663
+  user       : 312865 messages, 312865 with a sequence (0 not from an order), covering 100000 of 100000 orders; latency us p50 15391  p90 28991  p99 90111  p99.9 131199  max 164991  mean 18922.3; first fifth p50 16735 p99 71231, last fifth p50 18207 p99 122623
+  closed     : book 0 of 100, user 0 of 100
+  stalled    : 10 of 10 ended by the server (0 x 10); connected at most 35.0 s
+  last msg   : book unix us 1792477809294932, user unix us 1792477809292804, any 1792477809294932
+  client cpu : 35% of one hardware thread over 20.1 s (start to last message)
+  cpu        : window 19.2 s; exchange 0.58, replica 0.00, mdp 0.36, user feed 0.39, generators 0.69, other containers 0.36 (29), host busy 3.04 of 4 hardware threads
+### B: replicated no, maximum rate, 200000 orders, 100 clients of each feed, run 1
+# exchange: Tokio worker threads: 4, replicated: no
+# host 2026-10-20T12:00:28+05:30: loadavg 4.96 3.56 3.47, containers running 32
+http-bench: 200000 orders, rate max, 100 symbols, 100 users, 0 login loop(s), against http://127.0.0.1:4000
+  start      : unix us 1792477849116000
+  throughput : not measured (47438 answered before the 120 s deadline)
+  unanswered : 152562 (no answer within the 120 s deadline)
+  latency us : p50 59211775  p90 106299391  p99 118292479  p99.9 119799807  max 119930879  mean 57745426.7  (queue-bound at max rate)
+  send lag us: p50 0  p90 0  p99 0  p99.9 0  max 2867  mean 0.0
+  last reply : unix us 1792477969264985
+  statuses   : 201 x 19216
+  errors     : 28222 (first: http://127.0.0.1:4000/exchange/orders: client error (Connect))
+  client cpu : 1444.8 us per order, 241% of one hardware thread (user + system, includes the login loops)
+feed-bench: 100 book clients (one symbol each, of 100), 100 user clients (one user each, of 100), 0 stalled (every symbol, from the start), rate max, 200000 orders from unix ms 1792477849116
+  book       : 27030 messages, 27030 with a sequence (0 not from an order), covering 27030 of 200000 orders; latency us not timed at max rate
+  user       : 82767 messages, 82767 with a sequence (0 not from an order), covering 27030 of 200000 orders; latency us not timed at max rate
+  closed     : book 0 of 100, user 0 of 100
+  last msg   : book unix us 1792477970302844, user unix us 1792477970277244, any 1792477970302844
+  client cpu : 2% of one hardware thread over 121.3 s (start to last message)
+  cpu        : window 120.2 s; exchange 0.09, replica 0.00, mdp 0.03, user feed 0.04, generators 2.42, other containers 0.31 (29), host busy 3.99 of 4 hardware threads

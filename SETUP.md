@@ -91,6 +91,7 @@ using a separate git worktree per commit:
 
 | Binary name | Commit | Build | What it is |
 |---|---|---|---|
+| `stock-m26p3` | milestone 26 part 3 (this commit or later) | normal | every process of milestone 26's measurement: the exchange, the replica, the MDP, the private feed and the three generators |
 | `stock-m25final` | milestone 25 (this commit or later) | normal | the final binary of milestone 25 (Part 4) |
 | `stock-m25p2` | milestone 25 part 2 (this commit or later) | normal | the pipelined sync |
 | `stock-m25p2-timed` | the same | `--features stage-timing` | its stage-timing build |
@@ -162,6 +163,7 @@ count. Redirect each script into a file:
 | `m25p4-final.sh` | `bash ~/stock-scripts/m25p4-final.sh 3 > ~/m25-out/m25p4-final.txt 2>&1` (needs cgroup v2, and `m25p4-cpu.awk` in `~/stock-scripts`) | `stock-m24p2`, `stock-m25final`, generator `stock-m25final` |
 | `m26p1-mutate.sh` | `TREE=~/stock-m25 bash ~/stock-scripts/m26p1-mutate.sh > ~/m26-out/m26p1-mutate.txt 2>&1` | builds from `$TREE` (milestone 26 code) |
 | `m26p2-mutate.sh` | `TREE=~/stock-m25 bash ~/stock-scripts/m26p2-mutate.sh > ~/m26-out/m26p2-mutate.txt 2>&1` | builds from `$TREE` (milestone 26 code) |
+| `m26p3-measure.sh` | `nohup bash ~/stock-scripts/m26p3-measure.sh ABCDE 6 > ~/m26-out/m26p3-measure.txt 2>&1 &` (about 2 h 20 min; follow it with `tail -f`), then `awk -f ~/stock-scripts/m26p3-summarize.awk ~/m26-out/m26p3-measure.txt` | `stock-m26p3`; sources `m26p3-lib.sh` and `m24-lib.sh`; needs cgroup v2 and `m26p3-cpu.awk` in `~/stock-scripts`; do not change the script while it runs |
 
 Then summarize the stage runs the same way the documents did:
 

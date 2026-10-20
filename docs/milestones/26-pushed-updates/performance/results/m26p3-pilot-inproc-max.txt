@@ -1,0 +1,61 @@
+### B: replicated no, maximum rate (in-process), 200000 orders, 100 clients of each feed, run 1
+# exchange: in-process --bench, replicated: no
+# host 2026-10-20T12:06:15+05:30: loadavg 4.26 4.72 4.21, containers running 32
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  start      : unix us 1792478199814000
+  last reply : unix us 1792478210434503
+  day 1 2026-01-02: 18831 orders/s; close 583 ms, 5277 KB journaled; VmHWM: 294272 kB, VmRSS: 256040 kB
+  throughput : 18831 orders/s over 10.621 s
+  latency us : p50 621567  p90 754175  p99 1042431  p99.9 1056767  max 1056767  mean 621961.9  (queue-bound at max rate)
+  syncs      : 196 (1020.4 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 294272 kB, VmRSS: 256040 kB
+bench-exited 0
+feed-bench: 100 book clients (one symbol each, of 100), 100 user clients (one user each, of 100), 0 stalled (every symbol, from the start), rate max, 200000 orders from unix ms 1792478199814
+  book       : 200100 messages, 200100 with a sequence (100 not from an order), covering 200000 of 200000 orders; latency us not timed at max rate
+  user       : 671374 messages, 671374 with a sequence (41720 not from an order), covering 200000 of 200000 orders; latency us not timed at max rate
+  closed     : book 0 of 100, user 0 of 100
+  last msg   : book unix us 1792478212952650, user unix us 1792478214342848, any 1792478214342848
+  client cpu : 47% of one hardware thread over 14.6 s (start to last message)
+  cpu        : window 13.2 s; exchange 0.54, replica 0.00, mdp 0.61, user feed 0.78, generators 0.47, other containers 0.33 (29), host busy 3.95 of 4 hardware threads
+### B: replicated yes, maximum rate (in-process), 200000 orders, 100 clients of each feed, run 1
+# exchange: in-process --bench, replicated: yes
+# host 2026-10-20T12:07:14+05:30: loadavg 4.76 4.77 4.26, containers running 33
+terms: building the index from the journal
+replication: replica attached, resuming at journal byte 0
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  start      : unix us 1792478258266000
+  last reply : unix us 1792478268500841
+  day 1 2026-01-02: 19541 orders/s; close 778 ms, 5277 KB journaled; VmHWM: 296112 kB, VmRSS: 269788 kB
+  throughput : 19541 orders/s over 10.235 s
+  latency us : p50 598015  p90 796671  p99 913919  p99.9 925183  max 925183  mean 593648.1  (queue-bound at max rate)
+  syncs      : 198 (1010.1 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 296112 kB, VmRSS: 269852 kB
+bench-exited 0
+feed-bench: 100 book clients (one symbol each, of 100), 100 user clients (one user each, of 100), 0 stalled (every symbol, from the start), rate max, 200000 orders from unix ms 1792478258266
+  book       : 200100 messages, 200100 with a sequence (100 not from an order), covering 200000 of 200000 orders; latency us not timed at max rate
+  user       : 671374 messages, 671374 with a sequence (41720 not from an order), covering 200000 of 200000 orders; latency us not timed at max rate
+  closed     : book 0 of 100, user 0 of 100
+  last msg   : book unix us 1792478269643678, user unix us 1792478270846991, any 1792478270846991
+  client cpu : 54% of one hardware thread over 12.6 s (start to last message)
+  cpu        : window 12.2 s; exchange 0.63, replica 0.14, mdp 0.67, user feed 0.91, generators 0.54, other containers 0.32 (29), host busy 3.84 of 4 hardware threads
+### C: replicated no, in-process, orders 200000, maximum rate, feeds no, run 1
+# exchange: in-process --bench, replicated: no
+# host 2026-10-20T12:08:09+05:30: loadavg 5.24 4.84 4.31, containers running 30
+terms: building the index from the journal
+bench: 200000 orders a day for 1 day(s), rate max, 100 symbols, 100 users, depth 0 per symbol
+  start      : unix us 1792478314487000
+  last reply : unix us 1792478317848911
+  day 1 2026-01-02: 59490 orders/s; close 262 ms, 5277 KB journaled; VmHWM: 283992 kB, VmRSS: 257852 kB
+  throughput : 59490 orders/s over 3.362 s
+  latency us : p50 199167  p90 219903  p99 240895  p99.9 247679  max 247935  mean 196130.7  (queue-bound at max rate)
+  syncs      : 198 (1010.1 orders per sync)
+  journal    : 753 bytes per order
+  rejected   : 0
+  memory     : VmHWM: 283992 kB, VmRSS: 257852 kB
+bench-exited 0
+  cpu        : window 2.0 s; exchange 1.23, replica 0.00, mdp 0.00, user feed 0.00, generators 0.00, other containers 0.09 (29), host busy 1.81 of 4 hardware threads

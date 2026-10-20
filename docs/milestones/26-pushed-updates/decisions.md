@@ -39,3 +39,28 @@ behind each is in `01-theory.md`.
    buffer.
 6. **Book depth.** Full-depth snapshot and deltas (recommended). The alternative is top-N snapshots
    on change.
+
+## 2026-10-20 — Part 3's completion criterion: the explanation accepted
+
+**Chosen:** close Part 3 on the explanation. The owner answered "yes close part 3 i think the CPU
+contention is issue".
+
+**The question.** The criterion is "the mean must differ by less than 10%, or the difference must
+be explained". With the feeds and 100 clients of each on the same two-core machine, the HTTP mean
+at 5,000 orders/s alone rose 65.5% and the maximum rate fell 61% (alone) and 52% (replicated)
+(`performance/01-feeds-measured.md`, section C). Pinning the feeds to the other physical core
+recovered about 44% of the maximum-rate loss (section E); the rest is explained only by hypothesis
+(unpinned other containers on the exchange's core, shared cache and memory, the stream file's
+lock).
+
+**Options shown:**
+1. accept the explanation, CPU contention on the shared two-core machine, and close the part
+   (chosen);
+2. first test the remaining hypothesis: the feeds running with no clients, and the stream lock;
+3. optimize first, then measure again: a shorter idle poll or a wake-up from the stream for the
+   push latency (an inference: about 5 ms of the 5.3–7.4 ms gap), and batched writes for the
+   private feed's fan-out.
+
+**What stays open, recorded for later:** options 2 and 3 are not done. On this machine the feeds
+cost the exchange CPU; a deployment that runs them on another machine would not share it (an
+inference, not measured here).
