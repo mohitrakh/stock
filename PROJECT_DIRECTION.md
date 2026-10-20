@@ -1417,7 +1417,7 @@ Know, stage by stage, where an order's time goes, then shorten the stages that d
 
 ## 26. Pushed Updates
 
-**Status: planned on 2026-10-19; the owner accepted the plan and decisions 1–6 as recommended the same day ("accept all decisions, push and start part 1"). Part 1 in progress.** Progress will be recorded at the end of this section. Documents go in `docs/milestones/26-pushed-updates/`, with the same layout and depth rules as milestones 24 and 25 (the repository's `CLAUDE.md`).
+**Status: planned on 2026-10-19; the owner accepted the plan and decisions 1–6 as recommended the same day ("accept all decisions, push and start part 1"). Parts 1 and 2 complete; Part 3 next.** Progress will be recorded at the end of this section. Documents go in `docs/milestones/26-pushed-updates/`, with the same layout and depth rules as milestones 24 and 25 (the repository's `CLAUDE.md`).
 
 ### Why this milestone
 
@@ -1554,7 +1554,7 @@ A client that falls behind is told so and resynchronizes; it never silently hold
   - gaps are detectable from the sequences;
   - a slow client is disconnected with a reason and can resubscribe;
   - no user id ever appears in a public message (tested).
-- **Private feed:**
+- **Private feed** (met in Part 2, 2026-10-20):
   - both parties of every fill are told, each with their own order and side;
   - every order status change reaches its owner;
   - no user receives another user's event (tested with several users, a colliding order id, and a cancellation of another user's order);
@@ -1588,6 +1588,12 @@ Planned on 2026-10-19; decisions 1–6 accepted the same day.
 - **Proof.** An oracle test (2,000 random orders and cancellations through the authoritative core; after every batch two clients equal the projection and the core), durability with a held sync, the close and the next day, the socket protocol and every refusal, resubscription, three slow-consumer and silence cases, a halt, and the shipped executable against its REST view. 232 tests (218 + 14), 235 with `stage-timing`, 4 MDP integration tests, the 3 PostgreSQL acceptance tests; a mutation check of 7 mutations, each failing its test; two review rounds, no way found to miss or double a delta; their findings fixed (a resubscription test, a ring leak on two paths, pings that detected nothing, an abort not awaited, and a closing-handshake bug the new silence test exposed).
 - **New dependency:** axum's `ws` feature (`tokio-tungstenite` and `tungstenite` 0.29, plus six small crates).
 
+**Part 2, complete (2026-10-20): the private feed.** Write-up: `docs/milestones/26-pushed-updates/part-2-private-feed.md`.
+- **The process.** `stock --user-feed JOURNAL STREAM STATE_FILE [LISTEN_ADDR]` (default `127.0.0.1:4006`), `GET /userfeed/ws` and `/health`, following the committed stream like the MDP. It keeps an owner map (every open order with its user, symbol, side, price, quantity and remaining), from accepted orders only, saved with its checkpoint at most once a second in a mode-0600 file. A batch the map cannot explain withdraws the feed (503, 1011), never a guess.
+- **Who is told.** Fills (both sides, each with its own order id, side and remaining, and the REST execution id), order states (`new`, `partially_filled`, `filled`, `canceled`, `expired`) to each order's owner; a rejected order to the user named in its input, never through the map; a refused cancellation to its requester.
+- **Authentication.** The first message is `{"type":"auth","token":JWT}` within 5 s, checked by the gateway's own `verify_token`, except that a token already past `exp` is refused (the gateway's 60 s leeway would give it a connection of no length). `ready` names the last applied sequence, taken with the join under the view's read lock. The connection closes with 1008 at the token's expiry. Client messages are capped at 16 KiB. No replay (decision 5).
+- **Proof.** An oracle against the core (3,000 random steps with other users' cancellations and reused ids; after every batch exactly the expected messages, each matching the core; then the close and a next-day reuse), drift, refusals, the state file, ring release, a restart from the saved map with a real runtime, durability with a held sync, a join racing the follower and a deterministic test that the joiner holds the view across its join, the socket (isolation of three users, every refused `auth`, the deadline, the size cap, expiry, silence, halt), and the shipped executable across a restart. 248 tests (232 + 16), 251 with `stage-timing`, 6 MDP and user-feed integration tests, the 3 PostgreSQL acceptance tests; a mutation check of 17 mutations, each failing its test (one, the join under separate locks, first survived the racing test, so a deterministic test was added); two independent reviews, no cross-user leak or `ready` gap found, their findings fixed (a smaller per-user ring, the leeway, the size cap, a stronger oracle, a racing test and a deterministic test of the join).
+
 ## Known Prototype Limitations
 
 - the risk-limit endpoint sets the caller's own cap, so a trader can raise their own limit; a real exchange would make this a compliance action
@@ -1615,6 +1621,7 @@ Planned on 2026-10-19; decisions 1–6 accepted the same day.
 - the warm replica's snapshot writes share the host's disk with the journal's syncs
 - after a failed journal sync the in-memory core is ahead of the disk; it is never used again, the worker halts, and the process must be restarted to recover from the journal
 - a `client_order_id` is unique within its trading day, including after its order finished; earlier days' orders are only in the reporter's tables, and there is no reporting API to read them
+- the private feed replays nothing: a client that reconnects reads what it missed through REST, which holds one trading day and carries no stream sequence; one order trading with more than about 1,000 resting orders gives its user more events in one batch than that user's ring holds, and closes the connection as a slow consumer (1013)
 - snapshots rely on the journal id and committed boundary; an invalid snapshot falls back to full replay and is retained for diagnosis. A journal copied by hand that kept its id but diverged before a snapshot or checkpoint would not be detected; the replication design never publishes a record that is not on both machines, and Part 5's epochs handle divergence after a failover
 - event-log sequencing and matching-input sequencing remain distinct concepts
 - live HTTP replies still use `oneshot`

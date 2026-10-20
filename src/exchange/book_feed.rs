@@ -53,6 +53,9 @@ const SLOW_CONSUMER: u16 = 1013;
 const UNAVAILABLE: u16 = 1011;
 /// "Going away" (RFC 6455): the client stopped answering pings, so it is presumed gone.
 const GOING_AWAY: u16 = 1001;
+/// "Policy violation" (RFC 6455): the private feed's client did not authenticate, or its token
+/// expired.
+const POLICY_VIOLATION: u16 = 1008;
 
 /// How a connection is paced. Tests shrink these to see a slow consumer quickly.
 #[derive(Clone, Copy, Debug)]
@@ -72,7 +75,7 @@ pub(super) struct Limits {
 
 /// Ping intervals without a single frame from the client after which its connection is closed,
 /// at the next ping.
-const SILENT_PINGS: u32 = 3;
+pub(super) const SILENT_PINGS: u32 = 3;
 
 impl Limits {
     /// The queue is per connection, shared by all its subscriptions, so the stall it absorbs is
@@ -265,20 +268,23 @@ impl BookFeed {
     }
 }
 
-/// Why the server ends a connection.
+/// Why the server ends a connection. Shared with the private feed (`user_feed`).
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Close {
+pub(super) enum Close {
     SlowConsumer,
     Unavailable,
     Silent,
+    /// The private feed's authentication failed, timed out or expired.
+    Policy(&'static str),
 }
 
 impl Close {
     fn frame(self) -> CloseFrame {
         let (code, reason) = match self {
             Close::SlowConsumer => (SLOW_CONSUMER, "slow consumer: resubscribe"),
-            Close::Unavailable => (UNAVAILABLE, "market data unavailable"),
+            Close::Unavailable => (UNAVAILABLE, "feed unavailable"),
             Close::Silent => (GOING_AWAY, "no answer to pings"),
+            Close::Policy(reason) => (POLICY_VIOLATION, reason),
         };
         CloseFrame {
             code,
@@ -287,9 +293,30 @@ impl Close {
     }
 }
 
+/// Ends a connection the server chose to close: the close frame, then the closing handshake.
+pub(super) async fn finish(socket: &mut WebSocket, close: Close, limits: Limits) {
+    // Best effort: a client too slow to read may never take the close frame either.
+    let _ = timeout(
+        limits.write_deadline,
+        socket.send(Message::Close(Some(close.frame()))),
+    )
+    .await;
+    // The closing handshake: wait, within the deadline, for the client's own close frame,
+    // reading what it sent meanwhile. Dropping the socket with unread data from the client makes
+    // the kernel reset the connection, and the client can then lose the close frame.
+    let _ = timeout(limits.write_deadline, async {
+        while let Some(Ok(message)) = socket.recv().await {
+            if matches!(message, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
 /// Writes one message within the deadline. `Err(Some(..))`: the client is too slow;
 /// `Err(None)`: the connection is gone.
-async fn send(
+pub(super) async fn send(
     socket: &mut WebSocket,
     message: Message,
     deadline: Duration,
@@ -303,7 +330,7 @@ async fn send(
 
 /// Moves one subscription's deltas from its ring into the connection's queue, and reports a
 /// client that fell behind or a feed that halted.
-async fn forward(
+pub(super) async fn forward(
     mut receiver: broadcast::Receiver<Utf8Bytes>,
     queue: mpsc::Sender<Utf8Bytes>,
     closing: mpsc::UnboundedSender<Close>,
@@ -453,23 +480,7 @@ where
         feed.release(&symbol);
     }
     if let Some(close) = close {
-        // Best effort: a client too slow to read may never take the close frame either.
-        let _ = timeout(
-            limits.write_deadline,
-            socket.send(Message::Close(Some(close.frame()))),
-        )
-        .await;
-        // The closing handshake: wait, within the deadline, for the client's own close frame,
-        // reading what it sent meanwhile. Dropping the socket with unread data from the client
-        // makes the kernel reset the connection, and the client can then lose the close frame.
-        let _ = timeout(limits.write_deadline, async {
-            while let Some(Ok(message)) = socket.recv().await {
-                if matches!(message, Message::Close(_)) {
-                    break;
-                }
-            }
-        })
-        .await;
+        finish(&mut socket, close, limits).await;
     }
 }
 

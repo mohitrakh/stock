@@ -29,7 +29,7 @@ written to be studied cold.
 |---|---|---|
 | — | The plan and decisions 1–6 | accepted by the owner as recommended (2026-10-19) |
 | 1 | The public L2 feed, in the MDP | complete, 2026-10-19 |
-| 2 | The private feed, in its own process | not started |
+| 2 | The private feed, in its own process | complete, 2026-10-20 |
 | 3 | Measurement | not started |
 | 4 | Final review and close | not started |
 
@@ -43,6 +43,8 @@ written to be studied cold.
 | `glossary.md` | Definitions. |
 | `part-1-public-book-feed.md` | The WebSocket book feed: the protocol, every code change, the tests (an oracle at every sequence, durability, slow consumers, halt, silence, resubscription, the shipped executable), the mutation check, two review rounds. |
 | `performance/scripts/m26p1-mutate.sh`, `performance/results/m26p1-mutate*.txt` | Part 1's mutation check and its runs. |
+| `part-2-private-feed.md` | The private feed: who is told what, the protocol, authentication, every code change, the tests (an oracle against the core with colliding ids and other users' cancellations, drift, restart, durability, the socket, the shipped executable), the mutation check, the review. |
+| `performance/scripts/m26p2-mutate.sh`, `performance/results/m26p2-mutate*.txt` | Part 2's mutation check and its runs. |
 
 ## Conventions
 

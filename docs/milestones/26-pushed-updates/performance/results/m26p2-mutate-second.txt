@@ -1,0 +1,32 @@
+### m26p2-mutate: 2026-10-20T10:41:23+05:30, tree /home/ubuntu/stock-m26
+## control: the real tree, each test alone (own target volume, fresh build)
+  every_event_reaches_only_its_owner_and_matches_the_core: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.74s
+  refusals_go_to_whoever_asked_and_never_touch_the_owner_map: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.00s
+  a_batch_the_owner_map_cannot_explain_is_an_error: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.00s
+  a_connection_that_does_not_authenticate_is_closed_as_a_policy_violation: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 5.22s
+  a_connection_closes_when_its_token_expires: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 1.98s
+  a_halted_follower_closes_every_connection: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.06s
+  a_users_ring_is_freed_when_their_last_connection_leaves: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.00s
+  each_user_receives_their_own_events_and_nothing_else: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.06s
+  a_restart_from_the_saved_map_still_tells_the_owners_of_older_orders: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.04s
+  a_client_that_never_answers_pings_is_closed_as_gone: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 1.51s
+  a_join_racing_the_follower_gets_exactly_the_events_after_its_sequence: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 3.35s
+  a_client_message_over_the_limit_ends_the_connection_unread: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.01s
+  a resting order's fill goes to the incoming order's user -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.00s (every_event_reaches_only_its_owner_and_matches_the_core)
+  a rejection goes to the open order's owner of that id -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.00s (refusals_go_to_whoever_asked_and_never_touch_the_owner_map)
+  a refused cancellation goes to the order's owner -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.00s (every_event_reaches_only_its_owner_and_matches_the_core)
+  a cancellation by someone else is accepted -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.00s (a_batch_the_owner_map_cannot_explain_is_an_error)
+  no auth deadline -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 20.23s (a_connection_that_does_not_authenticate_is_closed_as_a_policy_violation)
+  a token's signature is not checked -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.01s (a_connection_that_does_not_authenticate_is_closed_as_a_policy_violation)
+  a token's expiry is ignored once connected -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 20.01s (a_connection_closes_when_its_token_expires)
+  a halt leaves the rings open -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 20.02s (a_halted_follower_closes_every_connection)
+  a ring is never freed -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.00s (a_users_ring_is_freed_when_their_last_connection_leaves)
+  every event goes to every connected user -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.06s (each_user_receives_their_own_events_and_nothing_else)
+  ready names the next sequence, not the last applied -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.03s (each_user_receives_their_own_events_and_nothing_else)
+  the saved state holds no orders -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.03s (a_restart_from_the_saved_map_still_tells_the_owners_of_older_orders)
+  silence is never noticed -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 21.52s (a_client_that_never_answers_pings_is_closed_as_gone)
+  a resting order's own order message is dropped -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.01s (every_event_reaches_only_its_owner_and_matches_the_core)
+  ready's sequence and the join under separate locks -> test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 247 filtered out; finished in 2.41s (a_join_racing_the_follower_gets_exactly_the_events_after_its_sequence)
+  a token within the leeway past exp is accepted -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.06s (a_connection_that_does_not_authenticate_is_closed_as_a_policy_violation)
+  no limit on a client's message size -> test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 247 filtered out; finished in 0.01s (a_client_message_over_the_limit_ends_the_connection_unread)
+### done

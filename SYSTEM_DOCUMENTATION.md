@@ -332,6 +332,15 @@ The separate MDP listener has its own public routes and no database dependency:
 
 The previous `/exchange/orderbook/{symbol}` route and `ExchangeCommand::GetOrderBook` path have been removed. Internal core L2 methods remain for correctness tests.
 
+The private feed (milestone 26 part 2) is its own process, `--user-feed JOURNAL STREAM STATE_FILE [LISTEN_ADDR]` (default `127.0.0.1:4006`), with no database dependency; it needs `JWT_SECRET`:
+
+| Method | Path | Behavior |
+|---|---|---|
+| GET | `/health` | 200 after catch-up while following is healthy; otherwise 503 |
+| GET | `/userfeed/ws` | WebSocket private feed: the first message must be `{"type":"auth","token":JWT}` within 5 s, checked like the gateway's `Authorization` header; the server answers `{"type":"ready","seq":S}`, then pushes that user's own `fill` (execution id, order id, symbol, side, price, quantity, remaining), `order` (status `new`, `partially_filled`, `filled`, `canceled`, `expired` or `rejected` with a reason) and `cancel_rejected` messages, each with its batch's `seq` > S. No replay. Closes with 1008 for a failed or missing authentication and when the token expires, plus the book feed's 1013, 1011 and 1001 |
+
+It keeps an owner map (every open order by id, with its user) from accepted orders only, saved with its checkpoint in its own state file (mode 0600). A rejected order goes to the user named in its input, never through the map, because a client-chosen id can collide with another user's live order; a refused cancellation goes to its requester. A batch the map cannot explain withdraws the feed. See `docs/milestones/26-pushed-updates/part-2-private-feed.md`.
+
 ## Benchmark
 
 `--bench` is an in-process load generator over the production worker, journal, and mmap stream. To include snapshot cost, run `--warm-replica` on the benchmark's directory alongside it. It needs an empty directory and never deletes anything:

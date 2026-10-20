@@ -61,6 +61,13 @@ async fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "--user-feed") {
+        if let Err(error) = exchange::user_feed::run(&args[1..]).await {
+            eprintln!("user feed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "--reporter") {
         if let Err(error) = exchange::reporter::run(&args[1..]).await {
             eprintln!("reporter: {error}");
@@ -155,7 +162,7 @@ async fn main() {
     }
     if !args.is_empty() {
         eprintln!(
-            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --replica PRIMARY_ADDR JOURNAL STREAM | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR] | --bench EMPTY_DIR [OPTIONS] | --http-bench [OPTIONS] | --sync-probe EMPTY_DIR [OPTIONS] | --bcrypt-probe [OPTIONS]]"
+            "usage: stock [--event-probe JOURNAL STREAM [CHECKPOINT_JSON] [--once] | --market-data JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --user-feed JOURNAL STREAM STATE_FILE [LISTEN_ADDR] | --reporter JOURNAL STREAM [LISTEN_ADDR] | --replica PRIMARY_ADDR JOURNAL STREAM | --warm-replica JOURNAL STREAM SNAPSHOT [LISTEN_ADDR] | --bench EMPTY_DIR [OPTIONS] | --http-bench [OPTIONS] | --sync-probe EMPTY_DIR [OPTIONS] | --bcrypt-probe [OPTIONS]]"
         );
         std::process::exit(1);
     }

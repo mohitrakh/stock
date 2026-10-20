@@ -26,6 +26,14 @@ pub fn jwt_secret() -> Option<&'static str> {
         .as_deref()
 }
 
+/// Checks a login token's signature and expiry with `key`. The HTTP extractor below and the private
+/// feed's first message (milestone 26) both use it, so a token means the same thing to both.
+pub fn verify_token(token: &str, key: &DecodingKey) -> Option<Claims> {
+    decode::<Claims>(token, key, &Validation::default())
+        .ok()
+        .map(|data| data.claims)
+}
+
 /// The checking key, built once from `jwt_secret`.
 fn decoding_key() -> Option<&'static DecodingKey> {
     static KEY: OnceLock<Option<DecodingKey>> = OnceLock::new();
@@ -58,12 +66,12 @@ where
             StatusCode::INTERNAL_SERVER_ERROR,
             "token signing key is not configured",
         ))?;
-        let token_data = decode::<Claims>(token, key, &Validation::default())
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "Invalid or expired token"))?;
+        let claims = verify_token(token, key)
+            .ok_or((StatusCode::UNAUTHORIZED, "Invalid or expired token"))?;
 
         // 3. Return the user ID
         Ok(AuthUser {
-            user_id: token_data.claims.sub,
+            user_id: claims.sub,
         })
     }
 }

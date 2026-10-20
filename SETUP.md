@@ -161,6 +161,7 @@ count. Redirect each script into a file:
 | `m25p4-order.sh` | `bash ~/stock-scripts/m25p4-order.sh 6 > ~/m25-out/m25p4-order.txt 2>&1` | `stock-m24p2`, `stock-m25final` |
 | `m25p4-final.sh` | `bash ~/stock-scripts/m25p4-final.sh 3 > ~/m25-out/m25p4-final.txt 2>&1` (needs cgroup v2, and `m25p4-cpu.awk` in `~/stock-scripts`) | `stock-m24p2`, `stock-m25final`, generator `stock-m25final` |
 | `m26p1-mutate.sh` | `TREE=~/stock-m25 bash ~/stock-scripts/m26p1-mutate.sh > ~/m26-out/m26p1-mutate.txt 2>&1` | builds from `$TREE` (milestone 26 code) |
+| `m26p2-mutate.sh` | `TREE=~/stock-m25 bash ~/stock-scripts/m26p2-mutate.sh > ~/m26-out/m26p2-mutate.txt 2>&1` | builds from `$TREE` (milestone 26 code) |
 
 Then summarize the stage runs the same way the documents did:
 

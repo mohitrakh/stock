@@ -49,7 +49,7 @@ const IDLE_POLL: Duration = Duration::from_millis(10);
 /// the process replays at most about this much history; a shorter interval means more saves.
 const SAVE_INTERVAL: Duration = Duration::from_secs(1);
 
-type MdResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+pub(super) type MdResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
@@ -478,12 +478,14 @@ fn projection_file(
 }
 
 /// Returns the number of bytes written.
-fn save_state(path: &Path, file: &ProjectionFile) -> MdResult<usize> {
+/// Shared with the private feed (`user_feed`), which saves its own state the same way.
+pub(super) fn save_state<T: Serialize>(path: &Path, file: &T) -> MdResult<usize> {
     save_state_with_rename(path, file, |from, to| std::fs::rename(from, to))
 }
 
-fn save_state_with_rename<F>(path: &Path, file: &ProjectionFile, rename: F) -> MdResult<usize>
+fn save_state_with_rename<T, F>(path: &Path, file: &T, rename: F) -> MdResult<usize>
 where
+    T: Serialize,
     F: FnOnce(&Path, &Path) -> io::Result<()>,
 {
     let parent = path
@@ -493,7 +495,7 @@ where
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| invalid("invalid market-data state path"))?;
+        .ok_or_else(|| invalid("invalid state path"))?;
     let temp = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
     // One buffer, one write: serializing straight into the file was thousands of tiny writes.
     let bytes = serde_json::to_vec(file)?;
@@ -515,7 +517,7 @@ where
     result.map(|()| bytes.len())
 }
 
-fn ensure_safe_state_path(journal: &Path, stream: &Path, state: &Path) -> MdResult<()> {
+pub(super) fn ensure_safe_state_path(journal: &Path, stream: &Path, state: &Path) -> MdResult<()> {
     let journal_path = journal.canonicalize()?;
     let stream_path = stream.canonicalize()?;
     let parent = state
@@ -525,23 +527,21 @@ fn ensure_safe_state_path(journal: &Path, stream: &Path, state: &Path) -> MdResu
         .canonicalize()?;
     let state_name = state
         .file_name()
-        .ok_or_else(|| invalid("invalid market-data state path"))?;
+        .ok_or_else(|| invalid("invalid state path"))?;
     let state_path = if state.exists() {
         state.canonicalize()?
     } else {
         parent.join(state_name)
     };
     if state_path == journal_path || state_path == stream_path {
-        return Err(invalid("market-data state must not overwrite the journal or stream").into());
+        return Err(invalid("the state file must not overwrite the journal or stream").into());
     }
     if state.exists() {
         let state_meta = state.metadata()?;
         for source in [journal, stream] {
             let source_meta = source.metadata()?;
             if state_meta.dev() == source_meta.dev() && state_meta.ino() == source_meta.ino() {
-                return Err(
-                    invalid("market-data state must not alias the journal or stream").into(),
-                );
+                return Err(invalid("the state file must not alias the journal or stream").into());
             }
         }
     }
@@ -871,8 +871,9 @@ fn router(served: Served, feed: Arc<BookFeed>) -> Router {
         .with_state(MarketDataState { served, feed })
 }
 
+/// The private feed's tests (`user_feed.rs`) reuse the batch, journal and socket helpers here.
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::{
         exchange::{
@@ -883,7 +884,13 @@ mod tests {
     };
     use tokio::sync::{mpsc, oneshot};
 
-    fn order(id: &str, user: &str, side: &str, price: u64, quantity: u32) -> Order {
+    pub(in crate::exchange) fn order(
+        id: &str,
+        user: &str,
+        side: &str,
+        price: u64,
+        quantity: u32,
+    ) -> Order {
         Order::new(
             id.to_string(),
             user.to_string(),
@@ -898,7 +905,7 @@ mod tests {
         .unwrap()
     }
 
-    fn envelopes(
+    pub(in crate::exchange) fn envelopes(
         input: ExchangeInputEvent,
         outputs: Vec<ExchangeOutputEvent>,
     ) -> Vec<EventEnvelope> {
@@ -912,7 +919,10 @@ mod tests {
             .collect()
     }
 
-    fn accepted(order: Order, executions: Vec<Execution>) -> Vec<EventEnvelope> {
+    pub(in crate::exchange) fn accepted(
+        order: Order,
+        executions: Vec<Execution>,
+    ) -> Vec<EventEnvelope> {
         let mut outputs = vec![ExchangeOutputEvent::OrderAccepted {
             order_id: order.order_id.clone(),
             seq_num: 1,
@@ -925,7 +935,7 @@ mod tests {
         envelopes(ExchangeInputEvent::NewOrderRequested { order }, outputs)
     }
 
-    fn rejected(order: Order) -> Vec<EventEnvelope> {
+    pub(in crate::exchange) fn rejected(order: Order) -> Vec<EventEnvelope> {
         envelopes(
             ExchangeInputEvent::NewOrderRequested {
                 order: order.clone(),
@@ -950,7 +960,13 @@ mod tests {
         )
     }
 
-    fn execution(id: &str, buy: &str, sell: &str, price: u64, quantity: u32) -> Execution {
+    pub(in crate::exchange) fn execution(
+        id: &str,
+        buy: &str,
+        sell: &str,
+        price: u64,
+        quantity: u32,
+    ) -> Execution {
         Execution {
             execution_id: id.to_string(),
             buy_order_id: buy.to_string(),
@@ -962,7 +978,13 @@ mod tests {
         }
     }
 
-    fn pair(prefix: &str, buy: &str, sell: &str, price: u64, quantity: u32) -> Vec<Execution> {
+    pub(in crate::exchange) fn pair(
+        prefix: &str,
+        buy: &str,
+        sell: &str,
+        price: u64,
+        quantity: u32,
+    ) -> Vec<Execution> {
         vec![
             execution(&format!("{prefix}-buy"), buy, sell, price, quantity),
             execution(&format!("{prefix}-sell"), buy, sell, price, quantity),
@@ -1012,7 +1034,7 @@ mod tests {
         assert_eq!(projection.orders.len(), 1);
     }
 
-    fn closed(expired: &[(&str, u64)]) -> Vec<EventEnvelope> {
+    pub(in crate::exchange) fn closed(expired: &[(&str, u64)]) -> Vec<EventEnvelope> {
         let mut outputs = vec![ExchangeOutputEvent::MarketClosed {
             trading_day: chrono::NaiveDate::from_ymd_opt(2026, 10, 5).unwrap(),
         }];
@@ -1431,7 +1453,10 @@ mod tests {
     }
 
     /// Gives a test batch the journal sequence numbers that follow `next`, as the exchange would.
-    fn numbered(mut batch: Vec<EventEnvelope>, next: &mut u64) -> Vec<EventEnvelope> {
+    pub(in crate::exchange) fn numbered(
+        mut batch: Vec<EventEnvelope>,
+        next: &mut u64,
+    ) -> Vec<EventEnvelope> {
         for envelope in &mut batch {
             envelope.seq_num = *next;
             *next += 1;
@@ -1439,7 +1464,7 @@ mod tests {
         batch
     }
 
-    fn publish(
+    pub(in crate::exchange) fn publish(
         store: &mut crate::exchange::event_store::EventStore,
         writer: &mut crate::exchange::event_stream::StreamWriter,
         batch: &[EventEnvelope],
@@ -1451,12 +1476,12 @@ mod tests {
             .unwrap();
     }
 
-    fn send(tx: &mpsc::Sender<ExchangeCommand>, command: ExchangeCommand) {
+    pub(in crate::exchange) fn send(tx: &mpsc::Sender<ExchangeCommand>, command: ExchangeCommand) {
         tx.blocking_send(command).unwrap();
     }
 
     /// Orders are refused until a trading day is open; the open is journaled like any command.
-    fn open_market(tx: &mpsc::Sender<ExchangeCommand>) {
+    pub(in crate::exchange) fn open_market(tx: &mpsc::Sender<ExchangeCommand>) {
         let (respond_to, reply) = oneshot::channel();
         send(
             tx,
@@ -1879,7 +1904,7 @@ mod tests {
 
     // Milestone 26 part 1: the public book feed.
 
-    fn parsed(text: &Utf8Bytes) -> serde_json::Value {
+    pub(in crate::exchange) fn parsed(text: &Utf8Bytes) -> serde_json::Value {
         serde_json::from_str(text.as_str()).unwrap()
     }
 
@@ -1983,7 +2008,7 @@ mod tests {
         (ClientBook::from_snapshot(&parsed(&snapshot)), receiver)
     }
 
-    fn order_in(
+    pub(in crate::exchange) fn order_in(
         symbol: &str,
         id: &str,
         user: &str,
@@ -2005,7 +2030,11 @@ mod tests {
         .unwrap()
     }
 
-    fn canceled_by(order_id: &str, user_id: &str, seq_num: u64) -> Vec<EventEnvelope> {
+    pub(in crate::exchange) fn canceled_by(
+        order_id: &str,
+        user_id: &str,
+        seq_num: u64,
+    ) -> Vec<EventEnvelope> {
         envelopes(
             ExchangeInputEvent::CancelOrderRequested {
                 order_id: order_id.to_string(),
@@ -2292,7 +2321,7 @@ mod tests {
         );
     }
 
-    type Client = tokio_tungstenite::WebSocketStream<
+    pub(in crate::exchange) type Client = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
@@ -2306,7 +2335,7 @@ mod tests {
     /// A client with a small receive buffer (64 KiB), so the slow-consumer tests fill the
     /// connection's buffers with the same volume whatever the host's TCP tuning. The server's
     /// send buffer is still the host's; Linux's default maximum is 4 MiB.
-    async fn connect(url: &str) -> Client {
+    pub(in crate::exchange) async fn connect(url: &str) -> Client {
         let address = url
             .trim_start_matches("ws://")
             .split('/')
@@ -2323,7 +2352,7 @@ mod tests {
             .0
     }
 
-    async fn request(client: &mut Client, text: &str) {
+    pub(in crate::exchange) async fn request(client: &mut Client, text: &str) {
         use futures_util::SinkExt;
         client
             .send(tokio_tungstenite::tungstenite::Message::Text(text.into()))
@@ -2336,7 +2365,7 @@ mod tests {
     }
 
     /// The next text message, skipping pings.
-    async fn next_json(client: &mut Client) -> serde_json::Value {
+    pub(in crate::exchange) async fn next_json(client: &mut Client) -> serde_json::Value {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
         loop {
@@ -2355,7 +2384,7 @@ mod tests {
 
     /// Reads until the connection ends: the close code, if a close frame came.
     /// One deadline for the whole wait, so steady pings cannot keep it waiting forever.
-    async fn close_code(client: &mut Client) -> Option<u16> {
+    pub(in crate::exchange) async fn close_code(client: &mut Client) -> Option<u16> {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::Message;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);

@@ -18,4 +18,5 @@ pub mod snapshot;
 #[cfg(feature = "stage-timing")]
 pub mod stage_timing;
 pub mod terms;
+pub mod user_feed;
 pub mod warm_replica;

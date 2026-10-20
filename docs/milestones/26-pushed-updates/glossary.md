@@ -47,6 +47,11 @@ quantity, not the difference, is idempotent. Theory §3.
 as a snapshot followed by changes: L2 data delivered this way. FIX's message for the changes is
 `MarketDataIncrementalRefresh`. Theory §3.
 
+**Leeway (token).** How long past its `exp` a JWT is still accepted, to absorb clock differences
+between machines. `jsonwebtoken`'s `Validation::default()` allows 60 s. The gateway keeps it; the
+private feed refuses a token already past `exp`, because a connection lasts only until then
+(`part-2-private-feed.md`).
+
 **`Lagged`.** What `tokio::sync::broadcast` returns to a receiver that fell behind its buffer, with
 the number of messages it lost. Theory §5.
 
@@ -58,13 +63,17 @@ page cannot make a browser send bytes a proxy would read as HTTP. Theory §2.
 **Oracle test.** A test that checks a result against an independent source known to be right: here,
 the feed's book against the projection's view and the core's `l2_snapshot`.
 
-**Owner map.** The private feed's table from each open order to its user, symbol, side and
-remaining quantity. Fills name order ids, not users, so the feed needs it. It is consulted only
-for orders it accepted. Theory §7.
+**Owner map.** The private feed's table from each open order to its user, symbol, side, price,
+quantity and remaining quantity. Fills name order ids, not users, so the feed needs it. It is
+consulted only for orders it accepted. Theory §7.
 
 **Polling.** A client asking repeatedly whether something changed. Theory §1.
 
 **Push.** A server sending a client a change when it happens. Theory §1.
+
+**`ready`.** The private feed's first message after a successful `auth`: the last stream sequence
+the feed had applied when the connection joined. Every later event has a greater sequence; nothing
+before it is sent (decision 5).
 
 **Resubscribe / resynchronize.** A client that detected a gap, or was disconnected, asking again
 and starting from a fresh snapshot.

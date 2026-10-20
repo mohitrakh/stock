@@ -1,5 +1,6 @@
-//! Process-level acceptance for the shipped MDP executable. The journal and mmap fixtures are
-//! encoded independently so this test checks the public wire boundary without PostgreSQL.
+//! Process-level acceptance for the shipped MDP executable, and for the private feed that follows
+//! the same stream. The journal and mmap fixtures are encoded independently so this test checks
+//! the public wire boundary without PostgreSQL.
 
 use std::{
     fs::{self, OpenOptions},
@@ -13,6 +14,7 @@ use std::{
 };
 
 const CAPACITY: usize = 4096;
+const USER_FEED_SECRET: &str = "user-feed-acceptance-secret";
 
 struct Fixture {
     dir: PathBuf,
@@ -100,6 +102,29 @@ impl Fixture {
             .spawn()
             .unwrap();
         ChildGuard(Some(child))
+    }
+
+    fn user_feed_state(&self) -> PathBuf {
+        self.dir.join("user-feed.json")
+    }
+
+    /// The private feed (milestone 26 part 2) on the same journal and stream.
+    fn user_feed(&self, address: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stock"));
+        command
+            .current_dir(&self.dir)
+            .env_remove("DATABASE_URL")
+            .env("JWT_SECRET", USER_FEED_SECRET)
+            .args([
+                "--user-feed",
+                self.journal.to_str().unwrap(),
+                self.stream.to_str().unwrap(),
+                self.user_feed_state().to_str().unwrap(),
+                address,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        command
     }
 }
 
@@ -641,4 +666,147 @@ async fn mdp_pushes_the_book_over_websocket_and_closes_when_the_stream_breaks() 
     };
     assert_eq!(closed, Some(1011));
     child.stop();
+}
+
+/// A user-feed client authenticated as `user`, and the sequence its `ready` message names.
+async fn user_feed_client(address: &str, user: &str) -> (Socket, u64) {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &serde_json::json!({"sub": user, "exp": exp}),
+        &jsonwebtoken::EncodingKey::from_secret(USER_FEED_SECRET.as_bytes()),
+    )
+    .unwrap();
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/userfeed/ws"))
+        .await
+        .unwrap();
+    socket
+        .send(Message::Text(
+            format!(r#"{{"type":"auth","token":"{token}"}}"#).into(),
+        ))
+        .await
+        .unwrap();
+    let ready = next_message(&mut socket).await.unwrap();
+    assert_eq!(ready["type"], "ready", "{ready}");
+    (socket, ready["seq"].as_u64().unwrap())
+}
+
+/// The kind of each message: an order's status, or the message type.
+fn kinds(messages: &[serde_json::Value]) -> Vec<(&str, u64)> {
+    messages
+        .iter()
+        .map(|message| {
+            let kind = message["status"].as_str().or(message["type"].as_str());
+            (kind.unwrap(), message["remaining"].as_u64().unwrap())
+        })
+        .collect()
+}
+
+/// Milestone 26 part 2, through the shipped executable: each side of a trade reaches its own
+/// user; the owner map is saved owner-only and survives a restart, so a fill after the restart
+/// still reaches the owner of an order placed before it; a broken stream closes with 1011.
+#[tokio::test(flavor = "multi_thread")]
+async fn user_feed_pushes_each_user_their_own_fills_across_a_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    fixture.initialize(
+        &[accepted_order(
+            1,
+            "sell-101",
+            "private-seller",
+            "sell",
+            101,
+            5,
+            1,
+        )],
+        2,
+    );
+    let address = unused_address();
+    let mut child = ChildGuard(Some(fixture.user_feed(&address).spawn().unwrap()));
+    wait_for(&mut child, &address, "/health", |status, _| status == 200);
+    let mode = fs::metadata(fixture.user_feed_state())
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+
+    let (mut seller, seller_ready) = user_feed_client(&address, "private-seller").await;
+    let (mut buyer, buyer_ready) = user_feed_client(&address, "private-buyer").await;
+    assert_eq!((seller_ready, buyer_ready), (2, 2));
+    // The buyer takes 4 of the seller's 5.
+    fixture.append_and_publish(
+        &accepted_buy_with_trade(3, "buy-101", 4, 2, "sell-101", 101, 1.0),
+        6,
+    );
+    let mut told = Vec::new();
+    for _ in 0..2 {
+        told.push(next_message(&mut seller).await.unwrap());
+    }
+    assert_eq!(kinds(&told), [("fill", 1), ("partially_filled", 1)]);
+    assert_eq!(told[0]["execution_id"], "buy-101-buy");
+    assert_eq!(told[0]["seq"], 6);
+    let mut told = Vec::new();
+    for _ in 0..2 {
+        told.push(next_message(&mut buyer).await.unwrap());
+    }
+    assert_eq!(kinds(&told), [("fill", 0), ("filled", 0)]);
+
+    // The follower saves at most once a second; wait for the save that holds the trade.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !fs::read_to_string(fixture.user_feed_state())
+        .unwrap()
+        .contains(r#""remaining":1"#)
+    {
+        assert!(Instant::now() < deadline, "the trade was never saved");
+        thread::sleep(Duration::from_millis(20));
+    }
+    child.stop();
+    drop((seller, buyer));
+
+    fixture.reset_stream_after_writer_restart(6);
+    let mut restarted = ChildGuard(Some(fixture.user_feed(&address).spawn().unwrap()));
+    wait_for(&mut restarted, &address, "/health", |status, _| {
+        status == 200
+    });
+    let (mut seller, seller_ready) = user_feed_client(&address, "private-seller").await;
+    assert_eq!(seller_ready, 6);
+    fixture.append_and_publish(
+        &accepted_buy_with_trade(7, "buy-101b", 1, 3, "sell-101", 101, 2.0),
+        10,
+    );
+    let mut told = Vec::new();
+    for _ in 0..2 {
+        told.push(next_message(&mut seller).await.unwrap());
+    }
+    assert_eq!(kinds(&told), [("fill", 0), ("filled", 0)]);
+
+    fixture.interrupt_stream_publication();
+    assert_eq!(next_message(&mut seller).await.unwrap_err(), Some(1011));
+    restarted.stop();
+}
+
+#[test]
+fn user_feed_refuses_to_start_without_a_token_secret() {
+    let fixture = Fixture::new();
+    fixture.initialize(
+        &[accepted_order(1, "buy", "private-user", "buy", 100, 1, 1)],
+        2,
+    );
+    let output = fixture
+        .user_feed(&unused_address())
+        .env_remove("JWT_SECRET")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("user feed: JWT_SECRET must be set"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
